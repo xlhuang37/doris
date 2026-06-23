@@ -50,14 +50,20 @@ private:
 
 // A Multilevel Feedback Queue with strict absolute priority between levels.
 //
-// A task's level is derived from its owning fragment's global CPU runtime (see
-// PipelineFragmentContext::fragment_runtime_ns), so a fragment is demoted as a
-// whole the more CPU it consumes. Workers always drain the lowest non-empty
-// level before serving a deeper one; within a level ordering is FIFO.
+// Level 0 is the inelastic-first level: a task whose owning fragment is currently
+// inelastic (few runnable pipelines, see PipelineFragmentContext::is_inelastic)
+// is placed here so the fragment finishes quickly and frees resources. Levels
+// 1..6 are the runtime levels: a task's level is derived from its fragment's
+// global CPU runtime (see PipelineFragmentContext::fragment_runtime_ns), so a
+// fragment is demoted as a whole the more CPU it consumes. Workers always drain
+// the lowest non-empty level before serving a deeper one; within a level
+// ordering is FIFO.
 //
-// Demotion is applied lazily at dequeue: when a task is pulled, its level is
-// recomputed from the (possibly grown) fragment counter, and if the fragment now
-// belongs in a deeper level the task is re-queued there instead of being run.
+// Both the inelastic boost and the runtime demotion are applied lazily at
+// dequeue: when a task is pulled its target level is recomputed (the fragment may
+// have turned elastic, or its runtime may have grown, on any core while the task
+// waited), and if it now belongs in a deeper level it is re-queued there instead
+// of being run.
 class PriorityTaskQueue {
 public:
     PriorityTaskQueue();
@@ -72,17 +78,26 @@ public:
 
 private:
     PipelineTaskSPtr _try_take_unprotected(bool is_steal);
-    static constexpr size_t SUB_QUEUE_LEVEL = 6;
+    // Level 0 is reserved for inelastic-first tasks; runtime-demoted tasks occupy
+    // levels [RUNTIME_LEVEL_BASE, SUB_QUEUE_LEVEL).
+    static constexpr size_t INELASTIC_LEVEL = 0;
+    static constexpr size_t RUNTIME_LEVEL_BASE = INELASTIC_LEVEL + 1;
+    static constexpr size_t NUM_RUNTIME_LEVELS = 6;
+    static constexpr size_t SUB_QUEUE_LEVEL = RUNTIME_LEVEL_BASE + NUM_RUNTIME_LEVELS;
     SubTaskQueue _sub_queues[SUB_QUEUE_LEVEL];
-    // 1s, 3s, 10s, 60s, 300s
-    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {1000000000, 3000000000, 10000000000,
-                                                        60000000000, 300000000000};
+    // Thresholds between the runtime levels: 1s, 3s, 10s, 60s, 300s.
+    uint64_t _queue_level_limit[NUM_RUNTIME_LEVELS - 1] = {1000000000, 3000000000, 10000000000,
+                                                           60000000000, 300000000000};
     std::mutex _work_size_mutex;
     std::condition_variable _wait_task;
     std::atomic<size_t> _total_task_size = 0;
     bool _closed;
 
+    // Runtime-only level in [RUNTIME_LEVEL_BASE, SUB_QUEUE_LEVEL).
     int _compute_level(uint64_t real_runtime);
+    // Final target level for a task: INELASTIC_LEVEL when its fragment is
+    // inelastic, otherwise its runtime level.
+    int _target_level(const PipelineTaskSPtr& task);
 };
 
 // Need consider NUMA architecture

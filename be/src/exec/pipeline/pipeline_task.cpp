@@ -91,6 +91,7 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
 #endif
     if (fragment_context) {
         _fragment_runtime_ptr = fragment_context->fragment_runtime_counter();
+        _fragment_raw = fragment_context.get();
     }
     _execution_dependencies.push_back(state->get_query_ctx()->get_execution_dependency());
     if (!_shared_state_map.contains(_sink->dests_id().front())) {
@@ -1074,8 +1075,23 @@ Status PipelineTask::_state_transition(State new_state) {
                 "Task state transition from {} to {} is not allowed! Task info: {}",
                 _to_string(_exec_state), _to_string(new_state), debug_string());
     }
+    // Maintain the owning fragment's runnable-pipeline count for inelastic-first
+    // scheduling. This is the single funnel for all state changes, so counting
+    // RUNNABLE enters/leaves here keeps the fragment's count exact. Blocked tasks are
+    // excluded by design (BLOCKED is not RUNNABLE), matching the inelasticity metric.
+    if (_fragment_raw != nullptr && new_state != _exec_state) {
+        if (new_state == State::RUNNABLE) {
+            _fragment_raw->adjust_runnable_pipelines(1);
+        } else if (_exec_state == State::RUNNABLE) {
+            _fragment_raw->adjust_runnable_pipelines(-1);
+        }
+    }
     _exec_state = new_state;
     return Status::OK();
+}
+
+bool PipelineTask::fragment_is_inelastic() const {
+    return _fragment_raw != nullptr && _fragment_raw->is_inelastic();
 }
 
 #include "common/compile_check_end.h"

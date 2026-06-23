@@ -369,6 +369,9 @@ DECLARE_Int32(be_service_threads);
 DECLARE_mInt32(pipeline_status_report_interval);
 // Time slice for pipeline task execution (ms)
 DECLARE_mInt32(pipeline_task_exec_time_slice);
+// Inelastic-first scheduling threshold: a fragment with <= this many runnable
+// (non-blocked) pipeline tasks is treated as inelastic and scheduled first.
+DECLARE_mInt32(pipeline_inelastic_runnable_threshold);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

@@ -148,6 +148,11 @@ public:
                        : 0;
     }
 
+    // True if the owning fragment is currently inelastic (few runnable pipelines).
+    // The scheduler reads this to boost the task to the top priority level. Defined
+    // out-of-line because it dereferences the (forward-declared) fragment context.
+    MOCK_FUNCTION bool fragment_is_inelastic() const;
+
     void put_in_runnable_queue() {
         _schedule_time++;
         _wait_worker_watcher.start();
@@ -223,6 +228,11 @@ private:
     // safe and lets the scheduler avoid locking `_fragment_context` (a weak_ptr)
     // on the hot push/dequeue path.
     std::atomic<uint64_t>* _fragment_runtime_ptr = nullptr;
+
+    // Cached raw pointer to the owning fragment context. Same lifetime guarantee as
+    // above: used for the inelastic-first signal read and the runnable-pipeline
+    // count updates without touching the weak_ptr on the hot path.
+    PipelineFragmentContext* _fragment_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

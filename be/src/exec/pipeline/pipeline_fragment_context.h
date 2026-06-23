@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "common/config.h"
 #include "common/status.h"
 #include "exec/pipeline/pipeline.h"
 #include "exec/pipeline/pipeline_task.h"
@@ -100,6 +101,17 @@ public:
         return _fragment_runtime_ns.load(std::memory_order_relaxed);
     }
     std::atomic<uint64_t>* fragment_runtime_counter() { return &_fragment_runtime_ns; }
+
+    // Inelastic-first scheduling. A fragment is "inelastic" when it has too few
+    // runnable (non-blocked) pipeline tasks to use much parallelism; such a
+    // fragment's tasks are boosted to the top scheduler priority level so it can
+    // finish quickly and release resources. The runnable count is maintained from
+    // PipelineTask::_state_transition (the sole place tasks enter/leave RUNNABLE).
+    void adjust_runnable_pipelines(int delta) {
+        int count = _runnable_pipeline_count.fetch_add(delta, std::memory_order_relaxed) + delta;
+        _is_inelastic.store(count <= _inelastic_threshold, std::memory_order_relaxed);
+    }
+    bool is_inelastic() const { return _is_inelastic.load(std::memory_order_relaxed); }
 
     void decrement_running_task(PipelineId pipeline_id);
 
@@ -229,6 +241,15 @@ private:
     // fragment's pipeline tasks (across instances and across the blocking/simple
     // sub-schedulers) and used by the pipeline MLFQ to compute the priority level.
     std::atomic<uint64_t> _fragment_runtime_ns {0};
+
+    // Inelastic-first scheduling state for this logical fragment.
+    // `_runnable_pipeline_count` tracks how many of the fragment's pipeline tasks are
+    // currently in RUNNABLE state (ready or executing, excluding blocked). When it is
+    // at or below `_inelastic_threshold`, `_is_inelastic` is set and the scheduler
+    // routes this fragment's tasks to the top priority level.
+    std::atomic<int> _runnable_pipeline_count {0};
+    std::atomic<bool> _is_inelastic {false};
+    const int _inelastic_threshold = config::pipeline_inelastic_runnable_threshold;
 
     ExecEnv* _exec_env = nullptr;
 

@@ -55,17 +55,17 @@ PipelineTaskSPtr PriorityTaskQueue::_try_take_unprotected(bool is_steal) {
     }
 
     // Strict absolute priority: serve the lowest non-empty level first.
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+    for (int level = 0; level < static_cast<int>(SUB_QUEUE_LEVEL); ++level) {
         while (!_sub_queues[level].empty()) {
             auto task = _sub_queues[level].try_take(is_steal);
             if (!task) {
                 break;
             }
-            // Lazy demotion: recompute the task's level from its fragment's global
-            // runtime, which may have grown (on any core) while the task waited. If
-            // the fragment now belongs in a deeper level, defer the task there
-            // instead of running it at the current, higher-priority level.
-            int want_level = _compute_level(task->fragment_runtime_ns());
+            // Lazy re-leveling: recompute the task's target level. The fragment may
+            // have grown its runtime or stopped being inelastic (on any core) while
+            // the task waited. If it now belongs in a deeper level, defer the task
+            // there instead of running it at the current, higher-priority level.
+            int want_level = _target_level(task);
             if (want_level > level) {
                 _sub_queues[want_level].push_back(task);
                 // The task is still queued, so _total_task_size is unchanged; keep
@@ -82,12 +82,20 @@ PipelineTaskSPtr PriorityTaskQueue::_try_take_unprotected(bool is_steal) {
 }
 
 int PriorityTaskQueue::_compute_level(uint64_t runtime) {
-    for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
+    for (int i = 0; i < static_cast<int>(NUM_RUNTIME_LEVELS) - 1; ++i) {
         if (runtime <= _queue_level_limit[i]) {
-            return i;
+            return static_cast<int>(RUNTIME_LEVEL_BASE) + i;
         }
     }
-    return SUB_QUEUE_LEVEL - 1;
+    return static_cast<int>(SUB_QUEUE_LEVEL) - 1;
+}
+
+int PriorityTaskQueue::_target_level(const PipelineTaskSPtr& task) {
+    // Inelastic fragments jump the queue to the top level so they drain first.
+    if (task->fragment_is_inelastic()) {
+        return static_cast<int>(INELASTIC_LEVEL);
+    }
+    return _compute_level(task->fragment_runtime_ns());
 }
 
 PipelineTaskSPtr PriorityTaskQueue::try_take(bool is_steal) {
@@ -115,10 +123,11 @@ Status PriorityTaskQueue::push(PipelineTaskSPtr task) {
     if (_closed) {
         return Status::InternalError("WorkTaskQueue closed");
     }
-    // The level is driven by the owning fragment's global CPU runtime, so all of a
-    // fragment's tasks are bucketed together. The dequeue path re-checks this in
-    // case the fragment crosses a threshold while the task waits.
-    auto level = _compute_level(task->fragment_runtime_ns());
+    // The level is driven by the owning fragment: inelastic fragments go to the top
+    // level, otherwise by global CPU runtime so all of a fragment's tasks are
+    // bucketed together. The dequeue path re-checks this in case the fragment's
+    // state changes while the task waits.
+    auto level = _target_level(task);
     std::unique_lock<std::mutex> lock(_work_size_mutex);
 
     _sub_queues[level].push_back(task);
