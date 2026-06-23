@@ -89,6 +89,18 @@ public:
 
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
+    // Global CPU runtime accumulated across all instances and pipeline tasks of
+    // this fragment. It drives the fragment-granular MLFQ demotion in the
+    // pipeline task scheduler: all of a fragment's tasks share this single
+    // counter, so a fragment is demoted as a whole based on its total CPU usage.
+    void add_fragment_runtime_ns(uint64_t delta) {
+        _fragment_runtime_ns.fetch_add(delta, std::memory_order_relaxed);
+    }
+    uint64_t fragment_runtime_ns() const {
+        return _fragment_runtime_ns.load(std::memory_order_relaxed);
+    }
+    std::atomic<uint64_t>* fragment_runtime_counter() { return &_fragment_runtime_ns; }
+
     void decrement_running_task(PipelineId pipeline_id);
 
     uint32_t rec_cte_stage() const { return _rec_cte_stage; }
@@ -212,6 +224,11 @@ private:
     // Id of this query
     TUniqueId _query_id;
     int _fragment_id;
+
+    // Global CPU runtime counter for this logical fragment. Shared by all of the
+    // fragment's pipeline tasks (across instances and across the blocking/simple
+    // sub-schedulers) and used by the pipeline MLFQ to compute the priority level.
+    std::atomic<uint64_t> _fragment_runtime_ns {0};
 
     ExecEnv* _exec_env = nullptr;
 
