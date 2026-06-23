@@ -40,13 +40,7 @@ PipelineTaskSPtr SubTaskQueue::try_take(bool is_steal) {
 
 ////////////////////  PriorityTaskQueue ////////////////////
 
-PriorityTaskQueue::PriorityTaskQueue() : _closed(false) {
-    double factor = 1;
-    for (int i = SUB_QUEUE_LEVEL - 1; i >= 0; i--) {
-        _sub_queues[i].set_level_factor(factor);
-        factor *= LEVEL_QUEUE_TIME_FACTOR;
-    }
-}
+PriorityTaskQueue::PriorityTaskQueue() : _closed(false) {}
 
 void PriorityTaskQueue::close() {
     std::unique_lock<std::mutex> lock(_work_size_mutex);
@@ -60,27 +54,31 @@ PipelineTaskSPtr PriorityTaskQueue::_try_take_unprotected(bool is_steal) {
         return nullptr;
     }
 
-    double min_vruntime = 0;
-    int level = -1;
-    for (int i = 0; i < SUB_QUEUE_LEVEL; ++i) {
-        double cur_queue_vruntime = _sub_queues[i].get_vruntime();
-        if (!_sub_queues[i].empty()) {
-            if (level == -1 || cur_queue_vruntime < min_vruntime) {
-                level = i;
-                min_vruntime = cur_queue_vruntime;
+    // Strict absolute priority: serve the lowest non-empty level first.
+    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+        while (!_sub_queues[level].empty()) {
+            auto task = _sub_queues[level].try_take(is_steal);
+            if (!task) {
+                break;
             }
+            // Lazy demotion: recompute the task's level from its fragment's global
+            // runtime, which may have grown (on any core) while the task waited. If
+            // the fragment now belongs in a deeper level, defer the task there
+            // instead of running it at the current, higher-priority level.
+            int want_level = _compute_level(task->fragment_runtime_ns());
+            if (want_level > level) {
+                _sub_queues[want_level].push_back(task);
+                // The task is still queued, so _total_task_size is unchanged; keep
+                // scanning. The deferred task will be reached when this same scan
+                // advances to `want_level`, where its level will match and it runs.
+                continue;
+            }
+            _total_task_size--;
+            DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+            return task;
         }
     }
-    DCHECK(level != -1);
-    _queue_level_min_vruntime = uint64_t(min_vruntime);
-
-    auto task = _sub_queues[level].try_take(is_steal);
-    if (task) {
-        task->update_queue_level(level);
-        _total_task_size--;
-        DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
-    }
-    return task;
+    return nullptr;
 }
 
 int PriorityTaskQueue::_compute_level(uint64_t runtime) {
@@ -117,14 +115,11 @@ Status PriorityTaskQueue::push(PipelineTaskSPtr task) {
     if (_closed) {
         return Status::InternalError("WorkTaskQueue closed");
     }
-    auto level = _compute_level(task->get_runtime_ns());
+    // The level is driven by the owning fragment's global CPU runtime, so all of a
+    // fragment's tasks are bucketed together. The dequeue path re-checks this in
+    // case the fragment crosses a threshold while the task waits.
+    auto level = _compute_level(task->fragment_runtime_ns());
     std::unique_lock<std::mutex> lock(_work_size_mutex);
-
-    // update empty queue's  runtime, to avoid too high priority
-    if (_sub_queues[level].empty() &&
-        double(_queue_level_min_vruntime) > _sub_queues[level].get_vruntime()) {
-        _sub_queues[level].adjust_runtime(_queue_level_min_vruntime);
-    }
 
     _sub_queues[level].push_back(task);
     _total_task_size++;
@@ -205,12 +200,12 @@ Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int core_id) {
 }
 
 void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spent) {
-    // if the task not execute but exception early close, core_id == -1
-    // should not do update_statistics
-    if (auto core_id = task->get_thread_id(_core_size); core_id >= 0) {
-        task->inc_runtime_ns(time_spent);
-        _prio_task_queues[core_id].inc_sub_queue_runtime(task->get_queue_level(), time_spent);
-    }
+    // Charge the executed CPU time to the owning fragment's global counter. This
+    // counter is shared by all of the fragment's tasks (across instances and
+    // cores) and drives the fragment-granular MLFQ demotion. For tasks without a
+    // fragment counter (e.g. RevokableTask), this is a no-op and they stay at the
+    // highest priority level, which is the desired behavior.
+    task->add_fragment_runtime_ns(time_spent);
 }
 
 } // namespace doris

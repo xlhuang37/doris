@@ -89,6 +89,9 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
 #ifndef BE_TEST
     _query_mem_tracker = fragment_context->get_query_ctx()->query_mem_tracker();
 #endif
+    if (fragment_context) {
+        _fragment_runtime_ptr = fragment_context->fragment_runtime_counter();
+    }
     _execution_dependencies.push_back(state->get_query_ctx()->get_execution_dependency());
     if (!_shared_state_map.contains(_sink->dests_id().front())) {
         auto shared_state = _sink->create_shared_state();

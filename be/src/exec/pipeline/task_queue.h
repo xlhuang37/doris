@@ -42,30 +42,22 @@ public:
 
     PipelineTaskSPtr try_take(bool is_steal);
 
-    void set_level_factor(double level_factor) { _level_factor = level_factor; }
-
-    // note:
-    // runtime is the time consumed by the actual execution of the task
-    // vruntime(means virtual runtime) = runtime / _level_factor
-    double get_vruntime() { return double(_runtime) / _level_factor; }
-
-    void inc_runtime(uint64_t delta_time) { _runtime += delta_time; }
-
-    void adjust_runtime(uint64_t vruntime) {
-        this->_runtime = uint64_t(double(vruntime) * _level_factor);
-    }
-
     bool empty() { return _queue.empty(); }
 
 private:
     std::queue<PipelineTaskSPtr> _queue;
-    // depends on LEVEL_QUEUE_TIME_FACTOR
-    double _level_factor = 1;
-
-    std::atomic<uint64_t> _runtime = 0;
 };
 
-// A Multilevel Feedback Queue
+// A Multilevel Feedback Queue with strict absolute priority between levels.
+//
+// A task's level is derived from its owning fragment's global CPU runtime (see
+// PipelineFragmentContext::fragment_runtime_ns), so a fragment is demoted as a
+// whole the more CPU it consumes. Workers always drain the lowest non-empty
+// level before serving a deeper one; within a level ordering is FIFO.
+//
+// Demotion is applied lazily at dequeue: when a task is pulled, its level is
+// recomputed from the (possibly grown) fragment counter, and if the fragment now
+// belongs in a deeper level the task is re-queued there instead of being run.
 class PriorityTaskQueue {
 public:
     PriorityTaskQueue();
@@ -78,13 +70,8 @@ public:
 
     Status push(PipelineTaskSPtr task);
 
-    void inc_sub_queue_runtime(int level, uint64_t runtime) {
-        _sub_queues[level].inc_runtime(runtime);
-    }
-
 private:
     PipelineTaskSPtr _try_take_unprotected(bool is_steal);
-    static constexpr auto LEVEL_QUEUE_TIME_FACTOR = 2;
     static constexpr size_t SUB_QUEUE_LEVEL = 6;
     SubTaskQueue _sub_queues[SUB_QUEUE_LEVEL];
     // 1s, 3s, 10s, 60s, 300s
@@ -94,10 +81,6 @@ private:
     std::condition_variable _wait_task;
     std::atomic<size_t> _total_task_size = 0;
     bool _closed;
-
-    // used to adjust vruntime of a queue when it's not empty
-    // protected by lock _work_size_mutex
-    uint64_t _queue_level_min_vruntime = 0;
 
     int _compute_level(uint64_t real_runtime);
 };
