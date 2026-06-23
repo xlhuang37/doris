@@ -133,15 +133,25 @@ public:
     // Execution phase should be terminated. This is called if this task is canceled or waken up early.
     void terminate();
 
-    // 1 used for update priority queue
-    // note(wb) an ugly implementation, need refactor later
-    // 1.1 pipeline task
-    void inc_runtime_ns(uint64_t delta_time) { this->_runtime += delta_time; }
-    uint64_t get_runtime_ns() const { return this->_runtime; }
+    // Used by the fragment-granular MLFQ in the pipeline task scheduler. The
+    // scheduler charges executed CPU time to the owning fragment's global counter
+    // (shared across all of the fragment's instances and pipeline tasks), and
+    // reads it back to decide which priority level this task belongs in.
+    void add_fragment_runtime_ns(uint64_t delta_time) {
+        if (_fragment_runtime_ptr != nullptr) {
+            _fragment_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
+        }
+    }
+    MOCK_FUNCTION uint64_t fragment_runtime_ns() const {
+        return _fragment_runtime_ptr != nullptr
+                       ? _fragment_runtime_ptr->load(std::memory_order_relaxed)
+                       : 0;
+    }
 
-    // 1.2 priority queue's queue level
-    void update_queue_level(int queue_level) { this->_queue_level = queue_level; }
-    int get_queue_level() const { return this->_queue_level; }
+    // True if the owning fragment is currently inelastic (few runnable pipelines).
+    // The scheduler reads this to boost the task to the top priority level. Defined
+    // out-of-line because it dereferences the (forward-declared) fragment context.
+    MOCK_FUNCTION bool fragment_is_inelastic() const;
 
     void put_in_runnable_queue() {
         _schedule_time++;
@@ -213,15 +223,16 @@ private:
 
     std::weak_ptr<PipelineFragmentContext> _fragment_context;
 
-    // used for priority queue
-    // it may be visited by different thread but there is no race condition
-    // so no need to add lock
-    uint64_t _runtime = 0;
-    // it's visited in one thread, so no need to thread synchronization
-    // 1 get task, (set _queue_level/_core_id)
-    // 2 exe task
-    // 3 update task statistics(update _queue_level/_core_id)
-    int _queue_level = 0;
+    // Cached pointer to the owning fragment context's global runtime counter.
+    // The fragment context strictly outlives its tasks, so this raw pointer is
+    // safe and lets the scheduler avoid locking `_fragment_context` (a weak_ptr)
+    // on the hot push/dequeue path.
+    std::atomic<uint64_t>* _fragment_runtime_ptr = nullptr;
+
+    // Cached raw pointer to the owning fragment context. Same lifetime guarantee as
+    // above: used for the inelastic-first signal read and the runnable-pipeline
+    // count updates without touching the weak_ptr on the hot path.
+    PipelineFragmentContext* _fragment_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

@@ -307,6 +307,11 @@ DEFINE_Int32(be_service_threads, "64");
 DEFINE_mInt32(pipeline_status_report_interval, "10");
 DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 
+// Inelastic-first scheduling: a fragment is considered "inelastic" (and its pipeline
+// tasks are boosted to the top MLFQ priority level) when the number of its currently
+// runnable (non-blocked) pipeline tasks is <= this threshold.
+DEFINE_mInt32(pipeline_inelastic_runnable_threshold, "4");
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task
