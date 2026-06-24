@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 
 #include "runtime/runtime_state.h"
@@ -33,6 +35,11 @@ class TaskExecutionContext : public std::enable_shared_from_this<TaskExecutionCo
 public:
     TaskExecutionContext();
     virtual ~TaskExecutionContext();
+
+    // Global CPU runtime counter for the owning logical fragment, shared by the
+    // pipeline MLFQ and (after this change) the scan scheduler so both level a
+    // fragment by one unified runtime signal. Non-fragment contexts return nullptr.
+    virtual std::atomic<uint64_t>* fragment_runtime_counter() { return nullptr; }
 };
 
 using TaskExecutionContextSPtr = std::shared_ptr<TaskExecutionContext>;
