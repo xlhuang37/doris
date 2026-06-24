@@ -133,18 +133,18 @@ public:
     // Execution phase should be terminated. This is called if this task is canceled or waken up early.
     void terminate();
 
-    // Used by the fragment-granular MLFQ in the pipeline task scheduler. The
-    // scheduler charges executed CPU time to the owning fragment's global counter
-    // (shared across all of the fragment's instances and pipeline tasks), and
-    // reads it back to decide which priority level this task belongs in.
-    void add_fragment_runtime_ns(uint64_t delta_time) {
-        if (_fragment_runtime_ptr != nullptr) {
-            _fragment_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
+    // Used by the query-granular MLFQ in the pipeline task scheduler. The
+    // scheduler charges executed CPU time to the owning query's global counter
+    // (shared across all of the query's fragments, instances and pipeline tasks),
+    // and reads it back to decide which priority level this task belongs in.
+    void add_query_runtime_ns(uint64_t delta_time) {
+        if (_query_runtime_ptr != nullptr) {
+            _query_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
         }
     }
-    MOCK_FUNCTION uint64_t fragment_runtime_ns() const {
-        return _fragment_runtime_ptr != nullptr
-                       ? _fragment_runtime_ptr->load(std::memory_order_relaxed)
+    MOCK_FUNCTION uint64_t query_runtime_ns() const {
+        return _query_runtime_ptr != nullptr
+                       ? _query_runtime_ptr->load(std::memory_order_relaxed)
                        : 0;
     }
 
@@ -218,11 +218,11 @@ private:
 
     std::weak_ptr<PipelineFragmentContext> _fragment_context;
 
-    // Cached pointer to the owning fragment context's global runtime counter.
-    // The fragment context strictly outlives its tasks, so this raw pointer is
-    // safe and lets the scheduler avoid locking `_fragment_context` (a weak_ptr)
-    // on the hot push/dequeue path.
-    std::atomic<uint64_t>* _fragment_runtime_ptr = nullptr;
+    // Cached pointer to the owning query's global runtime counter (owned by
+    // QueryContext). The query context strictly outlives its fragments and tasks,
+    // so this raw pointer is safe and lets the scheduler avoid locking
+    // `_fragment_context` (a weak_ptr) on the hot push/dequeue path.
+    std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;
