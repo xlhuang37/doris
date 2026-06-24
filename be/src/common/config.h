@@ -369,6 +369,8 @@ DECLARE_Int32(be_service_threads);
 DECLARE_mInt32(pipeline_status_report_interval);
 // Time slice for pipeline task execution (ms)
 DECLARE_mInt32(pipeline_task_exec_time_slice);
+// Soft per-query worker cap for the global query-granular pipeline MLFQ (0 = unbounded)
+DECLARE_mInt32(pipeline_query_worker_cap);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
