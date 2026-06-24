@@ -103,7 +103,7 @@ public:
             int initial_split_concurrency,
             std::chrono::nanoseconds split_concurrency_adjust_frequency,
             std::optional<int> max_concurrency_per_task,
-            std::atomic<uint64_t>* fragment_runtime = nullptr) override;
+            std::atomic<uint64_t>* query_runtime = nullptr) override;
 
     Status add_task(const TaskId& task_id, std::shared_ptr<TaskHandle> task_handle) override;
 
