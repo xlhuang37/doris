@@ -247,17 +247,20 @@ TEST(QueryCpuLeaseTest, SlotAccountingAndBandPriority) {
     lease.release_slot();
     EXPECT_EQ(lease.running_slots(), 0);
 
-    // CPU bands: <~6.3s -> 0, <~25s -> 1, <~100s -> 2, else 3.
+    // CPU bands follow the original Doris demotion quantum: <=1s -> 0, <=3s -> 1,
+    // <=10s -> 2, <=60s -> 3, <=300s -> 4, else -> 5.
     EXPECT_EQ(QueryCpuLease::pick_cpu_band(0), 0);
-    EXPECT_EQ(QueryCpuLease::pick_cpu_band(5 * kSecondNs), 0);
-    EXPECT_EQ(QueryCpuLease::pick_cpu_band(10 * kSecondNs), 1);
-    EXPECT_EQ(QueryCpuLease::pick_cpu_band(30 * kSecondNs), 2);
-    EXPECT_EQ(QueryCpuLease::pick_cpu_band(200 * kSecondNs), 3);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(2 * kSecondNs), 1);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(5 * kSecondNs), 2);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(10 * kSecondNs), 2);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(30 * kSecondNs), 3);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(100 * kSecondNs), 4);
+    EXPECT_EQ(QueryCpuLease::pick_cpu_band(500 * kSecondNs), 5);
 
     // With few slots the parallelism layer is 0, so priority == band.
     EXPECT_EQ(lease.compute_priority(0), 0);
-    EXPECT_EQ(lease.compute_priority(10 * kSecondNs), 1);
-    EXPECT_EQ(lease.compute_priority(30 * kSecondNs), 2);
+    EXPECT_EQ(lease.compute_priority(2 * kSecondNs), 1);
+    EXPECT_EQ(lease.compute_priority(30 * kSecondNs), 3);
 }
 
 // Parallelism layer dominates the CPU band: a query holding many slots is demoted below
@@ -266,11 +269,11 @@ TEST(QueryCpuLeaseTest, ParallelismLayerDominatesBand) {
     config::cpu_lease_leveling_slots = 4; // one layer per 4 slots
     QueryCpuLease wide;
     for (int i = 0; i < 8; ++i) {
-        wide.acquire_slot(); // layer = 8/4 = 2
+        wide.acquire_slot(); // layer = min(8/4, kNumLayers-1) = 1
     }
-    QueryCpuLease narrow; // layer 0, but lots of CPU -> band 2
-    // wide: layer 2, band 0 -> 2*kLayerWidth + 0 = 8
-    // narrow: layer 0, band 2 -> 2
+    QueryCpuLease narrow; // layer 0, but lots of CPU -> deeper band
+    // wide: layer 1, band 0 -> 1*kLayerWidth + 0 = 6
+    // narrow: layer 0, band 3 (30s) -> 3
     EXPECT_GT(wide.compute_priority(0), narrow.compute_priority(30 * kSecondNs));
     config::cpu_lease_leveling_slots = 8;
 }
@@ -328,9 +331,9 @@ TEST(CpuLeaseSchedulingTest, BandPriorityOrdering) {
     q.set_grantor(&grantor);
 
     QueryCpuLease la, lb, lc;
-    auto* qa = qkey(0xA); // band 0
-    auto* qb = qkey(0xB); // band 1
-    auto* qc = qkey(0xC); // band 2
+    auto* qa = qkey(0xA); // 0s   -> band 0
+    auto* qb = qkey(0xB); // 10s  -> band 2
+    auto* qc = qkey(0xC); // 30s  -> band 3
 
     // Push lowest-priority first to prove ordering is by priority, not insertion.
     ASSERT_TRUE(q.push_back(std::make_shared<MockPipelineTask>(qc, 30 * kSecondNs, &lc)).ok());

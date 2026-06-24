@@ -110,7 +110,7 @@ protected:
     // Legacy runtime-threshold leveling uses the first LEGACY_LEVELS levels; the lease
     // mode uses up to QueryCpuLease::kNumLevels. The level arrays are sized to the max.
     static constexpr int LEGACY_LEVELS = 6;
-    static constexpr int NUM_LEVELS = 16; // >= QueryCpuLease::kNumLevels and LEGACY_LEVELS
+    static constexpr int NUM_LEVELS = 12; // >= QueryCpuLease::kNumLevels and LEGACY_LEVELS
 
     // One bucket per runnable query. Lives in `_nodes` for the query's lifetime in
     // the queue; it is linked into exactly one level list while it has runnable

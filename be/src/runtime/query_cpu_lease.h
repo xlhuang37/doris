@@ -40,11 +40,13 @@ namespace doris {
 // (scan concurrency = running_slots * scan_threads_per_slot).
 class QueryCpuLease {
 public:
-    // Parallelism layers and CPU bands within a layer (ported from ClickHouse). Total
-    // MLFQ levels = kNumLayers * kLayerWidth.
-    static constexpr int kNumLayers = 4;
-    static constexpr int kLayerWidth = 4;
-    static constexpr int kNumLevels = kNumLayers * kLayerWidth; // 16
+    // Parallelism layers (ClickHouse-style) x CPU demotion bands. ClickHouse uses 2
+    // parallelism layers; the band dimension reuses Doris's original runtime-threshold
+    // leveling ({1s,3s,10s,60s,300s} -> 6 bands). Total MLFQ levels = kNumLayers *
+    // kLayerWidth.
+    static constexpr int kNumLayers = 2; // ClickHouse uses 2 parallelism layers
+    static constexpr int kLayerWidth = 6; // CPU bands: 5 thresholds -> 6 buckets
+    static constexpr int kNumLevels = kNumLayers * kLayerWidth; // 12
 
     QueryCpuLease() = default;
 
@@ -68,14 +70,15 @@ public:
     }
 
     // CPU consumption band [0, kLayerWidth): smaller = less CPU used = higher priority.
+    // Demotion quantum thresholds follow the original Doris MLFQ: a query is demoted a
+    // band when its cumulative CPU crosses 1s, 3s, 10s, 60s, 300s (anything beyond 300s
+    // lands in the deepest band).
     static int pick_cpu_band(uint64_t cumulative_cpu_ns) {
-        // Thresholds in ns; the last is a catch-all. Ported from ClickHouse
-        // kCpuBandThresholdsNs (~6s / ~25s / ~100s / inf).
-        static constexpr std::array<uint64_t, kLayerWidth> kThresholds = {
-                6'296'000'000ULL, 25'004'000'000ULL, 100'016'000'000ULL,
-                std::numeric_limits<uint64_t>::max()};
-        for (int i = 0; i < kLayerWidth; ++i) {
-            if (cumulative_cpu_ns < kThresholds[i]) {
+        static constexpr std::array<uint64_t, kLayerWidth - 1> kThresholds = {
+                1'000'000'000ULL, 3'000'000'000ULL, 10'000'000'000ULL, 60'000'000'000ULL,
+                300'000'000'000ULL};
+        for (int i = 0; i < kLayerWidth - 1; ++i) {
+            if (cumulative_cpu_ns <= kThresholds[i]) {
                 return i;
             }
         }
