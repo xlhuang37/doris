@@ -24,13 +24,13 @@ TimeSharingTaskHandle::TimeSharingTaskHandle(
         const TaskId& task_id, std::shared_ptr<SplitQueue> split_queue,
         std::function<double()> utilization_supplier, int initial_split_concurrency,
         std::chrono::nanoseconds split_concurrency_adjust_frequency,
-        std::optional<int> max_concurrency_per_task, std::atomic<uint64_t>* fragment_runtime)
+        std::optional<int> max_concurrency_per_task, std::atomic<uint64_t>* query_runtime)
         : _task_id(task_id),
           _split_queue(std::move(split_queue)),
           _utilization_supplier(std::move(utilization_supplier)),
           _max_concurrency_per_task(max_concurrency_per_task),
           _concurrency_controller(initial_split_concurrency, split_concurrency_adjust_frequency),
-          _fragment_runtime_ptr(fragment_runtime) {}
+          _query_runtime_ptr(query_runtime) {}
 
 Status TimeSharingTaskHandle::init() {
     return Status::OK();
@@ -42,14 +42,14 @@ Priority TimeSharingTaskHandle::add_scheduled_nanos(int64_t duration_nanos) {
                                    static_cast<int>(_running_leaf_splits.size()));
     _scheduled_nanos += duration_nanos;
 
-    if (_fragment_runtime_ptr != nullptr) {
-        // Unified fragment runtime drives the level: charge the executed scan CPU into
-        // the fragment counter (shared with the pipeline MLFQ), then level by the new
-        // fragment runtime. The within-level priority is the fragment runtime itself,
-        // so lighter fragments are served first within a level.
+    if (_query_runtime_ptr != nullptr) {
+        // Unified query runtime drives the level: charge the executed scan CPU into
+        // the query counter (shared with the pipeline MLFQ), then level by the new
+        // query runtime. The within-level priority is the query runtime itself,
+        // so lighter queries are served first within a level.
         auto runtime = static_cast<int64_t>(
-                _fragment_runtime_ptr->fetch_add(static_cast<uint64_t>(duration_nanos),
-                                                 std::memory_order_relaxed) +
+                _query_runtime_ptr->fetch_add(static_cast<uint64_t>(duration_nanos),
+                                              std::memory_order_relaxed) +
                 static_cast<uint64_t>(duration_nanos));
         _priority = Priority(_split_queue->compute_level(runtime), runtime);
         return _priority;
@@ -65,8 +65,8 @@ Priority TimeSharingTaskHandle::add_scheduled_nanos(int64_t duration_nanos) {
 Priority TimeSharingTaskHandle::reset_level_priority() {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    if (_fragment_runtime_ptr != nullptr) {
-        auto runtime = static_cast<int64_t>(_fragment_runtime_ptr->load(std::memory_order_relaxed));
+    if (_query_runtime_ptr != nullptr) {
+        auto runtime = static_cast<int64_t>(_query_runtime_ptr->load(std::memory_order_relaxed));
         _priority = Priority(_split_queue->compute_level(runtime), runtime);
         return _priority;
     }
@@ -90,11 +90,11 @@ bool TimeSharingTaskHandle::is_closed() const {
 
 Priority TimeSharingTaskHandle::priority() const {
     std::lock_guard<std::mutex> lock(_mutex);
-    // When backed by a fragment counter, recompute the level live so the split is
+    // When backed by a query counter, recompute the level live so the split is
     // re-leveled (via PrioritizedSplitRunner::update_level_priority) when sibling
-    // scanners or pipeline tasks have grown the shared fragment runtime.
-    if (_fragment_runtime_ptr != nullptr) {
-        auto runtime = static_cast<int64_t>(_fragment_runtime_ptr->load(std::memory_order_relaxed));
+    // scanners or pipeline tasks have grown the shared query runtime.
+    if (_query_runtime_ptr != nullptr) {
+        auto runtime = static_cast<int64_t>(_query_runtime_ptr->load(std::memory_order_relaxed));
         return Priority(_split_queue->compute_level(runtime), runtime);
     }
     return _priority;
