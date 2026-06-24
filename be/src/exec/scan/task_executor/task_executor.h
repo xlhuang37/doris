@@ -40,15 +40,15 @@ public:
     virtual void stop() = 0;
     virtual void wait() = 0;
 
-    // `fragment_runtime` (optional) is the owning fragment's unified CPU runtime
+    // `query_runtime` (optional) is the owning query's unified CPU runtime
     // counter. When provided, the time-sharing scheduler levels this task's splits
-    // by the fragment runtime and charges executed scan CPU back into it.
+    // by the query runtime and charges executed scan CPU back into it.
     virtual Result<std::shared_ptr<TaskHandle>> create_task(
             const TaskId& task_id, std::function<double()> utilization_supplier,
             int initial_split_concurrency,
             std::chrono::nanoseconds split_concurrency_adjust_frequency,
             std::optional<int> max_drivers_per_task,
-            std::atomic<uint64_t>* fragment_runtime = nullptr) = 0;
+            std::atomic<uint64_t>* query_runtime = nullptr) = 0;
 
     virtual Status add_task(const TaskId& task_id, std::shared_ptr<TaskHandle> task_handle) = 0;
 

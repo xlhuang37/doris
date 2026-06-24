@@ -50,13 +50,13 @@ private:
 
 // A Multilevel Feedback Queue with strict absolute priority between levels.
 //
-// A task's level is derived from its owning fragment's global CPU runtime (see
-// PipelineFragmentContext::fragment_runtime_ns), so a fragment is demoted as a
-// whole the more CPU it consumes. Workers always drain the lowest non-empty
-// level before serving a deeper one; within a level ordering is FIFO.
+// A task's level is derived from its owning query's global CPU runtime (see
+// QueryContext::query_runtime_counter), so a query is demoted as a whole the more
+// CPU it consumes across all of its fragments. Workers always drain the lowest
+// non-empty level before serving a deeper one; within a level ordering is FIFO.
 //
 // Demotion is applied lazily at dequeue: when a task is pulled, its level is
-// recomputed from the (possibly grown) fragment counter, and if the fragment now
+// recomputed from the (possibly grown) query counter, and if the query now
 // belongs in a deeper level the task is re-queued there instead of being run.
 class PriorityTaskQueue {
 public:

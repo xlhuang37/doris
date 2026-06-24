@@ -33,8 +33,8 @@
 
 namespace doris {
 
-// Scan-side fragment-runtime absolute-priority MLFQ tests. The level thresholds are
-// MultilevelSplitQueue::LEVEL_THRESHOLD_SECONDS = {0, 1, 10, 60, 300}, so a fragment
+// Scan-side query-runtime absolute-priority MLFQ tests. The level thresholds are
+// MultilevelSplitQueue::LEVEL_THRESHOLD_SECONDS = {0, 1, 10, 60, 300}, so a query
 // runtime maps to: <1s -> L0, [1s,10s) -> L1, [10s,60s) -> L2, [60s,300s) -> L3,
 // >=300s -> L4.
 static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
@@ -61,14 +61,14 @@ protected:
     int _next_id = 0;
 
     std::shared_ptr<TimeSharingTaskHandle> make_handle(const std::string& id,
-                                                       std::atomic<uint64_t>* frag) {
+                                                       std::atomic<uint64_t>* query_rt) {
         return std::make_shared<TimeSharingTaskHandle>(
                 TaskId(id), queue, []() { return 0.0; }, 1, std::chrono::seconds(1), std::nullopt,
-                frag);
+                query_rt);
     }
 
     // The PrioritizedSplitRunner constructor calls update_level_priority(), which reads
-    // the handle's fragment-runtime-derived level, so callers must set the fragment
+    // the handle's query-runtime-derived level, so callers must set the query
     // counter before building the split to get the intended initial level.
     std::shared_ptr<PrioritizedSplitRunner> make_split(
             const std::shared_ptr<TimeSharingTaskHandle>& handle) {
@@ -77,27 +77,27 @@ protected:
     }
 };
 
-// The split's level is derived from its fragment's cumulative runtime.
-TEST_F(MultilevelSplitQueueTest, LevelDerivedFromFragmentRuntime) {
-    std::atomic<uint64_t> frag_l0 {0};
-    std::atomic<uint64_t> frag_l1 {5 * kSecondNs};
-    std::atomic<uint64_t> frag_l3 {120 * kSecondNs};
+// The split's level is derived from its query's cumulative runtime.
+TEST_F(MultilevelSplitQueueTest, LevelDerivedFromQueryRuntime) {
+    std::atomic<uint64_t> query_l0 {0};
+    std::atomic<uint64_t> query_l1 {5 * kSecondNs};
+    std::atomic<uint64_t> query_l3 {120 * kSecondNs};
 
-    EXPECT_EQ(make_handle("l0", &frag_l0)->priority().level(), 0);
-    EXPECT_EQ(make_handle("l1", &frag_l1)->priority().level(), 1);
-    EXPECT_EQ(make_handle("l3", &frag_l3)->priority().level(), 3);
+    EXPECT_EQ(make_handle("l0", &query_l0)->priority().level(), 0);
+    EXPECT_EQ(make_handle("l1", &query_l1)->priority().level(), 1);
+    EXPECT_EQ(make_handle("l3", &query_l3)->priority().level(), 3);
 }
 
 // Workers drain the lowest non-empty level fully before any deeper one, regardless of
 // offer order.
 TEST_F(MultilevelSplitQueueTest, AbsolutePriorityAcrossLevels) {
-    std::atomic<uint64_t> frag_shallow {0};            // L0
-    std::atomic<uint64_t> frag_mid {5 * kSecondNs};    // L1
-    std::atomic<uint64_t> frag_deep {120 * kSecondNs}; // L3
+    std::atomic<uint64_t> query_shallow {0};            // L0
+    std::atomic<uint64_t> query_mid {5 * kSecondNs};    // L1
+    std::atomic<uint64_t> query_deep {120 * kSecondNs}; // L3
 
-    auto shallow = make_split(make_handle("shallow", &frag_shallow));
-    auto mid = make_split(make_handle("mid", &frag_mid));
-    auto deep = make_split(make_handle("deep", &frag_deep));
+    auto shallow = make_split(make_handle("shallow", &query_shallow));
+    auto mid = make_split(make_handle("mid", &query_mid));
+    auto deep = make_split(make_handle("deep", &query_deep));
 
     queue->offer(deep);
     queue->offer(mid);
@@ -109,14 +109,14 @@ TEST_F(MultilevelSplitQueueTest, AbsolutePriorityAcrossLevels) {
     EXPECT_EQ(queue->take(), nullptr);
 }
 
-// Within a single level, the split whose fragment has consumed less CPU is served
-// first (SplitRunnerComparator orders by level priority == fragment runtime).
-TEST_F(MultilevelSplitQueueTest, WithinLevelOrderedByFragmentRuntime) {
-    std::atomic<uint64_t> frag_light {1'000'000};  // 1ms -> L0
-    std::atomic<uint64_t> frag_heavy {2'000'000};  // 2ms -> L0
+// Within a single level, the split whose query has consumed less CPU is served
+// first (SplitRunnerComparator orders by level priority == query runtime).
+TEST_F(MultilevelSplitQueueTest, WithinLevelOrderedByQueryRuntime) {
+    std::atomic<uint64_t> query_light {1'000'000};  // 1ms -> L0
+    std::atomic<uint64_t> query_heavy {2'000'000};  // 2ms -> L0
 
-    auto light = make_split(make_handle("light", &frag_light));
-    auto heavy = make_split(make_handle("heavy", &frag_heavy));
+    auto light = make_split(make_handle("light", &query_light));
+    auto heavy = make_split(make_handle("heavy", &query_heavy));
 
     queue->offer(heavy);
     queue->offer(light);
@@ -125,21 +125,21 @@ TEST_F(MultilevelSplitQueueTest, WithinLevelOrderedByFragmentRuntime) {
     EXPECT_EQ(queue->take().get(), heavy.get());
 }
 
-// A split enqueued at a high-priority level whose fragment subsequently consumes a lot
+// A split enqueued at a high-priority level whose query subsequently consumes a lot
 // of CPU (on any core) is lazily demoted to the correct deeper level at take() time,
 // instead of running at its stale level.
-TEST_F(MultilevelSplitQueueTest, LazyDemotionWhenFragmentGrows) {
-    std::atomic<uint64_t> frag_boosted {0};         // starts at L0
-    std::atomic<uint64_t> frag_mid {5 * kSecondNs}; // L1
+TEST_F(MultilevelSplitQueueTest, LazyDemotionWhenQueryGrows) {
+    std::atomic<uint64_t> query_boosted {0};         // starts at L0
+    std::atomic<uint64_t> query_mid {5 * kSecondNs}; // L1
 
-    auto boosted = make_split(make_handle("boosted", &frag_boosted));
-    auto mid = make_split(make_handle("mid", &frag_mid));
+    auto boosted = make_split(make_handle("boosted", &query_boosted));
+    auto mid = make_split(make_handle("mid", &query_mid));
 
     queue->offer(boosted); // enters L0
     queue->offer(mid);     // enters L1
 
-    // The boosted split's fragment burns a lot of CPU after it was enqueued.
-    frag_boosted.store(120 * kSecondNs); // now belongs in L3
+    // The boosted split's query burns a lot of CPU after it was enqueued.
+    query_boosted.store(120 * kSecondNs); // now belongs in L3
 
     // Even though `boosted` physically sits in L0, lazy re-leveling defers it and `mid`
     // (L1) is served first.

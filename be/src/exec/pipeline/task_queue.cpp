@@ -61,11 +61,11 @@ PipelineTaskSPtr PriorityTaskQueue::_try_take_unprotected(bool is_steal) {
             if (!task) {
                 break;
             }
-            // Lazy demotion: recompute the task's level from its fragment's global
+            // Lazy demotion: recompute the task's level from its query's global
             // runtime, which may have grown (on any core) while the task waited. If
-            // the fragment now belongs in a deeper level, defer the task there
+            // the query now belongs in a deeper level, defer the task there
             // instead of running it at the current, higher-priority level.
-            int want_level = _compute_level(task->fragment_runtime_ns());
+            int want_level = _compute_level(task->query_runtime_ns());
             if (want_level > level) {
                 _sub_queues[want_level].push_back(task);
                 // The task is still queued, so _total_task_size is unchanged; keep
@@ -115,10 +115,10 @@ Status PriorityTaskQueue::push(PipelineTaskSPtr task) {
     if (_closed) {
         return Status::InternalError("WorkTaskQueue closed");
     }
-    // The level is driven by the owning fragment's global CPU runtime, so all of a
-    // fragment's tasks are bucketed together. The dequeue path re-checks this in
-    // case the fragment crosses a threshold while the task waits.
-    auto level = _compute_level(task->fragment_runtime_ns());
+    // The level is driven by the owning query's global CPU runtime, so all of a
+    // query's tasks are bucketed together. The dequeue path re-checks this in
+    // case the query crosses a threshold while the task waits.
+    auto level = _compute_level(task->query_runtime_ns());
     std::unique_lock<std::mutex> lock(_work_size_mutex);
 
     _sub_queues[level].push_back(task);
@@ -201,11 +201,11 @@ Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int core_id) {
 
 void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spent) {
     // Charge the executed CPU time to the owning fragment's global counter. This
-    // counter is shared by all of the fragment's tasks (across instances and
-    // cores) and drives the fragment-granular MLFQ demotion. For tasks without a
-    // fragment counter (e.g. RevokableTask), this is a no-op and they stay at the
+    // counter is shared by all of the query's tasks (across fragments, instances
+    // and cores) and drives the query-granular MLFQ demotion. For tasks without a
+    // query counter (e.g. RevokableTask), this is a no-op and they stay at the
     // highest priority level, which is the desired behavior.
-    task->add_fragment_runtime_ns(time_spent);
+    task->add_query_runtime_ns(time_spent);
 }
 
 } // namespace doris
