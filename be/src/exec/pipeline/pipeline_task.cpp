@@ -91,6 +91,7 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
 #endif
     if (fragment_context) {
         _query_runtime_ptr = fragment_context->query_runtime_counter();
+        _query_ctx_raw = fragment_context->get_query_ctx();
     }
     _execution_dependencies.push_back(state->get_query_ctx()->get_execution_dependency());
     if (!_shared_state_map.contains(_sink->dests_id().front())) {

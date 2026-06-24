@@ -40,7 +40,6 @@ class PipelineFragmentContext;
 namespace doris {
 
 class MultiCoreTaskQueue;
-class PriorityTaskQueue;
 class Dependency;
 
 class PipelineTask : public std::enable_shared_from_this<PipelineTask> {
@@ -147,6 +146,10 @@ public:
                        ? _query_runtime_ptr->load(std::memory_order_relaxed)
                        : 0;
     }
+    // Opaque key identifying the owning query, used by the global query-granular MLFQ
+    // to bucket this task. The query context outlives its tasks; the pointer is only
+    // ever compared/used as a map key, never dereferenced by the queue.
+    MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
 
     void put_in_runnable_queue() {
         _schedule_time++;
@@ -223,6 +226,10 @@ private:
     // so this raw pointer is safe and lets the scheduler avoid locking
     // `_fragment_context` (a weak_ptr) on the hot push/dequeue path.
     std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
+
+    // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
+    // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
+    QueryContext* _query_ctx_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

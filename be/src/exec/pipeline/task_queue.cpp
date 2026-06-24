@@ -18,70 +18,26 @@
 #include "exec/pipeline/task_queue.h"
 
 // IWYU pragma: no_include <bits/chrono.h>
+#include <algorithm>
 #include <chrono> // IWYU pragma: keep
+#include <iterator>
+#include <limits>
 #include <memory>
-#include <string>
 
+#include "common/config.h"
 #include "common/logging.h"
+#include "common/metrics/doris_metrics.h"
 #include "exec/pipeline/pipeline_task.h"
-#include "runtime/workload_group/workload_group.h"
 
 namespace doris {
 #include "common/compile_check_begin.h"
 
-PipelineTaskSPtr SubTaskQueue::try_take(bool is_steal) {
-    if (_queue.empty()) {
-        return nullptr;
-    }
-    auto task = _queue.front();
-    _queue.pop();
-    return task;
-}
+MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
+        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {}
 
-////////////////////  PriorityTaskQueue ////////////////////
+MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
 
-PriorityTaskQueue::PriorityTaskQueue() : _closed(false) {}
-
-void PriorityTaskQueue::close() {
-    std::unique_lock<std::mutex> lock(_work_size_mutex);
-    _closed = true;
-    _wait_task.notify_all();
-    DorisMetrics::instance()->pipeline_task_queue_size->increment(-_total_task_size);
-}
-
-PipelineTaskSPtr PriorityTaskQueue::_try_take_unprotected(bool is_steal) {
-    if (_total_task_size == 0 || _closed) {
-        return nullptr;
-    }
-
-    // Strict absolute priority: serve the lowest non-empty level first.
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
-        while (!_sub_queues[level].empty()) {
-            auto task = _sub_queues[level].try_take(is_steal);
-            if (!task) {
-                break;
-            }
-            // Lazy demotion: recompute the task's level from its query's global
-            // runtime, which may have grown (on any core) while the task waited. If
-            // the query now belongs in a deeper level, defer the task there
-            // instead of running it at the current, higher-priority level.
-            int want_level = _compute_level(task->query_runtime_ns());
-            if (want_level > level) {
-                _sub_queues[want_level].push_back(task);
-                // The task is still queued, so _total_task_size is unchanged; keep
-                // scanning. The deferred task will be reached when this same scan
-                // advances to `want_level`, where its level will match and it runs.
-                continue;
-            }
-            _total_task_size--;
-            DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
-            return task;
-        }
-    }
-    return nullptr;
-}
-
-int PriorityTaskQueue::_compute_level(uint64_t runtime) {
+int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
     for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
         if (runtime <= _queue_level_limit[i]) {
             return i;
@@ -90,76 +46,150 @@ int PriorityTaskQueue::_compute_level(uint64_t runtime) {
     return SUB_QUEUE_LEVEL - 1;
 }
 
-PipelineTaskSPtr PriorityTaskQueue::try_take(bool is_steal) {
-    // TODO other efficient lock? e.g. if get lock fail, return null_ptr
-    std::unique_lock<std::mutex> lock(_work_size_mutex);
-    return _try_take_unprotected(is_steal);
-}
-
-PipelineTaskSPtr PriorityTaskQueue::take(uint32_t timeout_ms) {
-    std::unique_lock<std::mutex> lock(_work_size_mutex);
-    auto task = _try_take_unprotected(false);
-    if (task) {
-        return task;
-    } else {
-        if (timeout_ms > 0) {
-            _wait_task.wait_for(lock, std::chrono::milliseconds(timeout_ms));
-        } else {
-            _wait_task.wait(lock);
+int MultiCoreTaskQueue::_lowest_non_empty_level() const {
+    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+        if (!_levels[level].empty()) {
+            return level;
         }
-        return _try_take_unprotected(false);
     }
+    return -1;
 }
 
-Status PriorityTaskQueue::push(PipelineTaskSPtr task) {
-    if (_closed) {
-        return Status::InternalError("WorkTaskQueue closed");
-    }
-    // The level is driven by the owning query's global CPU runtime, so all of a
-    // query's tasks are bucketed together. The dequeue path re-checks this in
-    // case the query crosses a threshold while the task waits.
-    auto level = _compute_level(task->query_runtime_ns());
-    std::unique_lock<std::mutex> lock(_work_size_mutex);
-
-    _sub_queues[level].push_back(task);
-    _total_task_size++;
-    DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
-    _wait_task.notify_one();
-    return Status::OK();
+int MultiCoreTaskQueue::_lease(const QueryNode* /*node*/) const {
+    // Option 2 (soft lease): a per-query cap on concurrent workers. When > 0, workers
+    // beyond the cap spill to lower-priority queries even if this query has more
+    // runnable tasks; default (<= 0) means unbounded (strict absolute priority).
+    int cap = config::pipeline_query_worker_cap;
+    return cap > 0 ? cap : std::numeric_limits<int>::max();
 }
 
-MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
+uint64_t MultiCoreTaskQueue::_node_runtime(const QueryNode* node) const {
+    if (node->runnable.empty()) {
+        return 0;
+    }
+    return node->runnable.front()->query_runtime_ns();
+}
 
-MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
-        : _prio_task_queues(core_size), _closed(false), _core_size(core_size) {}
+MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key) {
+    auto it = _nodes.find(key);
+    if (it != _nodes.end()) {
+        return it->second.get();
+    }
+    auto node = std::make_unique<QueryNode>();
+    node->key = key;
+    QueryNode* raw = node.get();
+    _nodes.emplace(key, std::move(node));
+    return raw;
+}
 
-void MultiCoreTaskQueue::close() {
-    if (_closed) {
+void MultiCoreTaskQueue::_link(QueryNode* node, int level) {
+    node->level = level;
+    _levels[level].push_back(node);
+    node->pos = std::prev(_levels[level].end());
+    node->linked = true;
+}
+
+void MultiCoreTaskQueue::_unlink(QueryNode* node) {
+    if (!node->linked) {
         return;
     }
-    _closed = true;
-    // close all priority task queue
-    std::ranges::for_each(_prio_task_queues,
-                          [](auto& prio_task_queue) { prio_task_queue.close(); });
+    _levels[node->level].erase(node->pos);
+    node->linked = false;
 }
 
-PipelineTaskSPtr MultiCoreTaskQueue::take(int core_id) {
+void MultiCoreTaskQueue::_relevel_locked(QueryNode* node) {
+    if (!node->linked) {
+        return;
+    }
+    int want = _compute_level(_node_runtime(node));
+    if (want != node->level) {
+        _unlink(node);
+        _link(node, want);
+    }
+}
+
+PipelineTaskSPtr MultiCoreTaskQueue::_pop_from_node(QueryNode* node, int worker_id) {
+    auto task = node->runnable.front();
+    node->runnable.pop();
+    node->in_flight++;
+    _total_task_size.fetch_sub(1);
+    DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+
+    if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
+        _worker_sticky[worker_id] = node->key;
+    }
+
+    if (node->runnable.empty()) {
+        // No more runnable tasks: unlink from its level (kept in `_nodes` while it
+        // still has in-flight workers, so their release can find it).
+        _unlink(node);
+    } else {
+        // Round-robin: rotate this node to the back of its level so the next worker
+        // serves a different query first.
+        auto& lst = _levels[node->level];
+        lst.splice(lst.end(), lst, node->pos);
+        node->pos = std::prev(lst.end());
+    }
+    return task;
+}
+
+PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
+    if (_total_task_size.load() == 0 || _closed) {
+        return nullptr;
+    }
+
+    // 1. Locality: keep serving the query this worker last served, as long as it is
+    // still the highest-priority (lowest non-empty level) query and under its lease.
+    if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
+        QueryContext* sticky = _worker_sticky[worker_id];
+        if (sticky != nullptr) {
+            auto it = _nodes.find(sticky);
+            if (it != _nodes.end()) {
+                QueryNode* node = it->second.get();
+                if (node->linked && !node->runnable.empty()) {
+                    _relevel_locked(node);
+                    if (node->level == _lowest_non_empty_level() &&
+                        node->in_flight < _lease(node)) {
+                        return _pop_from_node(node, worker_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Strict absolute priority: drain the lowest non-empty level first; within a
+    // level, round-robin across queries (the list front is the least-recently served).
+    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+        auto& lst = _levels[level];
+        for (auto it = lst.begin(); it != lst.end();) {
+            QueryNode* node = *it;
+            // Lazy demotion: if the query has crossed a threshold, move the whole node
+            // (all of its tasks) to the deeper level and keep scanning.
+            int want = _compute_level(_node_runtime(node));
+            if (want > level) {
+                auto next = std::next(it);
+                _unlink(node);
+                _link(node, want);
+                it = next;
+                continue;
+            }
+            if (!node->runnable.empty() && node->in_flight < _lease(node)) {
+                return _pop_from_node(node, worker_id);
+            }
+            ++it;
+        }
+    }
+    return nullptr;
+}
+
+PipelineTaskSPtr MultiCoreTaskQueue::_take(int worker_id, uint32_t timeout_ms) {
     PipelineTaskSPtr task = nullptr;
-    while (!_closed) {
-        DCHECK(_prio_task_queues.size() > core_id)
-                << " list size: " << _prio_task_queues.size() << " core_id: " << core_id
-                << " _core_size: " << _core_size << " _next_core: " << _next_core.load();
-        task = _prio_task_queues[core_id].try_take(false);
-        if (task) {
-            break;
-        }
-        task = _steal_take(core_id);
-        if (task) {
-            break;
-        }
-        task = _prio_task_queues[core_id].take(WAIT_CORE_TASK_TIMEOUT_MS /* timeout_ms */);
-        if (task) {
-            break;
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        task = _try_take_unprotected(worker_id);
+        if (!task && !_closed && timeout_ms > 0) {
+            _wait_task.wait_for(lock, std::chrono::milliseconds(timeout_ms));
+            task = _try_take_unprotected(worker_id);
         }
     }
     if (task) {
@@ -168,44 +198,83 @@ PipelineTaskSPtr MultiCoreTaskQueue::take(int core_id) {
     return task;
 }
 
-PipelineTaskSPtr MultiCoreTaskQueue::_steal_take(int core_id) {
-    DCHECK(core_id < _core_size);
-    int next_id = core_id;
-    for (int i = 1; i < _core_size; ++i) {
-        ++next_id;
-        if (next_id == _core_size) {
-            next_id = 0;
-        }
-        DCHECK(next_id < _core_size);
-        auto task = _prio_task_queues[next_id].try_take(true);
-        if (task) {
-            return task;
-        }
+PipelineTaskSPtr MultiCoreTaskQueue::take(int core_id) {
+    return _take(core_id, WAIT_CORE_TASK_TIMEOUT_MS);
+}
+
+Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
+    if (_closed) {
+        return Status::InternalError("WorkTaskQueue closed");
     }
-    return nullptr;
+    task->put_in_runnable_queue();
+    QueryContext* key = task->query_ctx_raw();
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        if (_closed) {
+            return Status::InternalError("WorkTaskQueue closed");
+        }
+        QueryNode* node = _ensure_node(key);
+        node->runnable.push(task);
+        if (!node->linked) {
+            // An unlinked node has no runnable tasks; (re)link it at the level implied
+            // by the owning query's current global runtime.
+            _link(node, _compute_level(task->query_runtime_ns()));
+        }
+        _total_task_size.fetch_add(1);
+        DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
+        _wait_task.notify_one();
+    }
+    return Status::OK();
 }
 
 Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task) {
-    int thread_id = task->get_thread_id(_core_size);
-    if (thread_id < 0) {
-        thread_id = _next_core.fetch_add(1) % _core_size;
-    }
-    return push_back(task, thread_id);
+    return _push(std::move(task));
 }
 
-Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int core_id) {
-    DCHECK(core_id < _core_size);
-    task->put_in_runnable_queue();
-    return _prio_task_queues[core_id].push(task);
+Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int /*core_id*/) {
+    // `core_id` no longer pins a task to a shard; placement is global by query level.
+    return _push(std::move(task));
+}
+
+void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key) {
+    std::unique_lock<std::mutex> lock(_mutex);
+    auto it = _nodes.find(key);
+    if (it == _nodes.end()) {
+        return;
+    }
+    QueryNode* node = it->second.get();
+    if (node->in_flight > 0) {
+        node->in_flight--;
+    }
+    if (!node->linked && node->runnable.empty() && node->in_flight == 0) {
+        _nodes.erase(it);
+    }
 }
 
 void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spent) {
-    // Charge the executed CPU time to the owning fragment's global counter. This
-    // counter is shared by all of the query's tasks (across fragments, instances
-    // and cores) and drives the query-granular MLFQ demotion. For tasks without a
-    // query counter (e.g. RevokableTask), this is a no-op and they stay at the
-    // highest priority level, which is the desired behavior.
+    // Charge the executed CPU time to the owning query's global counter. This counter
+    // is shared by all of the query's tasks (across fragments, instances and cores)
+    // and across the pipeline/scan schedulers, and drives the query-granular MLFQ
+    // demotion. For tasks without a query counter (e.g. RevokableTask) the charge is
+    // a no-op and they stay at the highest priority level.
     task->add_query_runtime_ns(time_spent);
+    _release_worker_slot(task->query_ctx_raw());
 }
 
+void MultiCoreTaskQueue::release_task(PipelineTask* task) {
+    _release_worker_slot(task->query_ctx_raw());
+}
+
+void MultiCoreTaskQueue::close() {
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (_closed) {
+        return;
+    }
+    _closed = true;
+    _wait_task.notify_all();
+    DorisMetrics::instance()->pipeline_task_queue_size->increment(
+            -static_cast<int64_t>(_total_task_size.load()));
+}
+
+#include "common/compile_check_end.h"
 } // namespace doris
