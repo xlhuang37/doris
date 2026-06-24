@@ -127,39 +127,22 @@ std::shared_ptr<PrioritizedSplitRunner> MultilevelSplitQueue::take() {
 }
 
 /**
- * Attempts to give each level a target amount of scheduled time, which is configurable
- * using levelTimeMultiplier.
- * <p>
- * This function selects the level that has the lowest ratio of actual to the target time
- * with the objective of minimizing deviation from the target scheduled time. From this level,
- * we pick the split with the lowest priority.
+ * Strict absolute priority between levels: always serve the lowest non-empty level
+ * before any deeper one, draining higher-priority levels first. A split's level is
+ * derived from its owning fragment's unified runtime (see TimeSharingTaskHandle),
+ * so a fragment is demoted as a whole the more CPU it consumes. Within a level,
+ * SplitRunnerComparator orders by level priority (the fragment runtime), then by
+ * worker id, so lighter fragments run first.
  */
 std::shared_ptr<PrioritizedSplitRunner> MultilevelSplitQueue::_poll_split() {
-    int64_t target_scheduled_time = _get_level0_target_time();
-    double worst_ratio = 1.0;
-    int selected_level = -1;
-
-    for (int level = 0; level < LEVEL_THRESHOLD_SECONDS.size(); ++level) {
+    for (size_t level = 0; level < LEVEL_THRESHOLD_SECONDS.size(); ++level) {
         if (!_level_waiting_splits[level].empty()) {
-            int64_t level_time = _level_scheduled_time[level].load();
-            double ratio = (level_time == 0) ? 0
-                                             : static_cast<double>(target_scheduled_time) /
-                                                       (1.0 * level_time);
-
-            if (selected_level == -1 || ratio > worst_ratio) {
-                worst_ratio = ratio;
-                selected_level = level;
-            }
+            auto result = _level_waiting_splits[level].top();
+            _level_waiting_splits[level].pop();
+            return result;
         }
-        target_scheduled_time =
-                static_cast<int64_t>(std::round(target_scheduled_time / _level_time_multiplier));
     }
-
-    if (selected_level == -1) return nullptr;
-
-    auto result = _level_waiting_splits[selected_level].top();
-    _level_waiting_splits[selected_level].pop();
-    return result;
+    return nullptr;
 }
 
 void MultilevelSplitQueue::remove(std::shared_ptr<PrioritizedSplitRunner> split) {
