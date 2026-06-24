@@ -99,7 +99,7 @@ public:
     uint64_t fragment_runtime_ns() const {
         return _fragment_runtime_ns.load(std::memory_order_relaxed);
     }
-    std::atomic<uint64_t>* fragment_runtime_counter() { return &_fragment_runtime_ns; }
+    std::atomic<uint64_t>* fragment_runtime_counter() override { return &_fragment_runtime_ns; }
 
     void decrement_running_task(PipelineId pipeline_id);
 
