@@ -124,12 +124,19 @@ Status ScannerContext::init() {
                 dynamic_cast<TaskExecutorSimplifiedScanScheduler*>(_scanner_scheduler)) {
         std::shared_ptr<TaskExecutor> task_executor = task_executor_scheduler->task_executor();
         TaskId task_id(fmt::format("{}-{}", print_id(_state->query_id()), ctx_id));
+        // Level this scan task by the owning fragment's unified CPU runtime (shared
+        // with the pipeline MLFQ). The fragment context strictly outlives its
+        // scanners, so the counter pointer is stable for this task's lifetime.
+        std::atomic<uint64_t>* fragment_runtime = nullptr;
+        if (auto exec_ctx = task_exec_ctx()) {
+            fragment_runtime = exec_ctx->fragment_runtime_counter();
+        }
         _task_handle = DORIS_TRY(task_executor->create_task(
                 task_id, []() { return 0.0; },
                 config::task_executor_initial_max_concurrency_per_task > 0
                         ? config::task_executor_initial_max_concurrency_per_task
                         : std::max(48, CpuInfo::num_cores() * 2),
-                std::chrono::milliseconds(100), std::nullopt));
+                std::chrono::milliseconds(100), std::nullopt, fragment_runtime));
     }
 #endif
     // _max_bytes_in_queue controls the maximum memory that can be used by a single scan operator.
