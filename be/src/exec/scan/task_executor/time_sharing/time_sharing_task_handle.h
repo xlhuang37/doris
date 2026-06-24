@@ -43,7 +43,8 @@ public:
                           std::function<double()> utilization_supplier,
                           int initial_split_concurrency,
                           std::chrono::nanoseconds split_concurrency_adjust_frequency,
-                          std::optional<int> max_concurrency_per_task);
+                          std::optional<int> max_concurrency_per_task,
+                          std::atomic<uint64_t>* fragment_runtime = nullptr);
 
     Status init() override;
 
@@ -72,6 +73,12 @@ private:
     std::function<double()> _utilization_supplier;
     std::optional<int> _max_concurrency_per_task;
     SplitConcurrencyController _concurrency_controller;
+
+    // Owning fragment's unified CPU runtime counter (nullable). When set, this task's
+    // splits are leveled by the fragment runtime (shared with the pipeline MLFQ) and
+    // executed scan CPU is charged back into it. Null for non-fragment tasks
+    // (e.g. TopN multiget, simulator), which keep the legacy per-task leveling.
+    std::atomic<uint64_t>* _fragment_runtime_ptr = nullptr;
 
     std::queue<std::shared_ptr<PrioritizedSplitRunner>> _queued_leaf_splits;
     //std::vector<std::shared_ptr<PrioritizedSplitRunner>> _running_leaf_splits;
