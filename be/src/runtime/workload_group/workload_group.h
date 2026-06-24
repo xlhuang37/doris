@@ -49,6 +49,7 @@ class ResourceContext;
 class ScannerScheduler;
 
 class TaskScheduler;
+class CpuLeaseGrantor;
 
 class WorkloadGroup;
 struct WorkloadGroupInfo;
@@ -256,6 +257,9 @@ private:
     // but also some global background threadpool which not owned by WorkloadGroup,
     // so it should be shared ptr;
     std::shared_ptr<CgroupCpuCtl> _cgroup_cpu_ctl {nullptr};
+    // Per-WG CPU-lease admission controller. Declared before _task_sched so it is
+    // destroyed after the scheduler (whose queues hold a raw pointer to it).
+    std::unique_ptr<CpuLeaseGrantor> _cpu_lease_grantor {nullptr};
     std::unique_ptr<doris::TaskScheduler> _task_sched {nullptr};
     std::unique_ptr<ScannerScheduler> _scan_task_sched {nullptr};
     std::unique_ptr<ScannerScheduler> _remote_scan_task_sched {nullptr};

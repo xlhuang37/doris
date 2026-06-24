@@ -31,6 +31,7 @@
 #include "common/logging.h"
 #include "exec/pipeline/task_queue.h"
 #include "exec/pipeline/task_scheduler.h"
+#include "runtime/workload_group/cpu_lease_grantor.h"
 #include "exec/scan/scanner_scheduler.h"
 #include "information_schema/schema_scanner_helper.h"
 #include "io/cache/block_file_cache_factory.h"
@@ -545,10 +546,16 @@ Status WorkloadGroup::upsert_thread_pool_no_lock(WorkloadGroupInfo* wg_info,
 
     // 1 create thread pool
     if (_task_sched == nullptr) {
+        // Per-WG CPU-lease admission controller, shared by both inner pipeline
+        // schedulers (simple + blocking). Created before the scheduler so it outlives
+        // the queues that reference it.
+        if (_cpu_lease_grantor == nullptr) {
+            _cpu_lease_grantor = std::make_unique<CpuLeaseGrantor>();
+        }
         std::unique_ptr<TaskScheduler> pipeline_task_scheduler =
                 std::make_unique<HybridTaskScheduler>(pipeline_exec_thread_num,
                                                       blocking_exec_thread_num, "p_" + wg_name,
-                                                      cg_cpu_ctl_ptr);
+                                                      cg_cpu_ctl_ptr, _cpu_lease_grantor.get());
         Status ret = pipeline_task_scheduler->start();
         if (ret.ok()) {
             _task_sched = std::move(pipeline_task_scheduler);

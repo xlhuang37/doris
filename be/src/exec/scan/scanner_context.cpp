@@ -40,7 +40,10 @@
 #include "exec/operator/scan_operator.h"
 #include "exec/scan/scan_node.h"
 #include "exec/scan/scanner_scheduler.h"
+#include "exec/scan/task_executor/time_sharing/time_sharing_task_handle.h"
 #include "runtime/descriptors.h"
+#include "runtime/query_context.h"
+#include "runtime/query_cpu_lease.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_profile.h"
 #include "runtime/runtime_state.h"
@@ -137,6 +140,12 @@ Status ScannerContext::init() {
                         ? config::task_executor_initial_max_concurrency_per_task
                         : std::max(48, CpuInfo::num_cores() * 2),
                 std::chrono::milliseconds(100), std::nullopt, query_runtime));
+        // Bundle scanner concurrency with the query's pipeline grants under CPU-lease
+        // scheduling: scan concurrency = granted slots * scan_threads_per_slot.
+        if (auto time_sharing_handle =
+                    std::dynamic_pointer_cast<TimeSharingTaskHandle>(_task_handle)) {
+            time_sharing_handle->set_cpu_lease(_state->get_query_ctx()->cpu_lease());
+        }
     }
 #endif
     // _max_bytes_in_queue controls the maximum memory that can be used by a single scan operator.

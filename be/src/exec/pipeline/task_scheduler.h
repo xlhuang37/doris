@@ -38,6 +38,7 @@
 namespace doris {
 class ExecEnv;
 class ThreadPool;
+class CpuLeaseGrantor;
 } // namespace doris
 
 namespace doris {
@@ -60,11 +61,14 @@ public:
 private:
     friend class HybridTaskScheduler;
 
-    TaskScheduler(int core_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
+    TaskScheduler(int core_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl,
+                  CpuLeaseGrantor* grantor = nullptr)
             : _name(std::move(name)),
               _task_queue(core_num),
               _num_threads(core_num),
-              _cgroup_cpu_ctl(cgroup_cpu_ctl) {}
+              _cgroup_cpu_ctl(cgroup_cpu_ctl) {
+        _task_queue.set_grantor(grantor);
+    }
     TaskScheduler() : _task_queue(0), _num_threads(0) {}
     std::string _name;
     std::unique_ptr<ThreadPool> _fix_thread_pool;
@@ -81,10 +85,12 @@ private:
 class HybridTaskScheduler MOCK_REMOVE(final) : public TaskScheduler {
 public:
     HybridTaskScheduler(int exec_thread_num, int blocking_exec_thread_num, std::string name,
-                        std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
+                        std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl,
+                        CpuLeaseGrantor* grantor = nullptr)
             : _blocking_scheduler(blocking_exec_thread_num, name + "_blocking_scheduler",
-                                  cgroup_cpu_ctl),
-              _simple_scheduler(exec_thread_num, name + "_simple_scheduler", cgroup_cpu_ctl) {}
+                                  cgroup_cpu_ctl, grantor),
+              _simple_scheduler(exec_thread_num, name + "_simple_scheduler", cgroup_cpu_ctl,
+                                grantor) {}
 
     Status submit(PipelineTaskSPtr task) override;
 

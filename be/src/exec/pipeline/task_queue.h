@@ -35,6 +35,8 @@
 
 namespace doris {
 class QueryContext;
+class QueryCpuLease;
+class CpuLeaseGrantor;
 #include "common/compile_check_begin.h"
 
 // A global, query-granular Multilevel Feedback Queue with strict absolute priority
@@ -44,11 +46,14 @@ class QueryContext;
 // seeing its own shard.
 //
 // Structure:
-//   - SUB_QUEUE_LEVEL absolute-priority levels. A query's level is derived from its
-//     QueryContext-global CPU runtime (QueryContext::query_runtime_counter, surfaced
-//     via PipelineTask::query_runtime_ns), so a query is demoted as a whole the more
-//     CPU it consumes across all of its fragments/instances and across the
-//     pipeline/scan schedulers.
+//   - Absolute-priority levels. A query's level is derived from its QueryContext-global
+//     CPU runtime (QueryContext::query_runtime_counter, surfaced via
+//     PipelineTask::query_runtime_ns), so a query is demoted as a whole the more CPU it
+//     consumes across all of its fragments/instances and across the pipeline/scan
+//     schedulers. Legacy mode uses runtime thresholds ({1s,3s,10s,60s,300s}); the
+//     optional CPU-lease mode (config::enable_cpu_lease_scheduling) instead levels by
+//     parallelism layer (running slots) + CPU band and admits at most N queries per
+//     workload group via a shared CpuLeaseGrantor.
 //   - Each level holds query "nodes" in a round-robin list. Each node owns a FIFO of
 //     that query's runnable PipelineTasks. Within a level, nodes are served
 //     round-robin so workers spread across co-resident queries rather than dogpiling
@@ -95,8 +100,17 @@ public:
 
     int cores() const { return _core_size; }
 
+    // Wire the per-workload-group CPU-lease admission controller. Shared by both inner
+    // schedulers of a WG. When set and config::enable_cpu_lease_scheduling is on, the
+    // queue switches to lease mode: parallelism-layer + CPU-band leveling and grantor
+    // admission. Default (nullptr) keeps the legacy runtime-threshold global MLFQ.
+    void set_grantor(CpuLeaseGrantor* grantor) { _grantor = grantor; }
+
 protected:
-    static constexpr int SUB_QUEUE_LEVEL = 6;
+    // Legacy runtime-threshold leveling uses the first LEGACY_LEVELS levels; the lease
+    // mode uses up to QueryCpuLease::kNumLevels. The level arrays are sized to the max.
+    static constexpr int LEGACY_LEVELS = 6;
+    static constexpr int NUM_LEVELS = 16; // >= QueryCpuLease::kNumLevels and LEGACY_LEVELS
 
     // One bucket per runnable query. Lives in `_nodes` for the query's lifetime in
     // the queue; it is linked into exactly one level list while it has runnable
@@ -104,6 +118,7 @@ protected:
     // in-flight workers.
     struct QueryNode {
         QueryContext* key = nullptr;
+        QueryCpuLease* lease = nullptr; // owned by QueryContext; null for query-less tasks
         int level = 0;
         bool linked = false;
         int in_flight = 0;
@@ -116,7 +131,11 @@ protected:
     PipelineTaskSPtr _take(int worker_id, uint32_t timeout_ms);
 
 private:
+    bool _lease_mode() const;
+    // Legacy runtime-threshold level.
     int _compute_level(uint64_t runtime) const;
+    // Level for a node: lease priority (layer + CPU band) in lease mode, else legacy.
+    int _node_level(const QueryNode* node) const;
     int _lowest_non_empty_level() const;
     int _lease(const QueryNode* node) const;
     QueryNode* _ensure_node(QueryContext* key);
@@ -124,6 +143,8 @@ private:
     void _unlink(QueryNode* node);
     void _relevel_locked(QueryNode* node);
     uint64_t _node_runtime(const QueryNode* node) const;
+    // Whether the grantor admits this node's query (and admits it if there is capacity).
+    bool _admitted(const QueryNode* node);
     PipelineTaskSPtr _pop_from_node(QueryNode* node, int worker_id);
     PipelineTaskSPtr _try_take_unprotected(int worker_id);
     Status _push(PipelineTaskSPtr task);
@@ -133,7 +154,7 @@ private:
     std::condition_variable _wait_task;
     bool _closed = false;
 
-    std::array<std::list<QueryNode*>, SUB_QUEUE_LEVEL> _levels;
+    std::array<std::list<QueryNode*>, NUM_LEVELS> _levels;
     std::unordered_map<QueryContext*, std::unique_ptr<QueryNode>> _nodes;
 
     // The query each worker last served, used to preserve query locality.
@@ -141,10 +162,13 @@ private:
 
     std::atomic<size_t> _total_task_size = 0;
 
+    // Per-WG CPU-lease admission controller (nullptr => legacy mode). Not owned.
+    CpuLeaseGrantor* _grantor = nullptr;
+
     int _core_size;
     // 1s, 3s, 10s, 60s, 300s
-    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {1000000000, 3000000000, 10000000000,
-                                                        60000000000, 300000000000};
+    uint64_t _queue_level_limit[LEGACY_LEVELS - 1] = {1000000000, 3000000000, 10000000000,
+                                                      60000000000, 300000000000};
     static constexpr auto WAIT_CORE_TASK_TIMEOUT_MS = 100;
 };
 #include "common/compile_check_end.h"

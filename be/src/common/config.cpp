@@ -313,6 +313,23 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // Default 0 means unbounded (strict absolute priority).
 DEFINE_mInt32(pipeline_query_worker_cap, "0");
 
+// ClickHouse-style CPU-lease scheduling (per workload group). When enabled, the
+// pipeline scheduler moderates resource at the query level: a per-WG grantor admits at
+// most `max_active_queries_per_group` queries ("main drivers"), and the query MLFQ is
+// leveled by parallelism layer (running slots / cpu_lease_leveling_slots) then a CPU
+// consumption band. Each granted pipeline slot also entitles the query to
+// `scan_threads_per_slot` scanner threads. Default off: falls back to the existing
+// global query MLFQ (runtime-threshold leveling).
+DEFINE_mBool(enable_cpu_lease_scheduling, "false");
+// Max number of concurrently admitted queries ("main drivers") per workload group.
+DEFINE_mInt32(max_active_queries_per_group, "8");
+// Number of running pipeline slots per parallelism layer in the lease MLFQ.
+DEFINE_mInt32(cpu_lease_leveling_slots, "8");
+// Scanner threads bundled per granted pipeline slot.
+DEFINE_mInt32(scan_threads_per_slot, "2");
+// Soft per-query pipeline worker cap under lease scheduling (0 = unbounded).
+DEFINE_mInt32(cpu_lease_max_threads_per_query, "0");
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task

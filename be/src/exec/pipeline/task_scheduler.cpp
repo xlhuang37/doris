@@ -115,13 +115,18 @@ void TaskScheduler::_do_work(int index) {
         }
 
         if (task->is_finalized()) {
+            // take() acquired a worker slot for this task's query; release it here since
+            // we skip execution (the update_statistics defer below is not set up yet).
+            _task_queue.release_task(task.get());
             task->set_running(false);
             continue;
         }
 
         auto fragment_context = task->fragment_context().lock();
         if (!fragment_context) {
-            // Fragment already finished
+            // Fragment already finished. Release the worker slot take() acquired (the
+            // update_statistics defer below is not set up yet).
+            _task_queue.release_task(task.get());
             task->set_running(false);
             continue;
         }

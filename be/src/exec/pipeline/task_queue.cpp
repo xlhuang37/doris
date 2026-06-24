@@ -28,26 +28,45 @@
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "runtime/query_cpu_lease.h"
+#include "runtime/workload_group/cpu_lease_grantor.h"
 
 namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
-        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {}
+        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {
+    static_assert(NUM_LEVELS >= QueryCpuLease::kNumLevels,
+                  "level arrays must fit the lease MLFQ levels");
+}
 
 MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
 
+bool MultiCoreTaskQueue::_lease_mode() const {
+    return _grantor != nullptr && config::enable_cpu_lease_scheduling;
+}
+
 int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
-    for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
+    for (int i = 0; i < LEGACY_LEVELS - 1; ++i) {
         if (runtime <= _queue_level_limit[i]) {
             return i;
         }
     }
-    return SUB_QUEUE_LEVEL - 1;
+    return LEGACY_LEVELS - 1;
+}
+
+int MultiCoreTaskQueue::_node_level(const QueryNode* node) const {
+    uint64_t consumed = _node_runtime(node);
+    if (_lease_mode() && node->lease != nullptr) {
+        // Parallelism layer (running slots / leveling) then CPU band; mirrors
+        // ClickHouse CPULeaseAllocation::computeRequestPriority.
+        return node->lease->compute_priority(consumed);
+    }
+    return _compute_level(consumed);
 }
 
 int MultiCoreTaskQueue::_lowest_non_empty_level() const {
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+    for (int level = 0; level < NUM_LEVELS; ++level) {
         if (!_levels[level].empty()) {
             return level;
         }
@@ -56,11 +75,25 @@ int MultiCoreTaskQueue::_lowest_non_empty_level() const {
 }
 
 int MultiCoreTaskQueue::_lease(const QueryNode* /*node*/) const {
-    // Option 2 (soft lease): a per-query cap on concurrent workers. When > 0, workers
-    // beyond the cap spill to lower-priority queries even if this query has more
-    // runnable tasks; default (<= 0) means unbounded (strict absolute priority).
-    int cap = config::pipeline_query_worker_cap;
+    // Soft per-query cap on concurrent workers. When > 0, workers beyond the cap spill
+    // to lower-priority queries even if this query has more runnable tasks; default
+    // (<= 0) means unbounded (strict absolute priority). In lease mode the per-query
+    // cap is governed by cpu_lease_max_threads_per_query.
+    int cap = _lease_mode() ? config::cpu_lease_max_threads_per_query
+                            : config::pipeline_query_worker_cap;
     return cap > 0 ? cap : std::numeric_limits<int>::max();
+}
+
+bool MultiCoreTaskQueue::_admitted(const QueryNode* node) {
+    // Legacy mode: every query is implicitly admitted.
+    if (!_lease_mode()) {
+        return true;
+    }
+    // Query-less tasks (e.g. RevokableTask) are always allowed.
+    if (node->key == nullptr) {
+        return true;
+    }
+    return _grantor->try_serve(node->key);
 }
 
 uint64_t MultiCoreTaskQueue::_node_runtime(const QueryNode* node) const {
@@ -101,7 +134,7 @@ void MultiCoreTaskQueue::_relevel_locked(QueryNode* node) {
     if (!node->linked) {
         return;
     }
-    int want = _compute_level(_node_runtime(node));
+    int want = _node_level(node);
     if (want != node->level) {
         _unlink(node);
         _link(node, want);
@@ -112,6 +145,11 @@ PipelineTaskSPtr MultiCoreTaskQueue::_pop_from_node(QueryNode* node, int worker_
     auto task = node->runnable.front();
     node->runnable.pop();
     node->in_flight++;
+    // Account a granted pipeline slot on the query's lease (drives parallelism leveling
+    // and scanner bundling). Released in _release_worker_slot.
+    if (node->lease != nullptr) {
+        node->lease->acquire_slot();
+    }
     _total_task_size.fetch_sub(1);
     DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
 
@@ -139,7 +177,8 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
     }
 
     // 1. Locality: keep serving the query this worker last served, as long as it is
-    // still the highest-priority (lowest non-empty level) query and under its lease.
+    // still the highest-priority (lowest non-empty level) query, under its lease, and
+    // still admitted by the grantor.
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
         QueryContext* sticky = _worker_sticky[worker_id];
         if (sticky != nullptr) {
@@ -149,7 +188,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
                 if (node->linked && !node->runnable.empty()) {
                     _relevel_locked(node);
                     if (node->level == _lowest_non_empty_level() &&
-                        node->in_flight < _lease(node)) {
+                        node->in_flight < _lease(node) && _admitted(node)) {
                         return _pop_from_node(node, worker_id);
                     }
                 }
@@ -159,13 +198,16 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
 
     // 2. Strict absolute priority: drain the lowest non-empty level first; within a
     // level, round-robin across queries (the list front is the least-recently served).
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
+    // In lease mode, a query is served only if the grantor admits it (admission set
+    // capped at max_active_queries_per_group); non-admitted queries are skipped so
+    // workers fall through to admitted, higher-priority queries.
+    for (int level = 0; level < NUM_LEVELS; ++level) {
         auto& lst = _levels[level];
         for (auto it = lst.begin(); it != lst.end();) {
             QueryNode* node = *it;
-            // Lazy demotion: if the query has crossed a threshold, move the whole node
-            // (all of its tasks) to the deeper level and keep scanning.
-            int want = _compute_level(_node_runtime(node));
+            // Lazy demotion: if the query's level rose (more slots / more CPU), move the
+            // whole node (all of its tasks) to the deeper level and keep scanning.
+            int want = _node_level(node);
             if (want > level) {
                 auto next = std::next(it);
                 _unlink(node);
@@ -173,7 +215,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
                 it = next;
                 continue;
             }
-            if (!node->runnable.empty() && node->in_flight < _lease(node)) {
+            if (!node->runnable.empty() && node->in_flight < _lease(node) && _admitted(node)) {
                 return _pop_from_node(node, worker_id);
             }
             ++it;
@@ -214,11 +256,15 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
             return Status::InternalError("WorkTaskQueue closed");
         }
         QueryNode* node = _ensure_node(key);
+        if (node->lease == nullptr) {
+            node->lease = task->cpu_lease();
+        }
         node->runnable.push(task);
         if (!node->linked) {
             // An unlinked node has no runnable tasks; (re)link it at the level implied
-            // by the owning query's current global runtime.
-            _link(node, _compute_level(task->query_runtime_ns()));
+            // by the owning query's current priority (lease layer+band, or legacy
+            // runtime threshold).
+            _link(node, _node_level(node));
         }
         _total_task_size.fetch_add(1);
         DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
@@ -245,9 +291,18 @@ void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key) {
     QueryNode* node = it->second.get();
     if (node->in_flight > 0) {
         node->in_flight--;
+        if (node->lease != nullptr) {
+            node->lease->release_slot();
+        }
     }
     if (!node->linked && node->runnable.empty() && node->in_flight == 0) {
         _nodes.erase(it);
+        // The query has no runnable or in-flight work: free its admission slot so the
+        // next highest-priority waiting query can be admitted on a subsequent take().
+        // Lock order is always queue-lock -> grantor-lock (same as the take() path).
+        if (_lease_mode() && key != nullptr) {
+            _grantor->on_idle(key);
+        }
     }
 }
 

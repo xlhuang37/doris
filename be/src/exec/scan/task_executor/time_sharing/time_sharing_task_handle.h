@@ -34,6 +34,7 @@
 namespace doris {
 
 class MultilevelSplitQueue;
+class QueryCpuLease;
 
 class TimeSharingTaskHandle : public TaskHandle {
     ENABLE_FACTORY_CREATOR(TimeSharingTaskHandle);
@@ -54,6 +55,11 @@ public:
     Priority priority() const;
     TaskId task_id() const override;
     std::optional<int> max_concurrency_per_task() const;
+
+    // Bind the owning query's CPU-lease so scanner concurrency tracks the query's
+    // pipeline grants (scan_threads_per_slot per granted slot). Null keeps the static
+    // max_concurrency_per_task. Owned by the QueryContext, which outlives this handle.
+    void set_cpu_lease(QueryCpuLease* lease) { _cpu_lease = lease; }
     std::vector<std::shared_ptr<PrioritizedSplitRunner>> close();
     bool enqueue_split(std::shared_ptr<PrioritizedSplitRunner> split);
     bool record_intermediate_split(std::shared_ptr<PrioritizedSplitRunner> split);
@@ -79,6 +85,10 @@ private:
     // executed scan CPU is charged back into it. Null for non-query tasks
     // (e.g. TopN multiget, simulator), which keep the legacy per-task leveling.
     std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
+
+    // Owning query's CPU-lease (nullable). When set and lease scheduling is enabled,
+    // drives this task's scanner concurrency (see max_concurrency_per_task()).
+    QueryCpuLease* _cpu_lease = nullptr;
 
     std::queue<std::shared_ptr<PrioritizedSplitRunner>> _queued_leaf_splits;
     //std::vector<std::shared_ptr<PrioritizedSplitRunner>> _running_leaf_splits;

@@ -37,6 +37,7 @@
 #include "exec/scan/scanner_scheduler.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/query_cpu_lease.h"
 #include "runtime/runtime_predicate.h"
 #include "runtime/workload_group/workload_group.h"
 #include "runtime/workload_management/resource_context.h"
@@ -107,6 +108,12 @@ public:
     // pipeline task scheduler and the scan time-sharing scheduler, so all fragments of
     // a small query share one low "attained service" value and win priority together.
     std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
+
+    // Per-query CPU-lease state for the (optional) lease scheduling layer. Tracks the
+    // number of pipeline worker slots this query currently holds and computes its MLFQ
+    // priority; also drives scanner bundling. Always present; only consulted when
+    // config::enable_cpu_lease_scheduling is on.
+    QueryCpuLease* cpu_lease() { return &_cpu_lease; }
 
     bool is_timeout(timespec now) const {
         if (_timeout_second <= 0) {
@@ -332,6 +339,9 @@ private:
 
     // Query-global runtime counter; see query_runtime_counter().
     std::atomic<uint64_t> _query_runtime_ns {0};
+
+    // Per-query CPU-lease state; see cpu_lease().
+    QueryCpuLease _cpu_lease;
     bool _is_nereids = false;
 
     std::shared_ptr<ResourceContext> _resource_ctx;

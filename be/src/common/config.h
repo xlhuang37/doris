@@ -371,6 +371,16 @@ DECLARE_mInt32(pipeline_status_report_interval);
 DECLARE_mInt32(pipeline_task_exec_time_slice);
 // Soft per-query worker cap for the global query-granular pipeline MLFQ (0 = unbounded)
 DECLARE_mInt32(pipeline_query_worker_cap);
+// ClickHouse-style CPU-lease scheduling (per workload group); default off
+DECLARE_mBool(enable_cpu_lease_scheduling);
+// Max concurrently admitted queries ("main drivers") per workload group
+DECLARE_mInt32(max_active_queries_per_group);
+// Running pipeline slots per parallelism layer in the lease MLFQ
+DECLARE_mInt32(cpu_lease_leveling_slots);
+// Scanner threads bundled per granted pipeline slot
+DECLARE_mInt32(scan_threads_per_slot);
+// Soft per-query pipeline worker cap under lease scheduling (0 = unbounded)
+DECLARE_mInt32(cpu_lease_max_threads_per_query);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

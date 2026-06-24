@@ -17,6 +17,11 @@
 
 #include "exec/scan/task_executor/time_sharing/time_sharing_task_handle.h"
 
+#include <algorithm>
+
+#include "common/config.h"
+#include "runtime/query_cpu_lease.h"
+
 namespace doris {
 #include "common/compile_check_begin.h"
 
@@ -105,6 +110,16 @@ TaskId TimeSharingTaskHandle::task_id() const {
 }
 
 std::optional<int> TimeSharingTaskHandle::max_concurrency_per_task() const {
+    // Under CPU-lease scheduling, bundle scanner concurrency with the query's pipeline
+    // grants: each granted pipeline slot entitles the query to scan_threads_per_slot
+    // scanner threads. Recomputed on every call so it tracks grants as they change.
+    // Always allow at least one split so a query with scan work but no current pipeline
+    // slot still makes progress.
+    if (config::enable_cpu_lease_scheduling && _cpu_lease != nullptr) {
+        int per_slot = config::scan_threads_per_slot > 0 ? config::scan_threads_per_slot : 1;
+        int bundled = _cpu_lease->running_slots() * per_slot;
+        return std::max(1, bundled);
+    }
     return _max_concurrency_per_task;
 }
 

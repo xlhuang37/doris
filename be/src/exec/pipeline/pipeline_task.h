@@ -33,6 +33,7 @@
 
 namespace doris {
 class QueryContext;
+class QueryCpuLease;
 class RuntimeState;
 class PipelineFragmentContext;
 } // namespace doris
@@ -151,6 +152,10 @@ public:
     // ever compared/used as a map key, never dereferenced by the queue.
     MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
 
+    // Owning query's CPU-lease (used by the lease scheduling layer). Owned by the
+    // QueryContext, which outlives this task. Null only for tasks with no query (mocks).
+    MOCK_FUNCTION QueryCpuLease* cpu_lease() const { return _cpu_lease_raw; }
+
     void put_in_runnable_queue() {
         _schedule_time++;
         _wait_worker_watcher.start();
@@ -230,6 +235,10 @@ private:
     // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
     // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
     QueryContext* _query_ctx_raw = nullptr;
+
+    // Cached owning query's CPU-lease pointer (owned by QueryContext). Null for tasks
+    // not tied to a query.
+    QueryCpuLease* _cpu_lease_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;
