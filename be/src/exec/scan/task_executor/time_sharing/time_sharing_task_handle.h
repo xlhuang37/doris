@@ -43,7 +43,8 @@ public:
                           std::function<double()> utilization_supplier,
                           int initial_split_concurrency,
                           std::chrono::nanoseconds split_concurrency_adjust_frequency,
-                          std::optional<int> max_concurrency_per_task);
+                          std::optional<int> max_concurrency_per_task,
+                          std::atomic<uint64_t>* query_runtime = nullptr);
 
     Status init() override;
 
@@ -73,6 +74,8 @@ private:
     std::optional<int> _max_concurrency_per_task;
     SplitConcurrencyController _concurrency_controller;
 
+    std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
+    
     std::queue<std::shared_ptr<PrioritizedSplitRunner>> _queued_leaf_splits;
     //std::vector<std::shared_ptr<PrioritizedSplitRunner>> _running_leaf_splits;
     //std::vector<std::shared_ptr<PrioritizedSplitRunner>> _running_intermediate_splits;

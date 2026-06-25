@@ -117,7 +117,10 @@ Status PriorityTaskQueue::push(PipelineTaskSPtr task) {
     if (_closed) {
         return Status::InternalError("WorkTaskQueue closed");
     }
-    auto level = _compute_level(task->get_runtime_ns());
+    // The level is driven by the owning query's global CPU runtime, so all of a
+    // query's tasks are bucketed together. The dequeue path re-checks this in
+    // case the query crosses a threshold while the task waits.
+    auto level = _compute_level(task->query_runtime_ns());
     std::unique_lock<std::mutex> lock(_work_size_mutex);
 
     // update empty queue's  runtime, to avoid too high priority
@@ -211,6 +214,12 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
         task->inc_runtime_ns(time_spent);
         _prio_task_queues[core_id].inc_sub_queue_runtime(task->get_queue_level(), time_spent);
     }
+    // Charge the executed CPU time to the owning fragment's global counter. This
+    // counter is shared by all of the query's tasks (across fragments, instances
+    // and cores) and drives the query-granular MLFQ demotion. For tasks without a
+    // query counter (e.g. RevokableTask), this is a no-op and they stay at the
+    // highest priority level, which is the desired behavior.
+    task->add_query_runtime_ns(time_spent);
 }
 
 } // namespace doris

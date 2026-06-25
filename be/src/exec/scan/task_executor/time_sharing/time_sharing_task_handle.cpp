@@ -24,12 +24,14 @@ TimeSharingTaskHandle::TimeSharingTaskHandle(
         const TaskId& task_id, std::shared_ptr<SplitQueue> split_queue,
         std::function<double()> utilization_supplier, int initial_split_concurrency,
         std::chrono::nanoseconds split_concurrency_adjust_frequency,
-        std::optional<int> max_concurrency_per_task)
+        std::optional<int> max_concurrency_per_task,
+        std::atomic<uint64_t>* query_runtime)
         : _task_id(task_id),
           _split_queue(std::move(split_queue)),
           _utilization_supplier(std::move(utilization_supplier)),
           _max_concurrency_per_task(max_concurrency_per_task),
-          _concurrency_controller(initial_split_concurrency, split_concurrency_adjust_frequency) {}
+          _concurrency_controller(initial_split_concurrency, split_concurrency_adjust_frequency),
+          _query_runtime_ptr(query_runtime) {}
 
 Status TimeSharingTaskHandle::init() {
     return Status::OK();
@@ -41,6 +43,19 @@ Priority TimeSharingTaskHandle::add_scheduled_nanos(int64_t duration_nanos) {
                                    static_cast<int>(_running_leaf_splits.size()));
     _scheduled_nanos += duration_nanos;
 
+    if (_query_runtime_ptr != nullptr) {
+        // Unified query runtime drives the level: charge the executed scan CPU into
+        // the query counter (shared with the pipeline MLFQ), then level by the new
+        // query runtime. The within-level priority is the query runtime itself,
+        // so lighter queries are served first within a level.
+        auto runtime = static_cast<int64_t>(
+                _query_runtime_ptr->fetch_add(static_cast<uint64_t>(duration_nanos),
+                                              std::memory_order_relaxed) +
+                static_cast<uint64_t>(duration_nanos));
+        _priority = Priority(_split_queue->compute_level(runtime), runtime);
+        return _priority;
+    }
+
     Priority new_priority =
             _split_queue->update_priority(_priority, duration_nanos, _scheduled_nanos);
 
@@ -50,6 +65,12 @@ Priority TimeSharingTaskHandle::add_scheduled_nanos(int64_t duration_nanos) {
 
 Priority TimeSharingTaskHandle::reset_level_priority() {
     std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_query_runtime_ptr != nullptr) {
+        auto runtime = static_cast<int64_t>(_query_runtime_ptr->load(std::memory_order_relaxed));
+        _priority = Priority(_split_queue->compute_level(runtime), runtime);
+        return _priority;
+    }
 
     Priority current_priority = _priority;
     int64_t level_min_priority =

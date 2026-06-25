@@ -33,6 +33,11 @@ class TaskExecutionContext : public std::enable_shared_from_this<TaskExecutionCo
 public:
     TaskExecutionContext();
     virtual ~TaskExecutionContext();
+
+    // Query-global CPU runtime counter, shared by the pipeline MLFQ and the scan
+    // scheduler so both level a query by one unified runtime signal. Non-query
+    // contexts return nullptr.
+    virtual std::atomic<uint64_t>* query_runtime_counter() { return nullptr; }
 };
 
 using TaskExecutionContextSPtr = std::shared_ptr<TaskExecutionContext>;
