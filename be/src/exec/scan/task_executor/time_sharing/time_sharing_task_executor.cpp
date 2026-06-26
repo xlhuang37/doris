@@ -723,10 +723,10 @@ std::ostream& operator<<(std::ostream& o, SplitThreadPoolToken::State s) {
 Result<std::shared_ptr<TaskHandle>> TimeSharingTaskExecutor::create_task(
         const TaskId& task_id, std::function<double()> utilization_supplier,
         int initial_split_concurrency, std::chrono::nanoseconds split_concurrency_adjust_frequency,
-        std::optional<int> max_concurrency_per_task) {
+        std::optional<int> max_concurrency_per_task, std::atomic<uint64_t>* query_runtime) {
     auto task_handle = std::make_shared<TimeSharingTaskHandle>(
             task_id, _tokenless->_entries, utilization_supplier, initial_split_concurrency,
-            split_concurrency_adjust_frequency, max_concurrency_per_task);
+            split_concurrency_adjust_frequency, max_concurrency_per_task, query_runtime);
     RETURN_IF_ERROR_RESULT(task_handle->init());
 
     std::lock_guard<std::mutex> lock(_mutex);

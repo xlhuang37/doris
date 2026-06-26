@@ -307,6 +307,12 @@ DEFINE_Int32(be_service_threads, "64");
 DEFINE_mInt32(pipeline_status_report_interval, "10");
 DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 
+// Soft per-query worker cap for the global query-granular pipeline MLFQ. When > 0, a
+// single query holds at most this many pipeline workers concurrently; workers beyond
+// the cap spill to lower-priority queries (anti-starvation / anti-contention knob).
+// Default 0 means unbounded (strict absolute priority).
+DEFINE_mInt32(pipeline_query_worker_cap, "0");
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task
