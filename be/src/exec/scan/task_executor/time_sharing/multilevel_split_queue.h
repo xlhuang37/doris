@@ -60,7 +60,7 @@ class MultilevelSplitQueue : public SplitQueue {
     ENABLE_FACTORY_CREATOR(MultilevelSplitQueue);
 
 public:
-    static constexpr std::array<int, 5> LEVEL_THRESHOLD_SECONDS = {0, 1, 10, 60, 300};
+    static constexpr std::array<int, 4> LEVEL_THRESHOLD_SECONDS = {0, 3, 10, 30};
     static constexpr int64_t LEVEL_CONTRIBUTION_CAP = 30 * 1000000000LL; // 30 seconds in nanos
 
     explicit MultilevelSplitQueue(double level_time_multiplier);
