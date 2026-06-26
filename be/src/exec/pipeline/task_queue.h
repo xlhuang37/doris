@@ -96,7 +96,7 @@ public:
     int cores() const { return _core_size; }
 
 protected:
-    static constexpr int SUB_QUEUE_LEVEL = 6;
+    static constexpr int SUB_QUEUE_LEVEL = 4;
 
     // One bucket per runnable query. Lives in `_nodes` for the query's lifetime in
     // the queue; it is linked into exactly one level list while it has runnable
@@ -143,8 +143,8 @@ private:
 
     int _core_size;
     // 1s, 3s, 10s, 60s, 300s
-    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {1000000000, 3000000000, 10000000000,
-                                                        60000000000, 300000000000};
+    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {2800000000, 10000000000,
+                                                        25000000000};
     static constexpr auto WAIT_CORE_TASK_TIMEOUT_MS = 100;
 };
 #include "common/compile_check_end.h"
