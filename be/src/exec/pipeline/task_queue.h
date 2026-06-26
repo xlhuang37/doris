@@ -85,11 +85,11 @@ public:
 private:
     PipelineTaskSPtr _try_take_unprotected(bool is_steal);
     static constexpr auto LEVEL_QUEUE_TIME_FACTOR = 2;
-    static constexpr size_t SUB_QUEUE_LEVEL = 6;
+    static constexpr size_t SUB_QUEUE_LEVEL = 4;
     SubTaskQueue _sub_queues[SUB_QUEUE_LEVEL];
     // 1s, 3s, 10s, 60s, 300s
-    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {1000000000, 3000000000, 10000000000,
-                                                        60000000000, 300000000000};
+    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {2800000000, 10000000000,
+                                                        25000000000};
     std::mutex _work_size_mutex;
     std::condition_variable _wait_task;
     std::atomic<size_t> _total_task_size = 0;
