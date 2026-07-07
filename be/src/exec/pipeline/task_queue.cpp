@@ -138,16 +138,26 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         return nullptr;
     }
 
-    // 1. Locality: keep serving the (query, elasticity) this worker last served, as long
-    // as it is still the highest-priority (lowest non-empty level) node and under its
-    // lease.
+    // 0. Inelastic first: the standalone inelastic subqueue has strict absolute priority
+    // above the whole MLFQ. It is a plain global FIFO - no per-query node, no in_flight,
+    // no sticky (those belong to the MLFQ only).
+    if (!_inelastic_queue.empty()) {
+        auto task = _inelastic_queue.front();
+        _inelastic_queue.pop();
+        _total_task_size.fetch_sub(1);
+        DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+        return task;
+    }
+
+    // 1. Locality: keep serving the query this worker last served, as long as it is
+    // still the highest-priority (lowest non-empty level) query and under its lease.
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        auto [sticky_ctx, sticky_inelastic] = _worker_sticky[worker_id];
-        if (sticky_ctx != nullptr) {
-            auto it = _nodes.find(sticky_ctx);
+        QueryContext* sticky = _worker_sticky[worker_id];
+        if (sticky != nullptr) {
+            auto it = _nodes.find(sticky);
             if (it != _nodes.end()) {
-                QueryNode* node = it->second[sticky_inelastic ? 1 : 0].get();
-                if (node != nullptr && node->linked && !node->runnable.empty()) {
+                QueryNode* node = it->second.get();
+                if (node->linked && !node->runnable.empty()) {
                     _relevel_locked(node);
                     if (node->level == _lowest_non_empty_level() &&
                         node->in_flight < _lease(node)) {
@@ -165,17 +175,14 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         for (auto it = lst.begin(); it != lst.end();) {
             QueryNode* node = *it;
             // Lazy demotion: if the query has crossed a threshold, move the whole node
-            // (all of its tasks) to the deeper level and keep scanning. Inelastic nodes
-            // (level 0) are pinned and never demoted.
-            if (!node->inelastic) {
-                int want = _compute_level(_node_runtime(node));
-                if (want > level) {
-                    auto next = std::next(it);
-                    _unlink(node);
-                    _link(node, want);
-                    it = next;
-                    continue;
-                }
+            // (all of its tasks) to the deeper level and keep scanning.
+            int want = _compute_level(_node_runtime(node));
+            if (want > level) {
+                auto next = std::next(it);
+                _unlink(node);
+                _link(node, want);
+                it = next;
+                continue;
             }
             if (!node->runnable.empty() && node->in_flight < _lease(node)) {
                 return _pop_from_node(node, worker_id);
@@ -212,18 +219,24 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     }
     task->put_in_runnable_queue();
     QueryContext* key = task->query_ctx_raw();
+    const bool inelastic = task->is_inelastic();
     {
         std::unique_lock<std::mutex> lock(_mutex);
         if (_closed) {
             return Status::InternalError("WorkTaskQueue closed");
         }
-        QueryNode* node = _ensure_node(key, task->is_inelastic());
-        node->runnable.push(task);
-        if (!node->linked) {
-            // An unlinked node has no runnable tasks; (re)link it. Inelastic nodes are
-            // pinned at level 0; elastic nodes go to the level implied by the owning
-            // query's current global runtime.
-            _link(node, node->inelastic ? 0 : _compute_level(task->query_runtime_ns()));
+        if (inelastic) {
+            // Inelastic tasks bypass the MLFQ entirely and go to the standalone
+            // top-priority FIFO.
+            _inelastic_queue.push(std::move(task));
+        } else {
+            QueryNode* node = _ensure_node(key);
+            node->runnable.push(task);
+            if (!node->linked) {
+                // An unlinked node has no runnable tasks; (re)link it at the level
+                // implied by the owning query's current global runtime.
+                _link(node, _compute_level(task->query_runtime_ns()));
+            }
         }
         _total_task_size.fetch_add(1);
         DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
@@ -241,26 +254,18 @@ Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int /*core_id*/) {
     return _push(std::move(task));
 }
 
-void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key, bool inelastic) {
+void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key) {
     std::unique_lock<std::mutex> lock(_mutex);
     auto it = _nodes.find(key);
     if (it == _nodes.end()) {
         return;
     }
-    const int idx = inelastic ? 1 : 0;
-    QueryNode* node = it->second[idx].get();
-    if (node == nullptr) {
-        return;
-    }
+    QueryNode* node = it->second.get();
     if (node->in_flight > 0) {
         node->in_flight--;
     }
     if (!node->linked && node->runnable.empty() && node->in_flight == 0) {
-        it->second[idx].reset();
-        // Drop the map entry only once both the elastic and inelastic nodes are gone.
-        if (it->second[0] == nullptr && it->second[1] == nullptr) {
-            _nodes.erase(it);
-        }
+        _nodes.erase(it);
     }
 }
 
@@ -271,11 +276,17 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
     // demotion. For tasks without a query counter (e.g. RevokableTask) the charge is
     // a no-op and they stay at the highest priority level.
     task->add_query_runtime_ns(time_spent);
-    _release_worker_slot(task->query_ctx_raw(), task->is_inelastic());
+    // Inelastic tasks live in the standalone FIFO and never held an MLFQ worker slot
+    // (no per-query node / in_flight), so there is nothing to release for them.
+    if (!task->is_inelastic()) {
+        _release_worker_slot(task->query_ctx_raw());
+    }
 }
 
 void MultiCoreTaskQueue::release_task(PipelineTask* task) {
-    _release_worker_slot(task->query_ctx_raw(), task->is_inelastic());
+    if (!task->is_inelastic()) {
+        _release_worker_slot(task->query_ctx_raw());
+    }
 }
 
 void MultiCoreTaskQueue::close() {
