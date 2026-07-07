@@ -151,6 +151,12 @@ public:
     // ever compared/used as a map key, never dereferenced by the queue.
     MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
 
+    // "Inelastic first": true when the owning pipeline has low parallelism
+    // (pipeline->num_tasks() < config::pipeline_inelastic_max_parallelism). Such tasks are
+    // placed on the pinned top-priority MLFQ level 0 and are not preempted at the
+    // exec-time-slice boundary. Fixed at construction time.
+    bool is_inelastic() const { return _is_inelastic; }
+
     void put_in_runnable_queue() {
         _schedule_time++;
         _wait_worker_watcher.start();
@@ -230,6 +236,10 @@ private:
     // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
     // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
     QueryContext* _query_ctx_raw = nullptr;
+
+    // Whether this task belongs to a low-parallelism ("inelastic") pipeline; see
+    // is_inelastic(). Fixed at construction from pipeline->num_tasks() and config.
+    bool _is_inelastic = false;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

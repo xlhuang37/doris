@@ -33,14 +33,17 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
-        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {}
+        : _worker_sticky(std::max(core_size, 1), {nullptr, false}), _core_size(core_size) {}
 
 MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
 
 int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
-    for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
+    // Level 0 is reserved for inelastic tasks (assigned by PipelineTask::is_inelastic(),
+    // not by runtime). CPU-runtime levels occupy 1..SUB_QUEUE_LEVEL-1, so this never
+    // returns 0.
+    for (int i = 0; i < SUB_QUEUE_LEVEL - 2; ++i) {
         if (runtime <= _queue_level_limit[i]) {
-            return i;
+            return i + 1;
         }
     }
     return SUB_QUEUE_LEVEL - 1;
@@ -70,16 +73,15 @@ uint64_t MultiCoreTaskQueue::_node_runtime(const QueryNode* node) const {
     return node->runnable.front()->query_runtime_ns();
 }
 
-MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key) {
-    auto it = _nodes.find(key);
-    if (it != _nodes.end()) {
-        return it->second.get();
+MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key,
+                                                               bool inelastic) {
+    auto& slot = _nodes[key][inelastic ? 1 : 0];
+    if (slot == nullptr) {
+        slot = std::make_unique<QueryNode>();
+        slot->key = key;
+        slot->inelastic = inelastic;
     }
-    auto node = std::make_unique<QueryNode>();
-    node->key = key;
-    QueryNode* raw = node.get();
-    _nodes.emplace(key, std::move(node));
-    return raw;
+    return slot.get();
 }
 
 void MultiCoreTaskQueue::_link(QueryNode* node, int level) {
@@ -98,7 +100,8 @@ void MultiCoreTaskQueue::_unlink(QueryNode* node) {
 }
 
 void MultiCoreTaskQueue::_relevel_locked(QueryNode* node) {
-    if (!node->linked) {
+    // Inelastic nodes are pinned at level 0 and never demoted.
+    if (!node->linked || node->inelastic) {
         return;
     }
     int want = _compute_level(_node_runtime(node));
@@ -116,7 +119,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_pop_from_node(QueryNode* node, int worker_
     DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
 
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        _worker_sticky[worker_id] = node->key;
+        _worker_sticky[worker_id] = {node->key, node->inelastic};
     }
 
     if (node->runnable.empty()) {
@@ -138,15 +141,16 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         return nullptr;
     }
 
-    // 1. Locality: keep serving the query this worker last served, as long as it is
-    // still the highest-priority (lowest non-empty level) query and under its lease.
+    // 1. Locality: keep serving the (query, elasticity) this worker last served, as long
+    // as it is still the highest-priority (lowest non-empty level) node and under its
+    // lease.
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        QueryContext* sticky = _worker_sticky[worker_id];
-        if (sticky != nullptr) {
-            auto it = _nodes.find(sticky);
+        auto [sticky_ctx, sticky_inelastic] = _worker_sticky[worker_id];
+        if (sticky_ctx != nullptr) {
+            auto it = _nodes.find(sticky_ctx);
             if (it != _nodes.end()) {
-                QueryNode* node = it->second.get();
-                if (node->linked && !node->runnable.empty()) {
+                QueryNode* node = it->second[sticky_inelastic ? 1 : 0].get();
+                if (node != nullptr && node->linked && !node->runnable.empty()) {
                     _relevel_locked(node);
                     if (node->level == _lowest_non_empty_level() &&
                         node->in_flight < _lease(node)) {
@@ -164,14 +168,17 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         for (auto it = lst.begin(); it != lst.end();) {
             QueryNode* node = *it;
             // Lazy demotion: if the query has crossed a threshold, move the whole node
-            // (all of its tasks) to the deeper level and keep scanning.
-            int want = _compute_level(_node_runtime(node));
-            if (want > level) {
-                auto next = std::next(it);
-                _unlink(node);
-                _link(node, want);
-                it = next;
-                continue;
+            // (all of its tasks) to the deeper level and keep scanning. Inelastic nodes
+            // (level 0) are pinned and never demoted.
+            if (!node->inelastic) {
+                int want = _compute_level(_node_runtime(node));
+                if (want > level) {
+                    auto next = std::next(it);
+                    _unlink(node);
+                    _link(node, want);
+                    it = next;
+                    continue;
+                }
             }
             if (!node->runnable.empty() && node->in_flight < _lease(node)) {
                 return _pop_from_node(node, worker_id);
@@ -213,12 +220,13 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         if (_closed) {
             return Status::InternalError("WorkTaskQueue closed");
         }
-        QueryNode* node = _ensure_node(key);
+        QueryNode* node = _ensure_node(key, task->is_inelastic());
         node->runnable.push(task);
         if (!node->linked) {
-            // An unlinked node has no runnable tasks; (re)link it at the level implied
-            // by the owning query's current global runtime.
-            _link(node, _compute_level(task->query_runtime_ns()));
+            // An unlinked node has no runnable tasks; (re)link it. Inelastic nodes are
+            // pinned at level 0; elastic nodes go to the level implied by the owning
+            // query's current global runtime.
+            _link(node, node->inelastic ? 0 : _compute_level(task->query_runtime_ns()));
         }
         _total_task_size.fetch_add(1);
         DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
@@ -236,18 +244,26 @@ Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int /*core_id*/) {
     return _push(std::move(task));
 }
 
-void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key) {
+void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key, bool inelastic) {
     std::unique_lock<std::mutex> lock(_mutex);
     auto it = _nodes.find(key);
     if (it == _nodes.end()) {
         return;
     }
-    QueryNode* node = it->second.get();
+    const int idx = inelastic ? 1 : 0;
+    QueryNode* node = it->second[idx].get();
+    if (node == nullptr) {
+        return;
+    }
     if (node->in_flight > 0) {
         node->in_flight--;
     }
     if (!node->linked && node->runnable.empty() && node->in_flight == 0) {
-        _nodes.erase(it);
+        it->second[idx].reset();
+        // Drop the map entry only once both the elastic and inelastic nodes are gone.
+        if (it->second[0] == nullptr && it->second[1] == nullptr) {
+            _nodes.erase(it);
+        }
     }
 }
 
@@ -258,11 +274,11 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
     // demotion. For tasks without a query counter (e.g. RevokableTask) the charge is
     // a no-op and they stay at the highest priority level.
     task->add_query_runtime_ns(time_spent);
-    _release_worker_slot(task->query_ctx_raw());
+    _release_worker_slot(task->query_ctx_raw(), task->is_inelastic());
 }
 
 void MultiCoreTaskQueue::release_task(PipelineTask* task) {
-    _release_worker_slot(task->query_ctx_raw());
+    _release_worker_slot(task->query_ctx_raw(), task->is_inelastic());
 }
 
 void MultiCoreTaskQueue::close() {

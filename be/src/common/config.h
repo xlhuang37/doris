@@ -371,6 +371,11 @@ DECLARE_mInt32(pipeline_status_report_interval);
 DECLARE_mInt32(pipeline_task_exec_time_slice);
 // Soft per-query worker cap for the global query-granular pipeline MLFQ (0 = unbounded)
 DECLARE_mInt32(pipeline_query_worker_cap);
+// "Inelastic first": a task whose pipeline->num_tasks() < this goes to top-priority MLFQ
+// level 0 (0 = disable the policy)
+DECLARE_mInt32(pipeline_inelastic_max_parallelism);
+// When true, inelastic tasks are not preempted at the exec-time-slice boundary
+DECLARE_mBool(pipeline_inelastic_disable_preemption);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
