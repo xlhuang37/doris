@@ -33,17 +33,14 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
-        : _worker_sticky(std::max(core_size, 1), {nullptr, false}), _core_size(core_size) {}
+        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {}
 
 MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
 
 int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
-    // Level 0 is reserved for inelastic tasks (assigned by PipelineTask::is_inelastic(),
-    // not by runtime). CPU-runtime levels occupy 1..SUB_QUEUE_LEVEL-1, so this never
-    // returns 0.
-    for (int i = 0; i < SUB_QUEUE_LEVEL - 2; ++i) {
+    for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
         if (runtime <= _queue_level_limit[i]) {
-            return i + 1;
+            return i;
         }
     }
     return SUB_QUEUE_LEVEL - 1;
@@ -73,15 +70,16 @@ uint64_t MultiCoreTaskQueue::_node_runtime(const QueryNode* node) const {
     return node->runnable.front()->query_runtime_ns();
 }
 
-MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key,
-                                                               bool inelastic) {
-    auto& slot = _nodes[key][inelastic ? 1 : 0];
-    if (slot == nullptr) {
-        slot = std::make_unique<QueryNode>();
-        slot->key = key;
-        slot->inelastic = inelastic;
+MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key) {
+    auto it = _nodes.find(key);
+    if (it != _nodes.end()) {
+        return it->second.get();
     }
-    return slot.get();
+    auto node = std::make_unique<QueryNode>();
+    node->key = key;
+    QueryNode* raw = node.get();
+    _nodes.emplace(key, std::move(node));
+    return raw;
 }
 
 void MultiCoreTaskQueue::_link(QueryNode* node, int level) {
@@ -100,8 +98,7 @@ void MultiCoreTaskQueue::_unlink(QueryNode* node) {
 }
 
 void MultiCoreTaskQueue::_relevel_locked(QueryNode* node) {
-    // Inelastic nodes are pinned at level 0 and never demoted.
-    if (!node->linked || node->inelastic) {
+    if (!node->linked) {
         return;
     }
     int want = _compute_level(_node_runtime(node));
@@ -119,7 +116,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_pop_from_node(QueryNode* node, int worker_
     DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
 
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        _worker_sticky[worker_id] = {node->key, node->inelastic};
+        _worker_sticky[worker_id] = node->key;
     }
 
     if (node->runnable.empty()) {

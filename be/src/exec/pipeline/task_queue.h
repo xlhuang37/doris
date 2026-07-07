@@ -28,7 +28,6 @@
 #include <mutex>
 #include <queue>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -45,22 +44,23 @@ class QueryContext;
 // seeing its own shard.
 //
 // Structure:
-//   - SUB_QUEUE_LEVEL absolute-priority levels. Level 0 is the "inelastic" level: it
-//     holds tasks of low-parallelism pipelines (PipelineTask::is_inelastic()) and is
-//     pinned - a node here is never demoted regardless of CPU runtime. Levels 1..N are
-//     the CPU-runtime levels: a query's level there is derived from its QueryContext-
-//     global CPU runtime (QueryContext::query_runtime_counter, surfaced via
-//     PipelineTask::query_runtime_ns), so a query is demoted as a whole the more CPU it
-//     consumes across all of its fragments/instances and across the pipeline/scan
-//     schedulers. Because a query can own both inelastic and elastic tasks, it may have
-//     two nodes (one at level 0, one at its CPU level), keyed by (QueryContext*,
-//     is_inelastic).
+//   - A standalone "inelastic" subqueue that sits OUTSIDE the MLFQ and is drained first
+//     with strict absolute priority. It holds tasks of low-parallelism pipelines
+//     (PipelineTask::is_inelastic()) as a plain global FIFO, independent of the
+//     per-query node/level machinery below (no demotion, no per-query nodes).
+//   - SUB_QUEUE_LEVEL absolute-priority levels. A query's level is derived from its
+//     QueryContext-global CPU runtime (QueryContext::query_runtime_counter, surfaced
+//     via PipelineTask::query_runtime_ns), so a query is demoted as a whole the more
+//     CPU it consumes across all of its fragments/instances and across the
+//     pipeline/scan schedulers.
 //   - Each level holds query "nodes" in a round-robin list. Each node owns a FIFO of
 //     that query's runnable PipelineTasks. Within a level, nodes are served
 //     round-robin so workers spread across co-resident queries rather than dogpiling
 //     one; tasks within a node are FIFO.
 //
 // Selection (take):
+//   0. Inelastic first: if the standalone inelastic subqueue is non-empty, serve its
+//      front task before consulting the MLFQ.
 //   1. Locality: a worker prefers to keep serving the query it last served, as long
 //      as that query is still at the lowest non-empty level and under its lease.
 //   2. Otherwise pick, by strict absolute priority, the lowest non-empty level and
@@ -102,20 +102,15 @@ public:
     int cores() const { return _core_size; }
 
 protected:
-    // Level 0 is the pinned "inelastic" level; levels 1..SUB_QUEUE_LEVEL-1 are the
-    // CPU-runtime levels.
-    static constexpr int SUB_QUEUE_LEVEL = 5;
+    static constexpr int SUB_QUEUE_LEVEL = 4;
 
-    // One bucket per (runnable query, elasticity). Lives in `_nodes` for the query's
-    // lifetime in the queue; it is linked into exactly one level list while it has
-    // runnable tasks, and unlinked (but kept in `_nodes`) while it has none but still
-    // has in-flight workers.
+    // One bucket per runnable query. Lives in `_nodes` for the query's lifetime in
+    // the queue; it is linked into exactly one level list while it has runnable
+    // tasks, and unlinked (but kept in `_nodes`) while it has none but still has
+    // in-flight workers.
     struct QueryNode {
         QueryContext* key = nullptr;
         int level = 0;
-        // When true this node holds inelastic tasks, is pinned at level 0 and is never
-        // demoted by CPU runtime.
-        bool inelastic = false;
         bool linked = false;
         int in_flight = 0;
         std::queue<PipelineTaskSPtr> runnable;
@@ -130,7 +125,7 @@ private:
     int _compute_level(uint64_t runtime) const;
     int _lowest_non_empty_level() const;
     int _lease(const QueryNode* node) const;
-    QueryNode* _ensure_node(QueryContext* key, bool inelastic);
+    QueryNode* _ensure_node(QueryContext* key);
     void _link(QueryNode* node, int level);
     void _unlink(QueryNode* node);
     void _relevel_locked(QueryNode* node);
@@ -138,26 +133,28 @@ private:
     PipelineTaskSPtr _pop_from_node(QueryNode* node, int worker_id);
     PipelineTaskSPtr _try_take_unprotected(int worker_id);
     Status _push(PipelineTaskSPtr task);
-    void _release_worker_slot(QueryContext* key, bool inelastic);
+    void _release_worker_slot(QueryContext* key);
 
     std::mutex _mutex;
     std::condition_variable _wait_task;
     bool _closed = false;
 
     std::array<std::list<QueryNode*>, SUB_QUEUE_LEVEL> _levels;
-    // Up to two nodes per query: index [0] = elastic (levels 1..N), [1] = inelastic
-    // (level 0). A slot is null until that kind of task is first pushed.
-    std::unordered_map<QueryContext*, std::array<std::unique_ptr<QueryNode>, 2>> _nodes;
+    std::unordered_map<QueryContext*, std::unique_ptr<QueryNode>> _nodes;
 
-    // The (query, elasticity) each worker last served, used to preserve query locality.
-    std::vector<std::pair<QueryContext*, bool>> _worker_sticky;
+    // Standalone top-priority FIFO for inelastic tasks (PipelineTask::is_inelastic()).
+    // Independent of the MLFQ: no per-query nodes, no demotion, no in_flight tracking;
+    // drained before the MLFQ levels in _try_take_unprotected.
+    std::queue<PipelineTaskSPtr> _inelastic_queue;
+
+    // The query each worker last served, used to preserve query locality.
+    std::vector<QueryContext*> _worker_sticky;
 
     std::atomic<size_t> _total_task_size = 0;
 
     int _core_size;
-    // Thresholds between the CPU-runtime levels 1..N (level 0 is the inelastic level and
-    // is not runtime-based). Values are cumulative attained-service in ns.
-    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 2] = {2800000000, 10000000000,
+    // 1s, 3s, 10s, 60s, 300s
+    uint64_t _queue_level_limit[SUB_QUEUE_LEVEL - 1] = {2800000000, 10000000000,
                                                         25000000000};
     static constexpr auto WAIT_CORE_TASK_TIMEOUT_MS = 100;
 };
