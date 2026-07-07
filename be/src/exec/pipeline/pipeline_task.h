@@ -40,7 +40,6 @@ class PipelineFragmentContext;
 namespace doris {
 
 class MultiCoreTaskQueue;
-class PriorityTaskQueue;
 class Dependency;
 
 class PipelineTask : public std::enable_shared_from_this<PipelineTask> {
@@ -133,15 +132,24 @@ public:
     // Execution phase should be terminated. This is called if this task is canceled or waken up early.
     void terminate();
 
-    // 1 used for update priority queue
-    // note(wb) an ugly implementation, need refactor later
-    // 1.1 pipeline task
-    void inc_runtime_ns(uint64_t delta_time) { this->_runtime += delta_time; }
-    uint64_t get_runtime_ns() const { return this->_runtime; }
-
-    // 1.2 priority queue's queue level
-    void update_queue_level(int queue_level) { this->_queue_level = queue_level; }
-    int get_queue_level() const { return this->_queue_level; }
+    // Used by the query-granular MLFQ in the pipeline task scheduler. The
+    // scheduler charges executed CPU time to the owning query's global counter
+    // (shared across all of the query's fragments, instances and pipeline tasks),
+    // and reads it back to decide which priority level this task belongs in.
+    void add_query_runtime_ns(uint64_t delta_time) {
+        if (_query_runtime_ptr != nullptr) {
+            _query_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
+        }
+    }
+    MOCK_FUNCTION uint64_t query_runtime_ns() const {
+        return _query_runtime_ptr != nullptr
+                       ? _query_runtime_ptr->load(std::memory_order_relaxed)
+                       : 0;
+    }
+    // Opaque key identifying the owning query, used by the global query-granular MLFQ
+    // to bucket this task. The query context outlives its tasks; the pointer is only
+    // ever compared/used as a map key, never dereferenced by the queue.
+    MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
 
     void put_in_runnable_queue() {
         _schedule_time++;
@@ -213,15 +221,15 @@ private:
 
     std::weak_ptr<PipelineFragmentContext> _fragment_context;
 
-    // used for priority queue
-    // it may be visited by different thread but there is no race condition
-    // so no need to add lock
-    uint64_t _runtime = 0;
-    // it's visited in one thread, so no need to thread synchronization
-    // 1 get task, (set _queue_level/_core_id)
-    // 2 exe task
-    // 3 update task statistics(update _queue_level/_core_id)
-    int _queue_level = 0;
+    // Cached pointer to the owning query's global runtime counter (owned by
+    // QueryContext). The query context strictly outlives its fragments and tasks,
+    // so this raw pointer is safe and lets the scheduler avoid locking
+    // `_fragment_context` (a weak_ptr) on the hot push/dequeue path.
+    std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
+
+    // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
+    // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
+    QueryContext* _query_ctx_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

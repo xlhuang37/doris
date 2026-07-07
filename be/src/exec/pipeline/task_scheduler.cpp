@@ -106,6 +106,10 @@ void TaskScheduler::_do_work(int index) {
         // thread set task->set_running(false)
         // set_running return the old value
         if (task->set_running(true)) {
+            // This worker will not execute the task, so release the worker slot it
+            // took in take() before re-queueing it (the holding worker will release
+            // its own slot when it finishes).
+            _task_queue.release_task(task.get());
             static_cast<void>(_task_queue.push_back(task, index));
             continue;
         }
