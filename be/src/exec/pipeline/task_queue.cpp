@@ -138,6 +138,17 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         return nullptr;
     }
 
+    // 0. Inelastic first: the standalone inelastic subqueue has strict absolute priority
+    // above the whole MLFQ. It is a plain global FIFO - no per-query node, no in_flight,
+    // no sticky (those belong to the MLFQ only).
+    if (!_inelastic_queue.empty()) {
+        auto task = _inelastic_queue.front();
+        _inelastic_queue.pop();
+        _total_task_size.fetch_sub(1);
+        DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+        return task;
+    }
+
     // 1. Locality: keep serving the query this worker last served, as long as it is
     // still the highest-priority (lowest non-empty level) query and under its lease.
     if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
@@ -208,17 +219,24 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     }
     task->put_in_runnable_queue();
     QueryContext* key = task->query_ctx_raw();
+    const bool inelastic = task->is_inelastic();
     {
         std::unique_lock<std::mutex> lock(_mutex);
         if (_closed) {
             return Status::InternalError("WorkTaskQueue closed");
         }
-        QueryNode* node = _ensure_node(key);
-        node->runnable.push(task);
-        if (!node->linked) {
-            // An unlinked node has no runnable tasks; (re)link it at the level implied
-            // by the owning query's current global runtime.
-            _link(node, _compute_level(task->query_runtime_ns()));
+        if (inelastic) {
+            // Inelastic tasks bypass the MLFQ entirely and go to the standalone
+            // top-priority FIFO.
+            _inelastic_queue.push(std::move(task));
+        } else {
+            QueryNode* node = _ensure_node(key);
+            node->runnable.push(task);
+            if (!node->linked) {
+                // An unlinked node has no runnable tasks; (re)link it at the level
+                // implied by the owning query's current global runtime.
+                _link(node, _compute_level(task->query_runtime_ns()));
+            }
         }
         _total_task_size.fetch_add(1);
         DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
@@ -258,11 +276,17 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
     // demotion. For tasks without a query counter (e.g. RevokableTask) the charge is
     // a no-op and they stay at the highest priority level.
     task->add_query_runtime_ns(time_spent);
-    _release_worker_slot(task->query_ctx_raw());
+    // Inelastic tasks live in the standalone FIFO and never held an MLFQ worker slot
+    // (no per-query node / in_flight), so there is nothing to release for them.
+    if (!task->is_inelastic()) {
+        _release_worker_slot(task->query_ctx_raw());
+    }
 }
 
 void MultiCoreTaskQueue::release_task(PipelineTask* task) {
-    _release_worker_slot(task->query_ctx_raw());
+    if (!task->is_inelastic()) {
+        _release_worker_slot(task->query_ctx_raw());
+    }
 }
 
 void MultiCoreTaskQueue::close() {

@@ -313,6 +313,16 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // Default 0 means unbounded (strict absolute priority).
 DEFINE_mInt32(pipeline_query_worker_cap, "0");
 
+// "Inelastic first" scheduling policy. A pipeline task is classified as inelastic when
+// its owning pipeline has low parallelism (pipeline->num_tasks() < this threshold, which
+// includes serial pipelines with num_tasks()==1). Inelastic tasks are placed on the
+// top-priority MLFQ level 0, which is pinned (never demoted by CPU runtime). Set to 0 to
+// disable the policy (nothing is classified inelastic, level 0 stays empty).
+DEFINE_mInt32(pipeline_inelastic_max_parallelism, "1");
+// When true, a worker running an inelastic task does not preempt at the exec-time-slice
+// (pipeline_task_exec_time_slice) boundary; it keeps running until the task blocks or eos.
+DEFINE_mBool(pipeline_inelastic_disable_preemption, "true");
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task

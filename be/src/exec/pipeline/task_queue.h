@@ -44,6 +44,10 @@ class QueryContext;
 // seeing its own shard.
 //
 // Structure:
+//   - A standalone "inelastic" subqueue that sits OUTSIDE the MLFQ and is drained first
+//     with strict absolute priority. It holds tasks of low-parallelism pipelines
+//     (PipelineTask::is_inelastic()) as a plain global FIFO, independent of the
+//     per-query node/level machinery below (no demotion, no per-query nodes).
 //   - SUB_QUEUE_LEVEL absolute-priority levels. A query's level is derived from its
 //     QueryContext-global CPU runtime (QueryContext::query_runtime_counter, surfaced
 //     via PipelineTask::query_runtime_ns), so a query is demoted as a whole the more
@@ -55,6 +59,8 @@ class QueryContext;
 //     one; tasks within a node are FIFO.
 //
 // Selection (take):
+//   0. Inelastic first: if the standalone inelastic subqueue is non-empty, serve its
+//      front task before consulting the MLFQ.
 //   1. Locality: a worker prefers to keep serving the query it last served, as long
 //      as that query is still at the lowest non-empty level and under its lease.
 //   2. Otherwise pick, by strict absolute priority, the lowest non-empty level and
@@ -135,6 +141,11 @@ private:
 
     std::array<std::list<QueryNode*>, SUB_QUEUE_LEVEL> _levels;
     std::unordered_map<QueryContext*, std::unique_ptr<QueryNode>> _nodes;
+
+    // Standalone top-priority FIFO for inelastic tasks (PipelineTask::is_inelastic()).
+    // Independent of the MLFQ: no per-query nodes, no demotion, no in_flight tracking;
+    // drained before the MLFQ levels in _try_take_unprotected.
+    std::queue<PipelineTaskSPtr> _inelastic_queue;
 
     // The query each worker last served, used to preserve query locality.
     std::vector<QueryContext*> _worker_sticky;
