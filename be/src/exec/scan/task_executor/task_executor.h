@@ -16,8 +16,6 @@
 // under the License.
 
 #pragma once
-#include <atomic>
-#include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>
@@ -40,15 +38,11 @@ public:
     virtual void stop() = 0;
     virtual void wait() = 0;
 
-    // `query_runtime` (optional) is the owning query's unified CPU runtime
-    // counter. When provided, the time-sharing scheduler levels this task's splits
-    // by the query runtime and charges executed scan CPU back into it.
     virtual Result<std::shared_ptr<TaskHandle>> create_task(
             const TaskId& task_id, std::function<double()> utilization_supplier,
             int initial_split_concurrency,
             std::chrono::nanoseconds split_concurrency_adjust_frequency,
-            std::optional<int> max_drivers_per_task,
-            std::atomic<uint64_t>* query_runtime = nullptr) = 0;
+            std::optional<int> max_drivers_per_task) = 0;
 
     virtual Status add_task(const TaskId& task_id, std::shared_ptr<TaskHandle> task_handle) = 0;
 
@@ -62,4 +56,4 @@ public:
                                     const std::shared_ptr<SplitRunner>& split) = 0;
 };
 
-} // namespace doris
+} // namespace dorisx
