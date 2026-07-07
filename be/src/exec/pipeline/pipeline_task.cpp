@@ -93,6 +93,11 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
         _query_runtime_ptr = fragment_context->query_runtime_counter();
         _query_ctx_raw = fragment_context->get_query_ctx();
     }
+    // "Inelastic first": tasks of low-parallelism pipelines (including serial pipelines,
+    // which have num_tasks()==1) are placed on the pinned top-priority MLFQ level 0.
+    // num_tasks() is final by the time tasks are created. Threshold <= 0 disables the policy.
+    const int inelastic_threshold = config::pipeline_inelastic_max_parallelism;
+    _is_inelastic = inelastic_threshold > 0 && _pipeline->num_tasks() < inelastic_threshold;
     _execution_dependencies.push_back(state->get_query_ctx()->get_execution_dependency());
     if (!_shared_state_map.contains(_sink->dests_id().front())) {
         auto shared_state = _sink->create_shared_state();
@@ -577,7 +582,11 @@ Status PipelineTask::execute(bool* done) {
             break;
         }
 
-        if (time_spent > _exec_time_slice) {
+        // "Inelastic first": a worker running an inelastic task does not yield at the
+        // exec-time-slice boundary; it keeps running until the task blocks or reaches eos
+        // (the _is_blocked()/cancel/eos checks above still release the worker).
+        if (!(_is_inelastic && config::pipeline_inelastic_disable_preemption) &&
+            time_spent > _exec_time_slice) {
             COUNTER_UPDATE(_yield_counts, 1);
             break;
         }
