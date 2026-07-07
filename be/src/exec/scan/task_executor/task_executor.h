@@ -56,4 +56,4 @@ public:
                                     const std::shared_ptr<SplitRunner>& split) = 0;
 };
 
-} // namespace dorisx
+} // namespace doris
