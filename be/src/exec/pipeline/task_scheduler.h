@@ -53,6 +53,10 @@ public:
 
     virtual void stop();
 
+    // Drop the per-query state held by the underlying task queue for a finished
+    // query. Called when the owning QueryContext is destroyed.
+    virtual void remove_query(QueryContext* query_ctx) { _task_queue.remove_query(query_ctx); }
+
     virtual std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() {
         return {{_name, _fix_thread_pool->debug_info()}};
     }
@@ -91,6 +95,11 @@ public:
     Status start() override;
 
     void stop() override;
+
+    void remove_query(QueryContext* query_ctx) override {
+        _blocking_scheduler.remove_query(query_ctx);
+        _simple_scheduler.remove_query(query_ctx);
+    }
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
         return {_blocking_scheduler.thread_debug_info()[0],

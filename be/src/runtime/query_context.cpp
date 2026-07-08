@@ -35,6 +35,7 @@
 #include "exec/operator/rec_cte_scan_operator.h"
 #include "exec/pipeline/dependency.h"
 #include "exec/pipeline/pipeline_fragment_context.h"
+#include "exec/pipeline/task_scheduler.h"
 #include "exec/runtime_filter/runtime_filter_definitions.h"
 #include "exec/spill/spill_file_manager.h"
 #include "runtime/exec_env.h"
@@ -226,6 +227,13 @@ QueryContext::~QueryContext() {
     }
 
     _resource_ctx->task_controller()->finish();
+
+    // Drop this query's per-query state (and its ProducerToken) from the pipeline
+    // task queue. Safe here because all of the query's fragments/tasks are gone, so
+    // nothing can enqueue for it anymore.
+    if (_task_scheduler != nullptr) {
+        _task_scheduler->remove_query(this);
+    }
 
     if (enable_profile()) {
         _report_query_profile();

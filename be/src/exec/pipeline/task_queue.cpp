@@ -32,8 +32,7 @@
 namespace doris {
 #include "common/compile_check_begin.h"
 
-MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size)
-        : _worker_sticky(std::max(core_size, 1), nullptr), _core_size(core_size) {}
+MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size) : _core_size(core_size) {}
 
 MultiCoreTaskQueue::~MultiCoreTaskQueue() = default;
 
@@ -46,153 +45,37 @@ int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
     return SUB_QUEUE_LEVEL - 1;
 }
 
-int MultiCoreTaskQueue::_lowest_non_empty_level() const {
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
-        if (!_levels[level].empty()) {
-            return level;
-        }
-    }
-    return -1;
-}
-
-int MultiCoreTaskQueue::_lease(const QueryNode* /*node*/) const {
-    // Option 2 (soft lease): a per-query cap on concurrent workers. When > 0, workers
-    // beyond the cap spill to lower-priority queries even if this query has more
-    // runnable tasks; default (<= 0) means unbounded (strict absolute priority).
-    int cap = config::pipeline_query_worker_cap;
-    return cap > 0 ? cap : std::numeric_limits<int>::max();
-}
-
-uint64_t MultiCoreTaskQueue::_node_runtime(const QueryNode* node) const {
-    if (node->runnable.empty()) {
-        return 0;
-    }
-    return node->runnable.front()->query_runtime_ns();
-}
-
 MultiCoreTaskQueue::QueryNode* MultiCoreTaskQueue::_ensure_node(QueryContext* key) {
+    std::unique_lock<std::mutex> lock(_map_mutex);
     auto it = _nodes.find(key);
     if (it != _nodes.end()) {
         return it->second.get();
     }
-    auto node = std::make_unique<QueryNode>();
+    auto node = std::make_unique<QueryNode>(_queue);
     node->key = key;
     QueryNode* raw = node.get();
     _nodes.emplace(key, std::move(node));
     return raw;
 }
 
-void MultiCoreTaskQueue::_link(QueryNode* node, int level) {
-    node->level = level;
-    _levels[level].push_back(node);
-    node->pos = std::prev(_levels[level].end());
-    node->linked = true;
-}
-
-void MultiCoreTaskQueue::_unlink(QueryNode* node) {
-    if (!node->linked) {
-        return;
-    }
-    _levels[node->level].erase(node->pos);
-    node->linked = false;
-}
-
-void MultiCoreTaskQueue::_relevel_locked(QueryNode* node) {
-    if (!node->linked) {
-        return;
-    }
-    int want = _compute_level(_node_runtime(node));
-    if (want != node->level) {
-        _unlink(node);
-        _link(node, want);
-    }
-}
-
-PipelineTaskSPtr MultiCoreTaskQueue::_pop_from_node(QueryNode* node, int worker_id) {
-    auto task = node->runnable.front();
-    node->runnable.pop();
-    node->in_flight++;
-    _total_task_size.fetch_sub(1);
-    DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
-
-    if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        _worker_sticky[worker_id] = node->key;
-    }
-
-    if (node->runnable.empty()) {
-        // No more runnable tasks: unlink from its level (kept in `_nodes` while it
-        // still has in-flight workers, so their release can find it).
-        _unlink(node);
-    } else {
-        // Round-robin: rotate this node to the back of its level so the next worker
-        // serves a different query first.
-        auto& lst = _levels[node->level];
-        lst.splice(lst.end(), lst, node->pos);
-        node->pos = std::prev(lst.end());
-    }
-    return task;
-}
-
-PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
-    if (_total_task_size.load() == 0 || _closed) {
+PipelineTaskSPtr MultiCoreTaskQueue::_take(int /*worker_id*/, uint32_t timeout_ms) {
+    if (_closed) {
         return nullptr;
     }
-
-    // 1. Locality: keep serving the query this worker last served, as long as it is
-    // still the highest-priority (lowest non-empty level) query and under its lease.
-    if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        QueryContext* sticky = _worker_sticky[worker_id];
-        if (sticky != nullptr) {
-            auto it = _nodes.find(sticky);
-            if (it != _nodes.end()) {
-                QueryNode* node = it->second.get();
-                if (node->linked && !node->runnable.empty()) {
-                    _relevel_locked(node);
-                    if (node->level == _lowest_non_empty_level() &&
-                        node->in_flight < _lease(node)) {
-                        return _pop_from_node(node, worker_id);
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Strict absolute priority: drain the lowest non-empty level first; within a
-    // level, round-robin across queries (the list front is the least-recently served).
-    for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
-        auto& lst = _levels[level];
-        for (auto it = lst.begin(); it != lst.end();) {
-            QueryNode* node = *it;
-            // Lazy demotion: if the query has crossed a threshold, move the whole node
-            // (all of its tasks) to the deeper level and keep scanning.
-            int want = _compute_level(_node_runtime(node));
-            if (want > level) {
-                auto next = std::next(it);
-                _unlink(node);
-                _link(node, want);
-                it = next;
-                continue;
-            }
-            if (!node->runnable.empty() && node->in_flight < _lease(node)) {
-                return _pop_from_node(node, worker_id);
-            }
-            ++it;
-        }
-    }
-    return nullptr;
-}
-
-PipelineTaskSPtr MultiCoreTaskQueue::_take(int worker_id, uint32_t timeout_ms) {
     PipelineTaskSPtr task = nullptr;
-    {
-        std::unique_lock<std::mutex> lock(_mutex);
-        task = _try_take_unprotected(worker_id);
-        if (!task && !_closed && timeout_ms > 0) {
+    if (!_queue.try_dequeue(task) && !_closed && timeout_ms > 0) {
+        std::unique_lock<std::mutex> lock(_wait_mutex);
+        // Re-check under the lock to avoid missing a wakeup that raced with the empty
+        // dequeue above; then park for at most `timeout_ms`.
+        if (_total_task_size.load() == 0 && !_closed) {
             _wait_task.wait_for(lock, std::chrono::milliseconds(timeout_ms));
-            task = _try_take_unprotected(worker_id);
         }
+        lock.unlock();
+        _queue.try_dequeue(task);
     }
     if (task) {
+        _total_task_size.fetch_sub(1);
+        DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
         task->pop_out_runnable_queue();
     }
     return task;
@@ -207,21 +90,19 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         return Status::InternalError("WorkTaskQueue closed");
     }
     task->put_in_runnable_queue();
-    QueryContext* key = task->query_ctx_raw();
+    QueryNode* node = _ensure_node(task->query_ctx_raw());
     {
-        std::unique_lock<std::mutex> lock(_mutex);
-        if (_closed) {
-            return Status::InternalError("WorkTaskQueue closed");
+        // The sub-queue is single-producer, so serialize this query's enqueues.
+        // Enqueues of different queries use different tokens and never contend here.
+        std::unique_lock<std::mutex> lock(node->enqueue_mutex);
+        if (!_queue.enqueue(node->token, std::move(task))) {
+            return Status::MemoryLimitExceeded("failed to enqueue pipeline task");
         }
-        QueryNode* node = _ensure_node(key);
-        node->runnable.push(task);
-        if (!node->linked) {
-            // An unlinked node has no runnable tasks; (re)link it at the level implied
-            // by the owning query's current global runtime.
-            _link(node, _compute_level(task->query_runtime_ns()));
-        }
-        _total_task_size.fetch_add(1);
-        DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
+    }
+    _total_task_size.fetch_add(1);
+    DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
+    {
+        std::unique_lock<std::mutex> lock(_wait_mutex);
         _wait_task.notify_one();
     }
     return Status::OK();
@@ -236,21 +117,6 @@ Status MultiCoreTaskQueue::push_back(PipelineTaskSPtr task, int /*core_id*/) {
     return _push(std::move(task));
 }
 
-void MultiCoreTaskQueue::_release_worker_slot(QueryContext* key) {
-    std::unique_lock<std::mutex> lock(_mutex);
-    auto it = _nodes.find(key);
-    if (it == _nodes.end()) {
-        return;
-    }
-    QueryNode* node = it->second.get();
-    if (node->in_flight > 0) {
-        node->in_flight--;
-    }
-    if (!node->linked && node->runnable.empty() && node->in_flight == 0) {
-        _nodes.erase(it);
-    }
-}
-
 void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spent) {
     // Charge the executed CPU time to the owning query's global counter. This counter
     // is shared by all of the query's tasks (across fragments, instances and cores)
@@ -258,15 +124,41 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
     // demotion. For tasks without a query counter (e.g. RevokableTask) the charge is
     // a no-op and they stay at the highest priority level.
     task->add_query_runtime_ns(time_spent);
-    _release_worker_slot(task->query_ctx_raw());
+
+    QueryContext* key = task->query_ctx_raw();
+    QueryNode* node = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(_map_mutex);
+        auto it = _nodes.find(key);
+        if (it == _nodes.end()) {
+            return;
+        }
+        node = it->second.get();
+    }
+
+    // Demote the whole query to a deeper level if its accumulated runtime crossed a
+    // threshold. Runtime only grows, so this only ever moves the producer downward.
+    int want = _compute_level(task->query_runtime_ns());
+    if (want > node->current_level.load(std::memory_order_relaxed)) {
+        std::unique_lock<std::mutex> lock(node->demotion_mutex);
+        int current = node->current_level.load(std::memory_order_relaxed);
+        if (want > current && _queue.demote_producer(node->token, want)) {
+            node->current_level.store(want, std::memory_order_relaxed);
+        }
+    }
 }
 
-void MultiCoreTaskQueue::release_task(PipelineTask* task) {
-    _release_worker_slot(task->query_ctx_raw());
+void MultiCoreTaskQueue::release_task(PipelineTask* /*task*/) {
+    // No-op: the queue no longer tracks per-query in-flight workers.
+}
+
+void MultiCoreTaskQueue::remove_query(QueryContext* key) {
+    std::unique_lock<std::mutex> lock(_map_mutex);
+    _nodes.erase(key);
 }
 
 void MultiCoreTaskQueue::close() {
-    std::unique_lock<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_wait_mutex);
     if (_closed) {
         return;
     }
