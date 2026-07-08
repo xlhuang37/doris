@@ -22,16 +22,16 @@
 #include <cstdint>
 #include <memory>
 
-#include "common/config.h"
 #include "exec/pipeline/pipeline_task.h"
 
 namespace doris {
 
-// Tests for the global, query-granular absolute-priority pipeline MLFQ
-// (MultiCoreTaskQueue). Level thresholds are {1s,3s,10s,60s,300s} of query runtime,
-// so: <=1s -> L0, (1s,3s] -> L1, ... A query's level is read from its tasks'
-// query_runtime_ns(); the bucket key is query_ctx_raw() (compared, never dereferenced,
-// so opaque fake pointers are fine here).
+// Tests for the lock-free, query-granular pipeline MLFQ (MultiCoreTaskQueue). Each
+// query owns one producer sub-queue that starts at the highest priority level (L0);
+// a query is demoted to a deeper level by update_statistics once its accumulated
+// query_runtime_ns() crosses a threshold. Level thresholds are {2.8s,10s,25s}, so:
+// <=2.8s -> L0, (2.8s,10s] -> L1, (10s,25s] -> L2, >25s -> L3. The bucket key is
+// query_ctx_raw() (compared, never dereferenced, so opaque fake pointers are fine).
 static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
 
 class MockPipelineTask : public PipelineTask {
@@ -57,17 +57,71 @@ PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
 }
 } // namespace
 
-// A lower-runtime query's tasks are served before a higher-runtime query's, globally,
-// regardless of push order or which worker asks (the H1 per-core-sharding regression).
-TEST(GlobalPipelineMLFQTest, AbsolutePriorityAcrossQueries) {
+// Basic FIFO for a single query: everything pushed comes back out, then the queue is
+// empty (take returns nullptr after a short wait).
+TEST(LockFreePipelineMLFQTest, SingleQueueDrains) {
     MultiCoreTaskQueue q(1);
-    auto* qa = qkey(0xA); // runtime 0 -> L0
-    auto* qb = qkey(0xB); // runtime 5s -> L1
+    auto* qa = qkey(0xA);
 
-    // Push the lower-priority query first.
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
 
+    for (int i = 0; i < 2; ++i) {
+        auto t = q.take(0);
+        ASSERT_NE(t, nullptr);
+        EXPECT_EQ(t->query_ctx_raw(), qa);
+    }
+
+    q.close();
+}
+
+// Two queries both start at L0, so both of their tasks are served (order between
+// co-resident L0 queries is not guaranteed).
+TEST(LockFreePipelineMLFQTest, CoResidentQueriesBothServed) {
+    MultiCoreTaskQueue q(2);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+
+    int from_a = 0;
+    int from_b = 0;
+    for (int i = 0; i < 2; ++i) {
+        auto t = q.take(0);
+        ASSERT_NE(t, nullptr);
+        if (t->query_ctx_raw() == qa) {
+            ++from_a;
+        } else if (t->query_ctx_raw() == qb) {
+            ++from_b;
+        }
+    }
+    EXPECT_EQ(from_a, 1);
+    EXPECT_EQ(from_b, 1);
+
+    q.close();
+}
+
+// After a query is demoted via update_statistics, a freshly-arrived L0 query is
+// served ahead of it (strict absolute priority between levels).
+TEST(LockFreePipelineMLFQTest, DemotedQueryYieldsToFreshQuery) {
+    MultiCoreTaskQueue q(1);
+    auto* qb = qkey(0xB); // will be demoted to a deeper level
+    auto* qa = qkey(0xA); // stays at L0
+
+    // qb enqueues first (producer created at L0) and accumulates enough runtime to be
+    // demoted below L0.
+    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
+
+    // Charge qb's runtime so its producer is demoted (5s -> L1). update_statistics
+    // reads query_runtime_ns() from the task, which the mock reports directly.
+    auto qb_stat_task = make_task(qb, 5 * kSecondNs);
+    q.update_statistics(qb_stat_task.get(), 0);
+
+    // A fresh L0 query arrives.
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+
+    // The L0 query wins despite being pushed after qb.
     auto t1 = q.take(0);
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qa);
@@ -79,111 +133,27 @@ TEST(GlobalPipelineMLFQTest, AbsolutePriorityAcrossQueries) {
     q.close();
 }
 
-// Within one level, distinct workers are spread across co-resident queries
-// round-robin rather than dogpiling one query.
-TEST(GlobalPipelineMLFQTest, WithinLevelRoundRobinSpread) {
-    MultiCoreTaskQueue q(3);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-    auto* qc = qkey(0xC);
-
-    // All at L0, two tasks each; insertion order A, B, C.
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qc, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qc, 0)).ok());
-
-    // Three different workers each take once: should land on three different queries.
-    auto t0 = q.take(0);
-    auto t1 = q.take(1);
-    auto t2 = q.take(2);
-    ASSERT_NE(t0, nullptr);
-    ASSERT_NE(t1, nullptr);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t0->query_ctx_raw(), qa);
-    EXPECT_EQ(t1->query_ctx_raw(), qb);
-    EXPECT_EQ(t2->query_ctx_raw(), qc);
-
-    q.close();
-}
-
-// A worker keeps serving the same query across takes while that query remains the
-// highest priority (locality).
-TEST(GlobalPipelineMLFQTest, QueryLocality) {
-    MultiCoreTaskQueue q(2);
-    auto* qa = qkey(0xA); // L0
-    auto* qb = qkey(0xB); // L1
-
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    }
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
-
-    // Worker 0 should stick to query A for all three of its tasks before touching B.
-    for (int i = 0; i < 3; ++i) {
-        auto t = q.take(0);
-        ASSERT_NE(t, nullptr);
-        EXPECT_EQ(t->query_ctx_raw(), qa) << "iteration " << i;
-    }
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    EXPECT_EQ(t->query_ctx_raw(), qb);
-
-    q.close();
-}
-
-// A newly arrived higher-priority query pulls a worker off its current (lower
-// priority) query at the next take (cooperative preemption).
-TEST(GlobalPipelineMLFQTest, PreemptionByHigherPriorityQuery) {
+// remove_query drops the per-query state; a subsequent push for the same key
+// recreates it and still works.
+TEST(LockFreePipelineMLFQTest, RemoveQueryThenReuse) {
     MultiCoreTaskQueue q(1);
-    auto* qa = qkey(0xA); // L1 (5s)
-    auto* qc = qkey(0xC); // L0 (0)
+    auto* qa = qkey(0xA);
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
-
-    auto t1 = q.take(0); // worker latches onto A (only query present)
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    auto t1 = q.take(0);
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qa);
 
-    // Higher-priority query C arrives.
-    ASSERT_TRUE(q.push_back(make_task(qc, 0)).ok());
+    // The query finished; drop its node/token.
+    q.remove_query(qa);
 
-    auto t2 = q.take(0); // should preempt to C despite A still having a runnable task
+    // Re-using the same key recreates the node and enqueues normally.
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    auto t2 = q.take(0);
     ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qc);
+    EXPECT_EQ(t2->query_ctx_raw(), qa);
 
     q.close();
-}
-
-// With the soft per-query worker cap set, workers beyond the cap spill to a
-// lower-priority query even though the top query still has runnable tasks.
-TEST(GlobalPipelineMLFQTest, LeaseSpillWhenCapped) {
-    int saved = config::pipeline_query_worker_cap;
-    config::pipeline_query_worker_cap = 1;
-
-    MultiCoreTaskQueue q(2);
-    auto* qa = qkey(0xA); // L0, three tasks
-    auto* qb = qkey(0xB); // L1, one task
-
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    }
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
-
-    auto t0 = q.take(0); // A takes its single allowed worker slot
-    ASSERT_NE(t0, nullptr);
-    EXPECT_EQ(t0->query_ctx_raw(), qa);
-
-    // A is at its cap (1 in-flight, not released), so worker 1 spills to B.
-    auto t1 = q.take(1);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qb);
-
-    q.close();
-    config::pipeline_query_worker_cap = saved;
 }
 
 } // namespace doris
