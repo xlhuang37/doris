@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "common/status.h"
-#include "exec/pipeline/concurrentqueue.h"
+#include "exec/pipeline/priorityconcurrentqueue.h"
 #include "exec/pipeline/pipeline_task.h"
 
 namespace doris {
@@ -41,7 +41,7 @@ class QueryContext;
 // A global, query-granular Multilevel Feedback Queue with strict absolute priority
 // between levels, shared by all workers of one pipeline scheduler (one per workload
 // group). It is a thin wrapper around a lock-free multi-priority-level concurrent
-// queue (moodycamel::ConcurrentQueue), so that enqueue/dequeue of different queries
+// queue (moodycamel_pri::ConcurrentQueue), so that enqueue/dequeue of different queries
 // proceed without a global lock.
 //
 // Structure:
@@ -49,7 +49,7 @@ class QueryContext;
 //     concurrent queue drains higher-priority levels before lower ones and, within a
 //     level, spreads consumers across producers to reduce contention.
 //   - Each query owns exactly one producer sub-queue, represented by a
-//     moodycamel::ProducerToken kept in a per-query QueryNode. All of a query's
+//     moodycamel_pri::ProducerToken kept in a per-query QueryNode. All of a query's
 //     runnable PipelineTasks are enqueued through that token, so a query moves
 //     between levels as a whole.
 //   - A query's level is derived from its QueryContext-global CPU runtime
@@ -107,10 +107,10 @@ public:
 protected:
     static constexpr int SUB_QUEUE_LEVEL = 4;
 
-    struct Traits : public moodycamel::ConcurrentQueueDefaultTraits {
+    struct Traits : public moodycamel_pri::ConcurrentQueueDefaultTraits {
         static const size_t PRIORITY_LEVELS = static_cast<size_t>(SUB_QUEUE_LEVEL);
     };
-    using QueueT = moodycamel::ConcurrentQueue<PipelineTaskSPtr, Traits>;
+    using QueueT = moodycamel_pri::ConcurrentQueue<PipelineTaskSPtr, Traits>;
 
     // Per-query state, kept in `_nodes` for the query's lifetime in the queue.
     struct QueryNode {
@@ -118,7 +118,7 @@ protected:
 
         QueryContext* key = nullptr;
         // One producer sub-queue for this query; all of its tasks are enqueued here.
-        moodycamel::ProducerToken token;
+        moodycamel_pri::ProducerToken token;
         // Serializes this query's enqueues (the sub-queue is single-producer).
         std::mutex enqueue_mutex;
         // Serializes demotions of this producer (does not exclude enqueues).
