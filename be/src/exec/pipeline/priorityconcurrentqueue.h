@@ -80,7 +80,7 @@
 #include <mutex>        // used for thread exit synchronization
 
 // Platform-specific definitions of a numeric thread ID type and an invalid value
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 	template<typename thread_id_t> struct thread_id_converter {
 		typedef thread_id_t thread_id_numeric_size_t;
 		typedef thread_id_t thread_id_hash_t;
@@ -88,7 +88,7 @@ namespace moodycamel { namespace details {
 	};
 } }
 #if defined(MCDBGQ_USE_RELACY)
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 	typedef std::uint32_t thread_id_t;
 	static const thread_id_t invalid_thread_id  = 0xFFFFFFFFU;
 	static const thread_id_t invalid_thread_id2 = 0xFFFFFFFEU;
@@ -98,7 +98,7 @@ namespace moodycamel { namespace details {
 // No sense pulling in windows.h in a header, we'll manually declare the function
 // we use and rely on backwards-compatibility for this not to break
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 	static_assert(sizeof(unsigned long) == sizeof(std::uint32_t), "Expected size of unsigned long to be 32 bits on Windows");
 	typedef std::uint32_t thread_id_t;
 	static const thread_id_t invalid_thread_id  = 0;			// See http://blogs.msdn.com/b/oldnewthing/archive/2004/02/23/78395.aspx
@@ -106,7 +106,7 @@ namespace moodycamel { namespace details {
 	static inline thread_id_t thread_id() { return static_cast<thread_id_t>(::GetCurrentThreadId()); }
 } }
 #elif defined(__arm__) || defined(_M_ARM) || defined(__aarch64__) || (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__MVS__) || defined(MOODYCAMEL_NO_THREAD_LOCAL)
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 	static_assert(sizeof(std::thread::id) == 4 || sizeof(std::thread::id) == 8, "std::thread::id is expected to be either 4 or 8 bytes");
 	
 	typedef std::thread::id thread_id_t;
@@ -151,7 +151,7 @@ namespace moodycamel { namespace details {
 // Assume C++11 compliant compiler
 #define MOODYCAMEL_THREADLOCAL thread_local
 #endif
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 	typedef std::uintptr_t thread_id_t;
 	static const thread_id_t invalid_thread_id  = 0;		// Address can't be nullptr
 	static const thread_id_t invalid_thread_id2 = 1;		// Member accesses off a null pointer are also generally invalid. Plus it's not aligned.
@@ -234,7 +234,7 @@ namespace moodycamel { namespace details {
 #endif
 #endif
 
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 #ifndef MOODYCAMEL_ALIGNAS
 // VS2013 doesn't support alignas or alignof, and align() requires a constant literal
 #if defined(_MSC_VER) && _MSC_VER <= 1800
@@ -273,7 +273,7 @@ namespace moodycamel { namespace details {
 #endif // TSAN
 
 // Compiler-specific likely/unlikely hints
-namespace moodycamel { namespace details {
+namespace moodycamel_pri { namespace details {
 #if defined(__GNUC__)
 	static inline bool (likely)(bool x) { return __builtin_expect((x), true); }
 	static inline bool (unlikely)(bool x) { return __builtin_expect((x), false); }
@@ -287,7 +287,7 @@ namespace moodycamel { namespace details {
 #include "internal/concurrentqueue_internal_debug.h"
 #endif
 
-namespace moodycamel {
+namespace moodycamel_pri {
 namespace details {
 	template<typename T>
 	struct const_numeric_max {
@@ -789,8 +789,8 @@ template<typename T, typename Traits = ConcurrentQueueDefaultTraits>
 class ConcurrentQueue
 {
 public:
-	typedef ::moodycamel::ProducerToken producer_token_t;
-	typedef ::moodycamel::ConsumerToken consumer_token_t;
+	typedef ::moodycamel_pri::ProducerToken producer_token_t;
+	typedef ::moodycamel_pri::ConsumerToken consumer_token_t;
 	
 	typedef typename Traits::index_t index_t;
 	typedef typename Traits::size_t size_t;
@@ -3660,7 +3660,7 @@ private:
 	};
 	
 	template<typename XT, typename XTraits>
-	friend void moodycamel::swap(typename ConcurrentQueue<XT, XTraits>::ImplicitProducerKVP&, typename ConcurrentQueue<XT, XTraits>::ImplicitProducerKVP&) MOODYCAMEL_NOEXCEPT;
+	friend void moodycamel_pri::swap(typename ConcurrentQueue<XT, XTraits>::ImplicitProducerKVP&, typename ConcurrentQueue<XT, XTraits>::ImplicitProducerKVP&) MOODYCAMEL_NOEXCEPT;
 	
 	struct ImplicitProducerHash
 	{
