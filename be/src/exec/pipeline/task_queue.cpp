@@ -138,25 +138,6 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         return nullptr;
     }
 
-    // 1. Locality: keep serving the query this worker last served, as long as it is
-    // still the highest-priority (lowest non-empty level) query and under its lease.
-    if (worker_id >= 0 && worker_id < static_cast<int>(_worker_sticky.size())) {
-        QueryContext* sticky = _worker_sticky[worker_id];
-        if (sticky != nullptr) {
-            auto it = _nodes.find(sticky);
-            if (it != _nodes.end()) {
-                QueryNode* node = it->second.get();
-                if (node->linked && !node->runnable.empty()) {
-                    _relevel_locked(node);
-                    if (node->level == _lowest_non_empty_level() &&
-                        node->in_flight < _lease(node)) {
-                        return _pop_from_node(node, worker_id);
-                    }
-                }
-            }
-        }
-    }
-
     // Strict absolute priority: drain the lowest non-empty level first; within a
     // level, round-robin across queries (the list front is the least-recently served).
     for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
