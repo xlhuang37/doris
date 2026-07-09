@@ -157,7 +157,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_unprotected(int worker_id) {
         }
     }
 
-    // 2. Strict absolute priority: drain the lowest non-empty level first; within a
+    // Strict absolute priority: drain the lowest non-empty level first; within a
     // level, round-robin across queries (the list front is the least-recently served).
     for (int level = 0; level < SUB_QUEUE_LEVEL; ++level) {
         auto& lst = _levels[level];
