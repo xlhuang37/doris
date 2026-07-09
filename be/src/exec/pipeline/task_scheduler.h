@@ -60,9 +60,10 @@ public:
 private:
     friend class HybridTaskScheduler;
 
-    TaskScheduler(int core_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
+    TaskScheduler(int core_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl,
+                  MultiCoreTaskQueue::Mode queue_mode = MultiCoreTaskQueue::Mode::FULL)
             : _name(std::move(name)),
-              _task_queue(core_num),
+              _task_queue(core_num, queue_mode),
               _num_threads(core_num),
               _cgroup_cpu_ctl(cgroup_cpu_ctl) {}
     TaskScheduler() : _task_queue(0), _num_threads(0) {}
@@ -80,10 +81,16 @@ private:
 
 class HybridTaskScheduler MOCK_REMOVE(final) : public TaskScheduler {
 public:
+    // The blocking pool's workers sit inside blocking execute() calls (spill I/O,
+    // remote/AI functions, recursive CTEs) and cannot honor the "re-check the
+    // assignment slot every execution slice" invariant that the push-based scheduler
+    // relies on, so its queue runs in the degenerate general-only mode (plain shared
+    // lock-free queue, no scheduler thread). Runtime is still charged to the
+    // query-global counter, so MLFQ accounting in the simple pool is unaffected.
     HybridTaskScheduler(int exec_thread_num, int blocking_exec_thread_num, std::string name,
                         std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
             : _blocking_scheduler(blocking_exec_thread_num, name + "_blocking_scheduler",
-                                  cgroup_cpu_ctl),
+                                  cgroup_cpu_ctl, MultiCoreTaskQueue::Mode::GENERAL_ONLY),
               _simple_scheduler(exec_thread_num, name + "_simple_scheduler", cgroup_cpu_ctl) {}
 
     Status submit(PipelineTaskSPtr task) override;
