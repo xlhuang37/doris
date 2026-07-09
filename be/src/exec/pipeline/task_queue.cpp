@@ -136,7 +136,10 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     _total_task_size.fetch_add(1);
     DorisMetrics::instance()->pipeline_task_queue_size->increment(1);
     if (created || revived) {
-        _post_message({.type = SchedulerMessage::Type::NEW_QUERY, .key = key});
+        SchedulerMessage msg;
+        msg.type = SchedulerMessage::Type::NEW_QUERY;
+        msg.key = key;
+        _post_message(std::move(msg));
     }
     _notify_workers(false);
     return Status::OK();
@@ -194,10 +197,12 @@ void MultiCoreTaskQueue::_check_assignment(int worker_id) {
     local.detached = false;
     // The ack is posted after this worker has stopped touching `prev`, which is what
     // lets the scheduler treat workers_attached == 0 as a reclamation gate.
-    _post_message({.type = SchedulerMessage::Type::ACK,
-                   .state = prev,
-                   .worker_id = worker_id,
-                   .seq = seq});
+    SchedulerMessage msg;
+    msg.type = SchedulerMessage::Type::ACK;
+    msg.state = prev;
+    msg.worker_id = worker_id;
+    msg.seq = seq;
+    _post_message(std::move(msg));
 }
 
 PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
@@ -224,9 +229,11 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
                 // serving it and tell the scheduler. The slot itself is only ever
                 // rewritten by the scheduler.
                 local.detached = true;
-                _post_message({.type = SchedulerMessage::Type::DETACHED,
-                               .state = qs,
-                               .worker_id = worker_id});
+                SchedulerMessage msg;
+                msg.type = SchedulerMessage::Type::DETACHED;
+                msg.state = qs;
+                msg.worker_id = worker_id;
+                _post_message(std::move(msg));
             }
         }
     }
@@ -286,7 +293,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
         int want = _compute_level(task->query_runtime_ns());
         int cur = qs->level.load(std::memory_order_relaxed);
         if (want > cur && qs->level.compare_exchange_strong(cur, want)) {
-            _post_message({.type = SchedulerMessage::Type::LEVEL_DEMOTED, .key = key});
+            SchedulerMessage msg;
+            msg.type = SchedulerMessage::Type::LEVEL_DEMOTED;
+            msg.key = key;
+            _post_message(std::move(msg));
         }
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
@@ -294,7 +304,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
         // "Nothing here right now". Arm the idle flag; producers disarm it on the
         // next enqueue. Only the arming release posts the message.
         if (!qs->idle.exchange(true)) {
-            _post_message({.type = SchedulerMessage::Type::QUERY_IDLE, .key = key});
+            SchedulerMessage msg;
+            msg.type = SchedulerMessage::Type::QUERY_IDLE;
+            msg.key = key;
+            _post_message(std::move(msg));
         }
     }
 }
@@ -674,7 +687,10 @@ void MultiCoreTaskQueue::wait_scheduler_settled_for_test() {
     }
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
-    _post_message({.type = SchedulerMessage::Type::SYNC, .sync = promise});
+    SchedulerMessage msg;
+    msg.type = SchedulerMessage::Type::SYNC;
+    msg.sync = promise;
+    _post_message(std::move(msg));
     // Guard against a shutdown racing the post: close() fulfills leftover syncs, but
     // if it drained before our push, poll the closed flag instead of hanging.
     while (future.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready) {
