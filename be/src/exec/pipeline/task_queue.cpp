@@ -86,9 +86,25 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     }
 
     QueryContext* key = task->query_ctx_raw();
+    // "Inelastic first": single-task pipelines bypass the per-query sub-queue and go
+    // into the dedicated top-priority queue. All per-query bookkeeping is identical,
+    // so idle detection and teardown are oblivious to which queue the task sits in.
+    const bool inelastic = task->is_inelastic();
     bool enqueued = false;
     bool revived = false;
     bool created = false;
+    // Bookkeeping + physical enqueue for one QueryState. Caller holds the registry
+    // lock (shared or exclusive) and the per-query enqueue mutex.
+    auto do_enqueue = [&](QueryState* qs) -> bool {
+        qs->pending_approx.fetch_add(1);
+        revived = qs->idle.exchange(false);
+        bool ok = inelastic ? _inelastic_queue.enqueue(std::move(task))
+                            : _queue.enqueue(qs->token, std::move(task));
+        if (!ok) {
+            qs->pending_approx.fetch_sub(1);
+        }
+        return ok;
+    };
     {
         // Fast path: the query already has a state. The shared registry lock is held
         // for the whole enqueue, which fences against teardown (exclusive lock).
@@ -100,10 +116,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         if (it != _registry.end()) {
             QueryState* qs = it->second.get();
             std::lock_guard<std::mutex> elock(qs->enqueue_mutex);
-            qs->pending_approx.fetch_add(1);
-            revived = qs->idle.exchange(false);
-            if (!_queue.enqueue(qs->token, std::move(task))) {
-                qs->pending_approx.fetch_sub(1);
+            if (!do_enqueue(qs)) {
                 return Status::InternalError("WorkTaskQueue enqueue failed");
             }
             enqueued = true;
@@ -126,10 +139,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         // The exclusive registry lock already excludes all other producers, but take
         // the enqueue mutex anyway (uncontended) to keep the locking rule uniform.
         std::lock_guard<std::mutex> elock(qs->enqueue_mutex);
-        qs->pending_approx.fetch_add(1);
-        revived = qs->idle.exchange(false);
-        if (!_queue.enqueue(qs->token, std::move(task))) {
-            qs->pending_approx.fetch_sub(1);
+        if (!do_enqueue(qs)) {
             return Status::InternalError("WorkTaskQueue enqueue failed");
         }
     }
@@ -210,30 +220,55 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
         return nullptr;
     }
     PipelineTaskSPtr task;
-    if (_mode == Mode::FULL && _worker_in_range(worker_id)) {
-        _check_assignment(worker_id);
-        WorkerLocal& local = _worker_local[worker_id];
-        QueryState* qs = local.attached;
-        if (qs != nullptr && !local.detached) {
-            if (_queue.try_dequeue_from_producer(qs->token, task)) {
-                // in_flight up BEFORE pending down: a live task is always visible in
-                // at least one of the two counters (see header contract).
-                qs->in_flight.fetch_add(1);
-                qs->pending_approx.fetch_sub(1);
-                _total_task_size.fetch_sub(1);
-                DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
-                return task;
+    if (_mode == Mode::FULL) {
+        const bool in_range = _worker_in_range(worker_id);
+        if (in_range) {
+            // Ack any pending slot write first so scheduler decisions are never
+            // delayed by more than one execution slice.
+            _check_assignment(worker_id);
+        }
+        // "Inelastic first": single-task pipelines outrank everything, including the
+        // worker's own assignment and the MLFQ. Accounting is the same as the
+        // tokenless fallback below (the task was never in a per-query sub-queue).
+        if (_inelastic_queue.try_dequeue(task)) {
+            {
+                std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
+                auto it = _registry.find(task->query_ctx_raw());
+                if (it != _registry.end()) {
+                    // in_flight up BEFORE pending down: a live task is always visible
+                    // in at least one of the two counters (see header contract).
+                    it->second->in_flight.fetch_add(1);
+                    it->second->pending_approx.fetch_sub(1);
+                }
             }
-            if (qs->idle.load()) {
-                // The assigned query has nothing queued and nothing in flight: stop
-                // serving it and tell the scheduler. The slot itself is only ever
-                // rewritten by the scheduler.
-                local.detached = true;
-                SchedulerMessage msg;
-                msg.type = SchedulerMessage::Type::DETACHED;
-                msg.state = qs;
-                msg.worker_id = worker_id;
-                _post_message(std::move(msg));
+            _total_task_size.fetch_sub(1);
+            DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+            return task;
+        }
+        if (in_range) {
+            WorkerLocal& local = _worker_local[worker_id];
+            QueryState* qs = local.attached;
+            if (qs != nullptr && !local.detached) {
+                if (_queue.try_dequeue_from_producer(qs->token, task)) {
+                    // in_flight up BEFORE pending down: a live task is always visible
+                    // in at least one of the two counters (see header contract).
+                    qs->in_flight.fetch_add(1);
+                    qs->pending_approx.fetch_sub(1);
+                    _total_task_size.fetch_sub(1);
+                    DorisMetrics::instance()->pipeline_task_queue_size->increment(-1);
+                    return task;
+                }
+                if (qs->idle.load()) {
+                    // The assigned query has nothing queued and nothing in flight:
+                    // stop serving it and tell the scheduler. The slot itself is only
+                    // ever rewritten by the scheduler.
+                    local.detached = true;
+                    SchedulerMessage msg;
+                    msg.type = SchedulerMessage::Type::DETACHED;
+                    msg.state = qs;
+                    msg.worker_id = worker_id;
+                    _post_message(std::move(msg));
+                }
             }
         }
     }

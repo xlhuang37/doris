@@ -151,6 +151,17 @@ public:
     // ever compared/used as a map key, never dereferenced by the queue.
     MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
 
+    // A task is inelastic when its pipeline has exactly one task: it can only run
+    // sequentially, so extra workers cannot speed it up but any queueing delay
+    // lengthens the query's critical path. The pipeline task scheduler gives such
+    // tasks top dequeue priority ("inelastic first"). `_pipeline` is null for wrapper
+    // tasks built through the protected default constructor (e.g. RevokableTask);
+    // those are never inelastic (and being blockable they are routed to the blocking
+    // pool, which has no priority machinery anyway).
+    MOCK_FUNCTION bool is_inelastic() const {
+        return _pipeline != nullptr && _pipeline->num_tasks() == 1;
+    }
+
     void put_in_runnable_queue() {
         _schedule_time++;
         _wait_worker_watcher.start();

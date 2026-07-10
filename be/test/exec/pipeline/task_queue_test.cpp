@@ -42,16 +42,19 @@ static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
 
 class MockPipelineTask : public PipelineTask {
 public:
-    MockPipelineTask(QueryContext* key, uint64_t runtime_ns) : _key(key), _runtime_ns(runtime_ns) {}
+    MockPipelineTask(QueryContext* key, uint64_t runtime_ns, bool inelastic = false)
+            : _key(key), _runtime_ns(runtime_ns), _inelastic(inelastic) {}
 
     uint64_t query_runtime_ns() const override { return _runtime_ns; }
     QueryContext* query_ctx_raw() const override { return _key; }
+    bool is_inelastic() const override { return _inelastic; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
 
 private:
     QueryContext* _key;
     uint64_t _runtime_ns;
+    bool _inelastic;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -68,6 +71,9 @@ QueryContext* qkey(uintptr_t id) {
 }
 PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
     return std::make_shared<MockPipelineTask>(key, runtime_ns);
+}
+PipelineTaskSPtr make_inelastic_task(QueryContext* key, uint64_t runtime_ns) {
+    return std::make_shared<MockPipelineTask>(key, runtime_ns, /*inelastic=*/true);
 }
 } // namespace
 
@@ -323,6 +329,127 @@ TEST(PushBasedTaskQueueTest, GeneralOnlyMode) {
 
     q.close();
     EXPECT_FALSE(q.push_back(make_task(qa, 0)).ok());
+}
+
+// "Inelastic first": a single-task pipeline's task outranks a pre-existing backlog
+// from another query, including the worker's own assignment. Even though the worker
+// was assigned to query A (the only query known to the scheduler when it settled),
+// the inelastic task from query B is served first.
+TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA); // elastic backlog, L0
+    auto* qb = qkey(0xB); // inelastic, L1 (worse MLFQ level - priority still wins)
+
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    }
+    q.wait_scheduler_settled_for_test(); // worker 0 assigned to A
+
+    ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 5 * kSecondNs)).ok());
+
+    // The inelastic task jumps ahead of A's backlog and of the MLFQ.
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qb);
+    q.update_statistics(t1.get(), 1000);
+
+    // Elastic work is drained normally afterwards.
+    for (int i = 0; i < 3; ++i) {
+        auto t = q.take(0);
+        ASSERT_NE(t, nullptr);
+        EXPECT_EQ(t->query_ctx_raw(), qa) << "iteration " << i;
+        q.update_statistics(t.get(), 1000);
+    }
+
+    q.close();
+}
+
+// Inelastic tasks keep full per-query accounting: after execution and release the
+// query goes idle and its state is torn down; a later inelastic push resurrects it.
+TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    auto t = q.take(0);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->query_ctx_raw(), qa);
+    q.update_statistics(t.get(), 1000); // in_flight -> 0, pending 0: query idle
+
+    // Worker observes the idle query and detaches; grace period passes; reclaimed.
+    EXPECT_EQ(q.take(0), nullptr);
+    q.wait_scheduler_settled_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 0);
+
+    // Resurrection through the inelastic path works like the normal one.
+    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+    auto t2 = q.take(0);
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qa);
+    q.update_statistics(t2.get(), 1000);
+
+    q.close();
+}
+
+// One query mixing both kinds: the inelastic task is served first even if pushed
+// last, everything drains, and the counters reconcile so teardown still happens.
+TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_TRUE(t1->is_inelastic());
+    q.update_statistics(t1.get(), 1000);
+
+    for (int i = 0; i < 2; ++i) {
+        auto t = q.take(0);
+        ASSERT_NE(t, nullptr);
+        EXPECT_FALSE(t->is_inelastic()) << "iteration " << i;
+        q.update_statistics(t.get(), 1000);
+    }
+
+    // All released: the query reaches idle and is reclaimed after the grace period.
+    EXPECT_EQ(q.take(0), nullptr);
+    q.wait_scheduler_settled_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 0);
+
+    q.close();
+}
+
+// Degenerate mode ignores the inelastic flag: everything goes through the one shared
+// queue in FIFO order.
+TEST(PushBasedTaskQueueTest, GeneralOnlyModeIgnoresInelastic) {
+    TestTaskQueue q(1, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 0)).ok());
+
+    // FIFO: the elastic task pushed first comes out first.
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qa);
+    q.update_statistics(t1.get(), 1000);
+
+    auto t2 = q.take(0);
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qb);
+    q.update_statistics(t2.get(), 1000);
+
+    q.close();
 }
 
 // close() rejects further pushes and unblocks takers.

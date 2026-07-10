@@ -58,6 +58,12 @@ class QueryContext;
 //     sub-queue is empty they fall back to a tokenless try_dequeue on the shared queue
 //     (work-conserving, priority-blind relief valve), re-checking the slot after every
 //     task so scheduler decisions take effect within one execution slice.
+//   - "Inelastic first": a task whose pipeline has exactly one task cannot be sped up
+//     by parallelism, so queueing it behind elastic work only lengthens the query's
+//     critical path. Such tasks keep full per-query bookkeeping (pending/in-flight
+//     counters, idle detection, teardown) but bypass the per-query sub-queue and go
+//     into a dedicated shared queue that every worker drains before anything else,
+//     ahead of its assignment and of the MLFQ entirely.
 //   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
 //     idle queries, level demotions, new queries); the scheduler sleeps on a condition
 //     variable with a timer tick and reacts to events instead of polling state.
@@ -290,6 +296,11 @@ private:
     // The shared task queue. In full mode it is partitioned by per-query explicit
     // ProducerTokens; tokenless try_dequeue (fallback) sees all sub-queues.
     moodycamel::ConcurrentQueue<PipelineTaskSPtr> _queue;
+
+    // Top-priority queue for inelastic tasks (full mode; see "inelastic first" in the
+    // class comment). Tokenless multi-producer/multi-consumer: submits come from RPC
+    // threads, dependency wakeups and workers alike, and every worker polls it first.
+    moodycamel::ConcurrentQueue<PipelineTaskSPtr> _inelastic_queue;
 
     // Registry of live QueryStates (full mode). Producers hold the shared lock for the
     // whole enqueue; the fallback dequeue and release paths hold it while mutating a
