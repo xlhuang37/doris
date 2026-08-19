@@ -92,6 +92,10 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
     if (fragment_context) {
         _query_runtime_ptr = fragment_context->query_runtime_counter();
         _query_ctx_raw = fragment_context->get_query_ctx();
+        _active_tasks_ptr = _query_ctx_raw->active_task_counter();
+        // The task starts out in INITED, which counts as active; _state_transition()
+        // takes over the bookkeeping from here.
+        _active_tasks_ptr->fetch_add(1, std::memory_order_relaxed);
     }
     _execution_dependencies.push_back(state->get_query_ctx()->get_execution_dependency());
     if (!_shared_state_map.contains(_sink->dests_id().front())) {
@@ -103,6 +107,13 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
 }
 
 PipelineTask::~PipelineTask() {
+    // Safety net for a task destroyed while still counted, which happens when it never
+    // reaches a terminal state: finalize() bails out early once the fragment context is
+    // gone. Nothing else can transition the task at this point, so this cannot race with
+    // _state_transition().
+    if (_active_tasks_ptr != nullptr && _counts_as_active(_exec_state.load())) {
+        _active_tasks_ptr->fetch_sub(1, std::memory_order_relaxed);
+    }
     auto reset_member = [&]() {
         _shared_state_map.clear();
         _sink_shared_state.reset();
@@ -1075,7 +1086,15 @@ Status PipelineTask::_state_transition(State new_state) {
                 "Task state transition from {} to {} is not allowed! Task info: {}",
                 _to_string(_exec_state), _to_string(new_state), debug_string());
     }
-    _exec_state = new_state;
+    // Maintain the query-global active task count. The delta is taken against the state
+    // this exchange actually replaced rather than a separate load, because transitions
+    // can race: wake_up() runs on whichever thread readied the dependency while
+    // blocked()/close() run on the worker.
+    const State prev = _exec_state.exchange(new_state);
+    if (_active_tasks_ptr != nullptr && _counts_as_active(prev) != _counts_as_active(new_state)) {
+        _active_tasks_ptr->fetch_add(_counts_as_active(new_state) ? 1 : -1,
+                                     std::memory_order_relaxed);
+    }
     return Status::OK();
 }
 
