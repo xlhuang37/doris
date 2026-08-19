@@ -337,14 +337,8 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
     if (remaining == 0 && qs->pending_approx.load() == 0) {
-        // Arm idle so assigned workers self-detach. QUERY_IDLE is only for the
-        // sentinel bucket (no QueryContext destructor will terminate it).
-        if (!qs->idle.exchange(true) && _is_sentinel(query_id)) {
-            SchedulerMessage msg;
-            msg.type = SchedulerMessage::Type::QUERY_IDLE;
-            msg.query_id = query_id;
-            _post_message(std::move(msg));
-        }
+        // Arm idle so assigned workers self-detach. Reclaim waits for terminate.
+        qs->idle.exchange(true);
     }
 }
 
@@ -409,7 +403,6 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             }
         }
         bool closing = _closed.load();
-        ++_generation;
         for (auto& msg : batch) {
             _handle_message(msg, syncs);
         }
@@ -467,17 +460,6 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         DCHECK_GE(msg.state->workers_attached, 0);
         break;
     }
-    case SchedulerMessage::Type::QUERY_IDLE: {
-        QueryState* qs = _resolve(msg.query_id);
-        if (qs != nullptr && !qs->terminated && qs->idle_candidate_gen == 0) {
-            qs->idle_candidate_gen = _generation;
-            if (!qs->in_destroy_candidates) {
-                qs->in_destroy_candidates = true;
-                _destroy_candidates.push_back(qs);
-            }
-        }
-        break;
-    }
     case SchedulerMessage::Type::LEVEL_DEMOTED: {
         QueryState* qs = _resolve(msg.query_id);
         if (qs != nullptr && qs->linked && !qs->terminated) {
@@ -492,7 +474,6 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
     case SchedulerMessage::Type::NEW_QUERY: {
         QueryState* qs = _resolve(msg.query_id);
         if (qs != nullptr && !qs->terminated) {
-            qs->idle_candidate_gen = 0; // revive: drop sentinel idle candidacy
             if (!qs->linked) {
                 _link(qs, qs->level.load(std::memory_order_relaxed));
             }
@@ -506,7 +487,6 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         }
         qs->terminated = true;
         qs->rr_grant = 0;
-        qs->idle_candidate_gen = 0;
         _unlink(qs);
         if (!qs->in_destroy_candidates) {
             qs->in_destroy_candidates = true;
@@ -552,18 +532,6 @@ void MultiCoreTaskQueue::_try_teardown() {
     auto it = _destroy_candidates.begin();
     while (it != _destroy_candidates.end()) {
         QueryState* qs = *it;
-        if (!qs->terminated) {
-            // Sentinel idle path: one-generation grace + emptiness, same as before.
-            if (qs->idle_candidate_gen == 0) {
-                qs->in_destroy_candidates = false;
-                it = _destroy_candidates.erase(it);
-                continue;
-            }
-            if (qs->idle_candidate_gen >= _generation) {
-                ++it;
-                continue;
-            }
-        }
         if (qs->workers_attached > 0) {
             ++it;
             continue;
@@ -571,8 +539,7 @@ void MultiCoreTaskQueue::_try_teardown() {
         bool erased = false;
         {
             std::unique_lock<std::shared_mutex> wlock(_registry_mutex);
-            if (qs->in_flight.load() == 0 && qs->pending_approx.load() == 0 &&
-                (qs->terminated || qs->idle.load())) {
+            if (qs->terminated && qs->in_flight.load() == 0 && qs->pending_approx.load() == 0) {
                 _unlink(qs);
                 _registry.erase(qs->query_id);
                 erased = true;
@@ -580,15 +547,9 @@ void MultiCoreTaskQueue::_try_teardown() {
         }
         if (erased) {
             it = _destroy_candidates.erase(it);
-            continue;
+        } else {
+            ++it;
         }
-        if (!qs->terminated) {
-            qs->idle_candidate_gen = 0;
-            qs->in_destroy_candidates = false;
-            it = _destroy_candidates.erase(it);
-            continue;
-        }
-        ++it;
     }
 }
 

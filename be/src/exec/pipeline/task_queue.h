@@ -67,15 +67,13 @@ namespace doris {
 //     into a dedicated shared queue that every worker drains before anything else,
 //     ahead of its assignment and of the MLFQ entirely.
 //   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
-//     idle queries, level demotions, new queries, query termination); the scheduler
-//     sleeps on a condition variable with a timer tick and reacts to events instead of
-//     polling state.
-//   - Teardown for a real query happens only after QueryContext destruction posts
-//     QUERY_TERMINATED and every assigned worker has acked detaching
-//     (workers_attached == 0). Temporary emptiness while the query is still alive does
-//     not reclaim the node (blocked-task wakeups, late fragments). Tasks with no
-//     QueryContext (RevokableTask) share a sentinel id and are still reclaimed via
-//     idle + a one-generation grace period so that bucket cannot leak.
+//     level demotions, new queries, query termination); the scheduler sleeps on a
+//     condition variable with a timer tick and reacts to events instead of polling
+//     state.
+//   - Teardown happens only after QueryContext destruction posts QUERY_TERMINATED and
+//     every assigned worker has acked detaching (workers_attached == 0). Temporary
+//     emptiness while the query is still alive does not reclaim the node. Tasks with
+//     no QueryContext (RevokableTask) share a sentinel id and live until queue close.
 //
 // Degenerate mode (used by the "blocking" pool, whose workers sit inside blocking
 // execute() calls and cannot honor the "re-check the slot every slice" invariant):
@@ -169,12 +167,9 @@ private:
         bool linked = false;      // linked into an MLFQ level list
         int linked_level = 0;
         std::list<QueryState*>::iterator pos {};
-        // True after QUERY_TERMINATED. Real queries are erased only when this is set
-        // and workers_attached == 0.
+        // True after QUERY_TERMINATED. Erased only when this is set and
+        // workers_attached == 0.
         bool terminated = false;
-        // Scheduler generation when idle candidacy was established (sentinel bucket
-        // only); 0 = no candidacy.
-        uint64_t idle_candidate_gen = 0;
         // Membership flag for _destroy_candidates (dedup).
         bool in_destroy_candidates = false;
         // Rebalance scratch (valid only within one rebalance pass).
@@ -199,11 +194,9 @@ private:
         std::atomic<int> in_flight {0};
         // Approximate sub-queue length; invariant: >= real length.
         std::atomic<int> pending_approx {0};
-        // "Nothing here right now": armed (exchange) by the releaser that drove
-        // in_flight to zero while pending_approx was zero; disarmed by producers on
-        // enqueue (revive) and by the scheduler when a teardown verification fails.
-        // May be transiently true while a task is in flight (benign: verification
-        // re-checks the counters; a spurious worker self-detach is safe).
+        // "Nothing here right now": armed by the releaser that drove in_flight to
+        // zero while pending_approx was zero; disarmed by producers on enqueue.
+        // Assigned workers self-detach when they observe this. Not a reclaim trigger.
         std::atomic<bool> idle {false};
     };
 
@@ -259,7 +252,6 @@ private:
             ACK,              // worker observed slot write `seq`; `state` = what it was
                               // attached to before (null if it had self-detached)
             DETACHED,         // worker self-detached from `state` (observed it idle)
-            QUERY_IDLE,       // sentinel-only: release observed empty counters
             LEVEL_DEMOTED,    // CAS winner reports query_id crossed a level threshold
             NEW_QUERY,        // enqueue path created or revived query_id
             QUERY_TERMINATED, // QueryContext destructor: reclaim once detached
@@ -267,7 +259,7 @@ private:
         };
         Type type;
         QueryState* state = nullptr; // ACK / DETACHED only
-        TUniqueId query_id;          // QUERY_IDLE / LEVEL_DEMOTED / NEW_QUERY / TERMINATED
+        TUniqueId query_id;          // LEVEL_DEMOTED / NEW_QUERY / TERMINATED
         int worker_id = -1;
         uint64_t seq = 0;
         std::shared_ptr<std::promise<void>> sync;
@@ -330,9 +322,8 @@ private:
     // MLFQ level lists (scheduler-thread-only). Lists are rotated by one on every
     // rebalance so the round-robin dealing start is not positionally biased.
     std::array<std::list<QueryState*>, SUB_QUEUE_LEVEL> _levels;
-    // Queries pending destroy (terminated real queries, or idle sentinel).
+    // Queries pending destroy after QUERY_TERMINATED (scheduler-thread-only).
     std::vector<QueryState*> _destroy_candidates;
-    uint64_t _generation = 1; // current scheduler pass number
 
     // Inbox.
     std::mutex _inbox_mutex;

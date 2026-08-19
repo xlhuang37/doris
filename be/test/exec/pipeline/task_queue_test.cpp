@@ -462,9 +462,9 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
     q.close();
 }
 
-// Tasks with no QueryContext share the sentinel bucket and are still reclaimed
-// by idle + one-generation grace (no QUERY_TERMINATED will ever arrive).
-TEST(PushBasedTaskQueueTest, SentinelIdleTeardown) {
+// Tasks with no QueryContext share one sentinel bucket. Idle does not reclaim it
+// (no QUERY_TERMINATED will ever arrive); the state lives until queue close.
+TEST(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
     TestTaskQueue q(1);
     ASSERT_TRUE(q.push_back(make_task(nullptr, 0)).ok());
     q.wait_scheduler_settled_for_test();
@@ -476,7 +476,7 @@ TEST(PushBasedTaskQueueTest, SentinelIdleTeardown) {
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
     q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 0);
+    EXPECT_EQ(q.registry_size_for_test(), 1);
 
     q.close();
 }
