@@ -108,6 +108,12 @@ public:
     // a small query share one low "attained service" value and win priority together.
     std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
 
+    // Tasks of this query that currently want a core, across all fragments and
+    // instances: submitted and not yet finished, minus those parked on a dependency.
+    // Drives the pipeline scheduler's per-query core demand, which queue depth alone
+    // understates once a query's runnable tasks are spread over the workers.
+    std::atomic<int>* active_task_counter() { return &_active_task_num; }
+
     bool is_timeout(timespec now) const {
         if (_timeout_second <= 0) {
             return false;
@@ -332,6 +338,8 @@ private:
 
     // Query-global runtime counter; see query_runtime_counter().
     std::atomic<uint64_t> _query_runtime_ns {0};
+    // Query-global runnable task count; see active_task_counter().
+    std::atomic<int> _active_task_num {0};
     bool _is_nereids = false;
 
     std::shared_ptr<ResourceContext> _resource_ctx;
