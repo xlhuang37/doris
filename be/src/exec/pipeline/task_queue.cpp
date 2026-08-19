@@ -393,6 +393,7 @@ void MultiCoreTaskQueue::_scheduler_loop() {
     while (true) {
         batch.clear();
         {
+            // a bitmap design can potentially kill this mutex.
             std::unique_lock<std::mutex> lk(_inbox_mutex);
             if (_inbox.empty() && !_closed.load()) {
                 _inbox_cv.wait_for(lk, std::chrono::milliseconds(SCHEDULER_TICK_MS));
@@ -408,6 +409,7 @@ void MultiCoreTaskQueue::_scheduler_loop() {
         }
         if (!closing) {
             _try_teardown();
+            // rebalance should only trigger upon level update or query termination.
             _rebalance_and_dispatch();
         }
         for (auto& promise : syncs) {
