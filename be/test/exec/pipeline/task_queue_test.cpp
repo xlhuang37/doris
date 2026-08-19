@@ -20,9 +20,9 @@
 #include <gen_cpp/Types_types.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
-#include <set>
 
 #include "common/config.h"
 #include "exec/pipeline/pipeline_task.h"
@@ -54,13 +54,18 @@ public:
         return id;
     }
     bool is_inelastic() const override { return _inelastic; }
+    // Defaults to 0, which leaves demand at sub-queue depth for tests that do not care
+    // about the active-task signal (demand is the max of the two).
+    int active_task_num() const override { return _active_task_num; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
+    void set_active_task_num(int num) { _active_task_num = num; }
 
 private:
     QueryContext* _key;
     uint64_t _runtime_ns;
     bool _inelastic;
+    int _active_task_num = 0;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -85,6 +90,13 @@ PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
 }
 PipelineTaskSPtr make_inelastic_task(QueryContext* key, uint64_t runtime_ns) {
     return std::make_shared<MockPipelineTask>(key, runtime_ns, /*inelastic=*/true);
+}
+// A task reporting `active` live tasks for its query, i.e. a query whose demand exceeds
+// what is sitting in its sub-queue.
+PipelineTaskSPtr make_task_with_active(QueryContext* key, uint64_t runtime_ns, int active) {
+    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
+    task->set_active_task_num(active);
+    return task;
 }
 } // namespace
 
@@ -113,9 +125,10 @@ TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
     q.close();
 }
 
-// Within one level, the chunked fair-share dealing spreads distinct workers across
-// co-resident queries rather than dogpiling one query.
-TEST(PushBasedTaskQueueTest, WithinLevelFairSpread) {
+// Within one level, cores are dealt greedily in arrival order: the oldest query takes
+// everything it can use before the next one is considered, so with three two-task
+// queries and three workers the split is 2/1/0 in push order.
+TEST(PushBasedTaskQueueTest, WithinLevelGreedyFcfs) {
     TestTaskQueue q(3);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -128,14 +141,101 @@ TEST(PushBasedTaskQueueTest, WithinLevelFairSpread) {
     }
     q.wait_scheduler_settled_for_test();
 
-    // Three different workers each take once: they land on three different queries.
-    std::set<QueryContext*> served;
-    for (int worker = 0; worker < 3; ++worker) {
-        auto t = q.take(worker);
-        ASSERT_NE(t, nullptr) << "worker " << worker;
-        served.insert(t->query_ctx_raw());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.close();
+}
+
+// Demand is the query's active task count, not its sub-queue depth: a query with a
+// single queued task but three live tasks (the rest blocked on dependencies elsewhere)
+// is granted three cores, and the trailing query is left to the fallback.
+TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
+    TestTaskQueue q(4);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/3)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    // Sub-queue depth alone would have granted A a single core.
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+
+    q.close();
+}
+
+// Arrival order decides who gets the cores: the same three queries pushed in the
+// opposite order produce the mirrored allocation.
+TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
+    auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
+        TestTaskQueue q(3);
+        for (uintptr_t id : push_order) {
+            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
+            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
+        }
+        q.wait_scheduler_settled_for_test();
+        std::array<int, 3> assigned {};
+        for (size_t i = 0; i < push_order.size(); ++i) {
+            assigned[i] = q.assigned_workers_for_test(qid(push_order[i]));
+        }
+        q.close();
+        return assigned;
+    };
+
+    // Indexed by push position, not by query id: the first pushed always wins.
+    EXPECT_EQ(allocation({0xA, 0xB, 0xC}), (std::array<int, 3> {2, 1, 0}));
+    EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {2, 1, 0}));
+}
+
+// Levels are strictly ordered: L0 is satisfied to its full demand first, and only the
+// leftover cores spill into L1, again in arrival order there.
+TEST(PushBasedTaskQueueTest, AllocationSpillsIntoNextLevel) {
+    TestTaskQueue q(3);
+    auto* qa = qkey(0xA); // runtime 0 -> L0
+    auto* qb = qkey(0xB); // runtime 5s -> L1, first of the two L1 queries
+    auto* qc = qkey(0xC); // runtime 5s -> L1
+
+    // Pushed lowest priority first to show level order beats arrival order.
+    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qc, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.close();
+}
+
+// Once settled, repeated scheduler passes with no state change leave the allocation
+// exactly where it was.
+TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
+    TestTaskQueue q(2);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     }
-    EXPECT_EQ(served.size(), 3);
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    const int a_assigned = q.assigned_workers_for_test(qid(0xA));
+    const int b_assigned = q.assigned_workers_for_test(qid(0xB));
+    EXPECT_EQ(a_assigned, 2);
+    EXPECT_EQ(b_assigned, 0);
+
+    for (int i = 0; i < 3; ++i) {
+        q.wait_scheduler_settled_for_test();
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), a_assigned) << "pass " << i;
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), b_assigned) << "pass " << i;
+    }
 
     q.close();
 }
