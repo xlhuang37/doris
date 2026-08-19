@@ -165,6 +165,8 @@ PipelineTaskSPtr MultiCoreTaskQueue::take(int core_id) {
 }
 
 PipelineTaskSPtr MultiCoreTaskQueue::_take(int worker_id, uint32_t timeout_ms) {
+    // Genuinely, this park semaphore thing is quite dumb. It should be 
+    // replaced with a semaphore design similar to DuckDB. 
     PipelineTaskSPtr task = _try_take_once(worker_id);
     if (!task && !_closed.load() && timeout_ms > 0) {
         // Park until a producer or the scheduler signals, bounded by `timeout_ms`.
