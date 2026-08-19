@@ -148,6 +148,15 @@ public:
                        ? _query_runtime_ptr->load(std::memory_order_relaxed)
                        : 0;
     }
+    // Tasks of the owning query that currently want a core, across all of its fragments
+    // and instances: submitted and not yet finished, minus those parked on a dependency.
+    // The pipeline scheduler uses it to size how many cores the query can actually use,
+    // which sub-queue depth understates for a query whose runnable tasks are spread over
+    // the workers. Zero for tasks with no QueryContext (e.g. RevokableTask).
+    MOCK_FUNCTION int active_task_num() const {
+        return _active_tasks_ptr != nullptr ? _active_tasks_ptr->load(std::memory_order_relaxed)
+                                            : 0;
+    }
     // Opaque key identifying the owning query, used by the global query-granular MLFQ
     // to bucket this task. The query context outlives its tasks; the pointer is only
     // ever compared/used as a map key, never dereferenced by the queue.
@@ -244,6 +253,11 @@ private:
     // `_fragment_context` (a weak_ptr) on the hot push/dequeue path.
     std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
 
+    // Cached pointer to the owning query's active task count (same lifetime argument
+    // as `_query_runtime_ptr`). This task holds a slot in it for as long as its state
+    // counts as active; see _counts_as_active().
+    std::atomic<int>* _active_tasks_ptr = nullptr;
+
     // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
     // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
     QueryContext* _query_ctx_raw = nullptr;
@@ -336,6 +350,14 @@ private:
         default:
             __builtin_unreachable();
         }
+    }
+
+    // Whether a task in `state` is asking for a core: it has been submitted and is not
+    // waiting on a dependency, so it either occupies a worker or wants one. The
+    // query-global active task count tracks exactly these tasks, and _state_transition()
+    // adjusts it on every crossing of this boundary.
+    static bool _counts_as_active(State state) {
+        return state == State::INITED || state == State::RUNNABLE;
     }
 
     Status _state_transition(State new_state);
