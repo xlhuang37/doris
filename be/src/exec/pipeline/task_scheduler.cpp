@@ -73,6 +73,10 @@ Status TaskScheduler::submit(PipelineTaskSPtr task) {
     return _task_queue.push_back(task);
 }
 
+void TaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _task_queue.notify_query_terminated(query_id);
+}
+
 // after close_task, task maybe destructed.
 void close_task(PipelineTask* task, Status exec_status, PipelineFragmentContext* ctx) {
     // Has to attach memory tracker here, because the close task will also release some memory.
@@ -209,6 +213,11 @@ Status HybridTaskScheduler::start() {
 void HybridTaskScheduler::stop() {
     _blocking_scheduler.stop();
     _simple_scheduler.stop();
+}
+
+void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _blocking_scheduler.notify_query_terminated(query_id);
+    _simple_scheduler.notify_query_terminated(query_id);
 }
 
 } // namespace doris

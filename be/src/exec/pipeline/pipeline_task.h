@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <gen_cpp/Types_types.h>
+
 #include "common/status.h"
 #include "core/block/block.h"
 #include "exec/operator/operator.h"
@@ -150,6 +152,10 @@ public:
     // to bucket this task. The query context outlives its tasks; the pointer is only
     // ever compared/used as a map key, never dereferenced by the queue.
     MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
+
+    // Registry key for the query-granular task queue. Default (all-zero) is the
+    // sentinel bucket for tasks with no QueryContext (e.g. RevokableTask).
+    MOCK_FUNCTION TUniqueId query_id() const { return _query_id; }
 
     // A task is inelastic when its pipeline has exactly one task: it can only run
     // sequentially, so extra workers cannot speed it up but any queueing delay

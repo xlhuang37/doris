@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <gen_cpp/Types_types.h>
+
 #include "exec/pipeline/task_queue.h"
 #include "exec/pipeline/task_scheduler.h"
 
@@ -36,6 +38,10 @@ public:
     Status start() override { return Status::OK(); }
 
     void stop() override {}
+
+    void notify_query_terminated(const TUniqueId& query_id) override {
+        _task_queue->notify_query_terminated(query_id);
+    }
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
         return {};

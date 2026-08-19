@@ -20,6 +20,7 @@
 // IWYU pragma: no_include <bits/chrono.h>
 #include <algorithm>
 #include <chrono> // IWYU pragma: keep
+#include <gen_cpp/Types_types.h>
 #include <iterator>
 #include <memory>
 #include <utility>
@@ -85,7 +86,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         return Status::OK();
     }
 
-    QueryContext* key = task->query_ctx_raw();
+    const TUniqueId query_id = task->query_id();
     // "Inelastic first": single-task pipelines bypass the per-query sub-queue and go
     // into the dedicated top-priority queue. All per-query bookkeeping is identical,
     // so idle detection and teardown are oblivious to which queue the task sits in.
@@ -112,7 +113,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         if (_closed.load()) {
             return Status::InternalError("WorkTaskQueue closed");
         }
-        auto it = _registry.find(key);
+        auto it = _registry.find(query_id);
         if (it != _registry.end()) {
             QueryState* qs = it->second.get();
             std::lock_guard<std::mutex> elock(qs->enqueue_mutex);
@@ -129,9 +130,9 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         if (_closed.load()) {
             return Status::InternalError("WorkTaskQueue closed");
         }
-        auto& slot = _registry[key];
+        auto& slot = _registry[query_id];
         if (slot == nullptr) {
-            slot = std::make_unique<QueryState>(_queue, key,
+            slot = std::make_unique<QueryState>(_queue, query_id,
                                                 _compute_level(task->query_runtime_ns()));
             created = true;
         }
@@ -148,7 +149,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     if (created || revived) {
         SchedulerMessage msg;
         msg.type = SchedulerMessage::Type::NEW_QUERY;
-        msg.key = key;
+        msg.query_id = query_id;
         _post_message(std::move(msg));
     }
     _notify_workers(false);
@@ -233,7 +234,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
         if (_inelastic_queue.try_dequeue(task)) {
             {
                 std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
-                auto it = _registry.find(task->query_ctx_raw());
+                auto it = _registry.find(task->query_id());
                 if (it != _registry.end()) {
                     // in_flight up BEFORE pending down: a live task is always visible
                     // in at least one of the two counters (see header contract).
@@ -278,7 +279,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
     }
     if (_mode == Mode::FULL) {
         std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
-        auto it = _registry.find(task->query_ctx_raw());
+        auto it = _registry.find(task->query_id());
         if (it != _registry.end()) {
             it->second->in_flight.fetch_add(1);
             it->second->pending_approx.fetch_sub(1);
@@ -314,9 +315,9 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     if (_mode != Mode::FULL) {
         return;
     }
-    QueryContext* key = task->query_ctx_raw();
+    const TUniqueId query_id = task->query_id();
     std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
-    auto it = _registry.find(key);
+    auto it = _registry.find(query_id);
     if (it == _registry.end()) {
         return;
     }
@@ -330,18 +331,18 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
         if (want > cur && qs->level.compare_exchange_strong(cur, want)) {
             SchedulerMessage msg;
             msg.type = SchedulerMessage::Type::LEVEL_DEMOTED;
-            msg.key = key;
+            msg.query_id = query_id;
             _post_message(std::move(msg));
         }
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
     if (remaining == 0 && qs->pending_approx.load() == 0) {
-        // "Nothing here right now". Arm the idle flag; producers disarm it on the
-        // next enqueue. Only the arming release posts the message.
-        if (!qs->idle.exchange(true)) {
+        // Arm idle so assigned workers self-detach. QUERY_IDLE is only for the
+        // sentinel bucket (no QueryContext destructor will terminate it).
+        if (!qs->idle.exchange(true) && _is_sentinel(query_id)) {
             SchedulerMessage msg;
             msg.type = SchedulerMessage::Type::QUERY_IDLE;
-            msg.key = key;
+            msg.query_id = query_id;
             _post_message(std::move(msg));
         }
     }
@@ -360,6 +361,16 @@ void MultiCoreTaskQueue::_post_message(SchedulerMessage msg) {
         _inbox.push_back(std::move(msg));
     }
     _inbox_cv.notify_one();
+}
+
+void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id) {
+    if (_mode != Mode::FULL || _is_sentinel(query_id)) {
+        return;
+    }
+    SchedulerMessage msg;
+    msg.type = SchedulerMessage::Type::QUERY_TERMINATED;
+    msg.query_id = query_id;
+    _post_message(std::move(msg));
 }
 
 void MultiCoreTaskQueue::_notify_workers(bool all) {
@@ -416,11 +427,11 @@ void MultiCoreTaskQueue::_scheduler_loop() {
     }
 }
 
-MultiCoreTaskQueue::QueryState* MultiCoreTaskQueue::_resolve(QueryContext* key) {
+MultiCoreTaskQueue::QueryState* MultiCoreTaskQueue::_resolve(const TUniqueId& query_id) {
     // Only the scheduler thread erases registry entries, so a pointer resolved here
     // stays valid for the rest of this scheduler pass.
     std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
-    auto it = _registry.find(key);
+    auto it = _registry.find(query_id);
     return it == _registry.end() ? nullptr : it->second.get();
 }
 
@@ -457,19 +468,19 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         break;
     }
     case SchedulerMessage::Type::QUERY_IDLE: {
-        QueryState* qs = _resolve(msg.key);
-        if (qs != nullptr && qs->idle_candidate_gen == 0) {
+        QueryState* qs = _resolve(msg.query_id);
+        if (qs != nullptr && !qs->terminated && qs->idle_candidate_gen == 0) {
             qs->idle_candidate_gen = _generation;
-            if (!qs->in_idle_candidates) {
-                qs->in_idle_candidates = true;
-                _idle_candidates.push_back(qs);
+            if (!qs->in_destroy_candidates) {
+                qs->in_destroy_candidates = true;
+                _destroy_candidates.push_back(qs);
             }
         }
         break;
     }
     case SchedulerMessage::Type::LEVEL_DEMOTED: {
-        QueryState* qs = _resolve(msg.key);
-        if (qs != nullptr && qs->linked) {
+        QueryState* qs = _resolve(msg.query_id);
+        if (qs != nullptr && qs->linked && !qs->terminated) {
             int level = qs->level.load(std::memory_order_relaxed);
             if (level != qs->linked_level) {
                 _unlink(qs);
@@ -479,12 +490,38 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         break;
     }
     case SchedulerMessage::Type::NEW_QUERY: {
-        QueryState* qs = _resolve(msg.key);
-        if (qs != nullptr) {
-            qs->idle_candidate_gen = 0; // revive: drop any teardown candidacy
+        QueryState* qs = _resolve(msg.query_id);
+        if (qs != nullptr && !qs->terminated) {
+            qs->idle_candidate_gen = 0; // revive: drop sentinel idle candidacy
             if (!qs->linked) {
                 _link(qs, qs->level.load(std::memory_order_relaxed));
             }
+        }
+        break;
+    }
+    case SchedulerMessage::Type::QUERY_TERMINATED: {
+        QueryState* qs = _resolve(msg.query_id);
+        if (qs == nullptr) {
+            break;
+        }
+        qs->terminated = true;
+        qs->rr_grant = 0;
+        qs->idle_candidate_gen = 0;
+        _unlink(qs);
+        if (!qs->in_destroy_candidates) {
+            qs->in_destroy_candidates = true;
+            _destroy_candidates.push_back(qs);
+        }
+        bool wrote = false;
+        for (int i = 0; i < static_cast<int>(_worker_sched.size()); ++i) {
+            WorkerSched& ws = _worker_sched[i];
+            if (ws.acked && ws.target == qs) {
+                _write_assignment(i, nullptr);
+                wrote = true;
+            }
+        }
+        if (wrote) {
+            _notify_workers(true);
         }
         break;
     }
@@ -512,51 +549,46 @@ void MultiCoreTaskQueue::_unlink(QueryState* node) {
 }
 
 void MultiCoreTaskQueue::_try_teardown() {
-    auto it = _idle_candidates.begin();
-    while (it != _idle_candidates.end()) {
+    auto it = _destroy_candidates.begin();
+    while (it != _destroy_candidates.end()) {
         QueryState* qs = *it;
-        if (qs->idle_candidate_gen == 0) {
-            // Revived since candidacy was recorded.
-            qs->in_idle_candidates = false;
-            it = _idle_candidates.erase(it);
-            continue;
-        }
-        if (qs->idle_candidate_gen >= _generation) {
-            // Grace period: only candidates from a previous pass are eligible, which
-            // also guarantees every inbox message posted before candidacy (and any
-            // revive posted since) has been drained.
-            ++it;
-            continue;
+        if (!qs->terminated) {
+            // Sentinel idle path: one-generation grace + emptiness, same as before.
+            if (qs->idle_candidate_gen == 0) {
+                qs->in_destroy_candidates = false;
+                it = _destroy_candidates.erase(it);
+                continue;
+            }
+            if (qs->idle_candidate_gen >= _generation) {
+                ++it;
+                continue;
+            }
         }
         if (qs->workers_attached > 0) {
-            // Assigned workers will self-detach on their next take (they observe the
-            // idle flag) or be moved by the rebalance; either way the detach flows
-            // through the inbox. Wait for it.
             ++it;
             continue;
         }
         bool erased = false;
         {
-            // The exclusive lock excludes producers (which hold the shared lock for
-            // the whole enqueue) and pending fallback/release counter updates, so
-            // re-verifying the idle condition here makes the erase safe: nothing
-            // references the state and nothing can start referencing it before the
-            // lock is dropped (a later producer misses in the registry and simply
-            // re-creates the query).
             std::unique_lock<std::shared_mutex> wlock(_registry_mutex);
-            if (qs->idle.load() && qs->in_flight.load() == 0 && qs->pending_approx.load() == 0) {
+            if (qs->in_flight.load() == 0 && qs->pending_approx.load() == 0 &&
+                (qs->terminated || qs->idle.load())) {
                 _unlink(qs);
-                _registry.erase(qs->query); // destroys the QueryState and its token
+                _registry.erase(qs->query_id);
                 erased = true;
             }
         }
-        if (!erased) {
-            // A task slipped in; a NEW_QUERY revive is on its way (or was already
-            // processed). Drop the candidacy; a future QUERY_IDLE re-establishes it.
-            qs->idle_candidate_gen = 0;
-            qs->in_idle_candidates = false;
+        if (erased) {
+            it = _destroy_candidates.erase(it);
+            continue;
         }
-        it = _idle_candidates.erase(it);
+        if (!qs->terminated) {
+            qs->idle_candidate_gen = 0;
+            qs->in_destroy_candidates = false;
+            it = _destroy_candidates.erase(it);
+            continue;
+        }
+        ++it;
     }
 }
 
@@ -634,7 +666,8 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // so a steady state generates no control traffic at all.
     for (auto& ws : _worker_sched) {
         ws.rr_kept = false;
-        if (ws.acked && !ws.self_detached && ws.target != nullptr && ws.target->rr_grant > 0) {
+        if (ws.acked && !ws.self_detached && ws.target != nullptr && !ws.target->terminated &&
+            ws.target->rr_grant > 0) {
             ws.target->rr_grant--;
             ws.rr_kept = true;
         }

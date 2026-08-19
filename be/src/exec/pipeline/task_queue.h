@@ -34,11 +34,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include <gen_cpp/Types_types.h>
+
 #include "common/status.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "util/hash_util.hpp"
 
 namespace doris {
-class QueryContext;
 #include "common/compile_check_begin.h"
 
 // A push-based, query-granular task queue shared by all workers of one pipeline
@@ -65,17 +67,15 @@ class QueryContext;
 //     into a dedicated shared queue that every worker drains before anything else,
 //     ahead of its assignment and of the MLFQ entirely.
 //   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
-//     idle queries, level demotions, new queries); the scheduler sleeps on a condition
-//     variable with a timer tick and reacts to events instead of polling state.
-//   - Teardown is two-phase with a grace period: a query whose sub-queue is empty and
-//     which has no in-flight tasks is reported idle by workers; the scheduler deletes
-//     the per-query state only after every assigned worker has acked detaching and the
-//     query stayed idle across a full scheduler generation. Deletion happens under the
-//     exclusive registry lock with the idle condition re-verified, so producers (which
-//     hold the shared registry lock for the whole enqueue) can never observe a
-//     half-dead state; a query whose tasks come back later (blocked-task wakeups, late
-//     fragments, tasks migrating back from the blocking pool) is simply re-created on
-//     registry miss.
+//     idle queries, level demotions, new queries, query termination); the scheduler
+//     sleeps on a condition variable with a timer tick and reacts to events instead of
+//     polling state.
+//   - Teardown for a real query happens only after QueryContext destruction posts
+//     QUERY_TERMINATED and every assigned worker has acked detaching
+//     (workers_attached == 0). Temporary emptiness while the query is still alive does
+//     not reclaim the node (blocked-task wakeups, late fragments). Tasks with no
+//     QueryContext (RevokableTask) share a sentinel id and are still reclaimed via
+//     idle + a one-generation grace period so that bucket cannot leak.
 //
 // Degenerate mode (used by the "blocking" pool, whose workers sit inside blocking
 // execute() calls and cannot honor the "re-check the slot every slice" invariant):
@@ -119,6 +119,10 @@ public:
     // re-queued without being executed.
     void release_task(PipelineTask* task);
 
+    // QueryContext is being destroyed. Posts QUERY_TERMINATED; the scheduler reclaims
+    // the QueryState once workers_attached == 0. No-op in degenerate mode.
+    void notify_query_terminated(const TUniqueId& query_id);
+
     int cores() const { return _core_size; }
 
     // Test hook: block until the scheduler thread has fully processed every inbox
@@ -140,17 +144,17 @@ private:
     // ------------------------------------------------------------------
     // Per-query state (full mode only). Created lazily by the enqueue path; destroyed
     // exclusively by the scheduler thread, under the exclusive registry lock, once the
-    // query is idle in this pool and every assigned worker has acked detaching.
+    // query has been terminated and every assigned worker has acked detaching.
     // ------------------------------------------------------------------
     struct QueryState {
         QueryState(moodycamel::ConcurrentQueue<PipelineTaskSPtr>& shared_queue,
-                   QueryContext* key, int initial_level)
-                : query(key), token(shared_queue), level(initial_level) {}
+                   TUniqueId id, int initial_level)
+                : query_id(id), token(shared_queue), level(initial_level) {}
 
         // ---- Cold part: written rarely ----
-        // Opaque bucket key; compared, never dereferenced (may be null for tasks not
-        // tied to a query, e.g. RevokableTask; those bucket together).
-        QueryContext* const query;
+        // Registry key (query_id()). The all-zero sentinel buckets tasks with no
+        // QueryContext (e.g. RevokableTask).
+        const TUniqueId query_id;
         // This query's sub-queue in the shared queue. Enqueue through it is guarded by
         // `enqueue_mutex` (explicit producers are single-producer); dequeue via
         // try_dequeue_from_producer is lock-free and multi-consumer safe.
@@ -165,11 +169,14 @@ private:
         bool linked = false;      // linked into an MLFQ level list
         int linked_level = 0;
         std::list<QueryState*>::iterator pos {};
-        // Scheduler generation when idle candidacy was established; 0 = no candidacy.
+        // True after QUERY_TERMINATED. Real queries are erased only when this is set
+        // and workers_attached == 0.
+        bool terminated = false;
+        // Scheduler generation when idle candidacy was established (sentinel bucket
+        // only); 0 = no candidacy.
         uint64_t idle_candidate_gen = 0;
-        // Membership flag for the _idle_candidates vector (dedup; an entry may sit in
-        // the vector with candidacy disarmed until the teardown scan removes it).
-        bool in_idle_candidates = false;
+        // Membership flag for _destroy_candidates (dedup).
+        bool in_destroy_candidates = false;
         // Rebalance scratch (valid only within one rebalance pass).
         int rr_grant = 0;
         int rr_demand = 0;
@@ -243,23 +250,24 @@ private:
     // ------------------------------------------------------------------
     // Scheduler inbox. ACK/DETACHED may carry a QueryState pointer because the
     // worker's attachment keeps `workers_attached` nonzero until the message is
-    // processed, which blocks teardown. All other query references travel as the
-    // opaque QueryContext key and are re-resolved through the registry at processing
-    // time, so a message can never dangle across a teardown.
+    // processed, which blocks teardown. All other query references travel as
+    // TUniqueId and are re-resolved through the registry at processing time, so a
+    // message can never dangle across QueryContext destruction.
     // ------------------------------------------------------------------
     struct SchedulerMessage {
         enum class Type {
-            ACK,           // worker observed slot write `seq`; `state` = what it was
-                           // attached to before (null if it had self-detached)
-            DETACHED,      // worker self-detached from `state` (observed it idle)
-            QUERY_IDLE,    // a release observed in_flight == 0 && pending_approx == 0
-            LEVEL_DEMOTED, // CAS winner reports `key` crossed a level threshold
-            NEW_QUERY,     // enqueue path created or revived `key`
-            SYNC,          // test hook: fulfilled at the end of the draining pass
+            ACK,              // worker observed slot write `seq`; `state` = what it was
+                              // attached to before (null if it had self-detached)
+            DETACHED,         // worker self-detached from `state` (observed it idle)
+            QUERY_IDLE,       // sentinel-only: release observed empty counters
+            LEVEL_DEMOTED,    // CAS winner reports query_id crossed a level threshold
+            NEW_QUERY,        // enqueue path created or revived query_id
+            QUERY_TERMINATED, // QueryContext destructor: reclaim once detached
+            SYNC,             // test hook: fulfilled at the end of the draining pass
         };
         Type type;
         QueryState* state = nullptr; // ACK / DETACHED only
-        QueryContext* key = nullptr; // QUERY_IDLE / LEVEL_DEMOTED / NEW_QUERY only
+        TUniqueId query_id;          // QUERY_IDLE / LEVEL_DEMOTED / NEW_QUERY / TERMINATED
         int worker_id = -1;
         uint64_t seq = 0;
         std::shared_ptr<std::promise<void>> sync;
@@ -277,7 +285,10 @@ private:
     void _scheduler_loop();
     void _handle_message(SchedulerMessage& msg,
                          std::vector<std::shared_ptr<std::promise<void>>>& syncs);
-    QueryState* _resolve(QueryContext* key);
+    QueryState* _resolve(const TUniqueId& query_id);
+    static bool _is_sentinel(const TUniqueId& query_id) {
+        return query_id.hi == 0 && query_id.lo == 0;
+    }
     void _link(QueryState* node, int level);
     void _unlink(QueryState* node);
     void _try_teardown();
@@ -309,7 +320,7 @@ private:
     // looked-up pointer is therefore valid for as long as the shared lock is held, or
     // for as long as the holder is visible in `in_flight`/`workers_attached`.
     mutable std::shared_mutex _registry_mutex;
-    std::unordered_map<QueryContext*, std::unique_ptr<QueryState>> _registry;
+    std::unordered_map<TUniqueId, std::unique_ptr<QueryState>> _registry;
 
     // Worker control blocks (full mode), indexed by core_id.
     std::vector<WorkerSlot> _worker_slots;
@@ -319,8 +330,8 @@ private:
     // MLFQ level lists (scheduler-thread-only). Lists are rotated by one on every
     // rebalance so the round-robin dealing start is not positionally biased.
     std::array<std::list<QueryState*>, SUB_QUEUE_LEVEL> _levels;
-    // Queries with idle candidacy (scheduler-thread-only).
-    std::vector<QueryState*> _idle_candidates;
+    // Queries pending destroy (terminated real queries, or idle sentinel).
+    std::vector<QueryState*> _destroy_candidates;
     uint64_t _generation = 1; // current scheduler pass number
 
     // Inbox.
