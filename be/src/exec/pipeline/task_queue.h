@@ -56,6 +56,14 @@ namespace doris {
 //     between levels, driven by the query-global CPU runtime counter) and push-assigns
 //     workers to queries by writing per-worker, cache-aligned assignment slots. Only
 //     the scheduler writes a slot; only the owning worker reads it.
+//   - Core allocation is greedy first-come-first-served: queries are visited in strict
+//     level order and, within a level, in arrival order, and each one takes as many of
+//     the pool's workers as it can use before the next is considered. A query's demand
+//     is its active task count (tasks created and not yet finalized, so blocked tasks
+//     count too), which is what lets a query that is momentarily empty but about to
+//     unblock keep its cores. Queries reached after the workers run out hold no
+//     assigned worker and are served only by the fallback; the MLFQ demotes whoever is
+//     hogging cores, which re-links it behind the later arrivals of the deeper level.
 //   - Workers obey their slot: dequeue from the assigned query's sub-queue. When the
 //     sub-queue is empty they fall back to a tokenless try_dequeue on the shared queue
 //     (work-conserving, priority-blind relief valve), re-checking the slot after every
@@ -131,6 +139,10 @@ public:
     // Test hook: number of live per-query states (observes teardown/resurrection).
     size_t registry_size_for_test() const;
 
+    // Test hook: how many worker slots currently point at `query_id`, i.e. how many
+    // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
+    int assigned_workers_for_test(const TUniqueId& query_id) const;
+
 protected:
     static constexpr int SUB_QUEUE_LEVEL = 4;
 
@@ -175,7 +187,6 @@ private:
         // Rebalance scratch (valid only within one rebalance pass).
         int rr_grant = 0;
         int rr_demand = 0;
-        int rr_visit_dealt = 0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // CPU time executed in this pool (per-pool statistic; the authoritative
@@ -198,6 +209,12 @@ private:
         // zero while pending_approx was zero; disarmed by producers on enqueue.
         // Assigned workers self-detach when they observe this. Not a reclaim trigger.
         std::atomic<bool> idle {false};
+        // Mirror of the owning query's runnable task count (tasks submitted and not yet
+        // finished, minus those parked on a dependency, across every fragment of the
+        // query and every pool). Refreshed by producers on enqueue and by workers on
+        // release, since the scheduler thread must never dereference a QueryContext.
+        // Stays 0 for the sentinel bucket, whose tasks have no QueryContext.
+        std::atomic<int> active_tasks {0};
     };
 
     // ------------------------------------------------------------------
@@ -270,6 +287,10 @@ private:
     PipelineTaskSPtr _try_take_once(int worker_id);
     void _check_assignment(int worker_id);
     void _release_in_flight(PipelineTask* task, bool charge, int64_t time_spent);
+    // Republishes the query's active task count into `qs` and tells the scheduler if it
+    // moved. Called by producers and workers, which are the only threads allowed to
+    // read it off a task.
+    void _refresh_active_tasks(QueryState* qs, const PipelineTask* task);
     void _post_message(SchedulerMessage msg);
     void _notify_workers(bool all);
 
@@ -319,11 +340,25 @@ private:
     std::vector<WorkerLocal> _worker_local;
     std::vector<WorkerSched> _worker_sched; // scheduler-thread-only
 
-    // MLFQ level lists (scheduler-thread-only). Lists are rotated by one on every
-    // rebalance so the round-robin dealing start is not positionally biased.
+    // MLFQ level lists (scheduler-thread-only). Each list is in arrival order: a query
+    // is appended when it joins the level (first enqueue, or the re-link performed on
+    // demotion) and keeps its place until it leaves, so dealing is FIFO.
     std::array<std::list<QueryState*>, SUB_QUEUE_LEVEL> _levels;
     // Queries pending destroy after QUERY_TERMINATED (scheduler-thread-only).
     std::vector<QueryState*> _destroy_candidates;
+    // Queries that received a grant in the current rebalance pass, in (level, arrival)
+    // order. Reused across passes to avoid reallocating (scheduler-thread-only).
+    std::vector<QueryState*> _granted_queries;
+    // A rebalance runs only when something it depends on changed: a query was created
+    // or revived, demoted, or terminated, or a worker came free. Set once at startup so
+    // the first pass always runs (scheduler-thread-only).
+    bool _rebalance_dirty = true;
+    // The last pass had grants it could not place because every worker still owed an
+    // ack. Keeps the dirty flag set so the next pass retries (scheduler-thread-only).
+    bool _grants_pending = false;
+    // Some query's `active_tasks` mirror moved, which changes its demand without any
+    // scheduler message. Set by producers/workers, consumed by the scheduler.
+    std::atomic<bool> _demand_dirty {false};
 
     // Inbox.
     std::mutex _inbox_mutex;
@@ -344,11 +379,6 @@ private:
 
     std::thread _scheduler_thread;
 
-    // Round-robin dealing chunk of the fair-share rebalance: within a level, workers
-    // are dealt to queries one at a time, each query capped at k per round (and at its
-    // demand estimate); levels are visited in strict priority order, and rounds repeat
-    // from the top level while workers and demand remain.
-    static constexpr int REBALANCE_CHUNK = 8;
     static constexpr auto SCHEDULER_TICK_MS = 20;
     // 2.8s, 10s, 25s of query-global runtime, same thresholds as before.
     static constexpr uint64_t QUEUE_LEVEL_LIMIT[SUB_QUEUE_LEVEL - 1] = {
