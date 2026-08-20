@@ -607,12 +607,12 @@ void MultiCoreTaskQueue::_write_assignment(int worker_id, QueryState* value) {
 void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // Phase 1: desired grants per query - greedy first-come-first-served. Queries are
     // visited in strict level order and, within a level, in arrival order, and each
-    // takes as many workers as it can use before the next is considered. Demand is the
-    // query's runnable task count, which counts its tasks wherever they sit while
-    // excluding those parked on a dependency, so a query cannot hold cores for work it
-    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
-    // (whose tasks have no QueryContext, so no active count) schedulable, and they cover
-    // the window where a task has already blocked but its worker has yet to release it.
+    // takes up to TARGET_WORKERS_PER_QUERY workers before the next is considered, so a
+    // higher-priority query is served in full and lower levels divide the remainder.
+    // Idle queries (nothing queued, nothing in flight) are skipped, which is the same
+    // predicate a worker uses to self-detach: granting to one would only get a worker
+    // assigned, self-detached on its next take, and re-granted on the pass that the
+    // resulting DETACHED triggers.
     // Every linked query gets its scratch reset, not just the granted ones, because
     // phase 2 reads the grant of whatever query a worker currently sits on.
     int remaining = static_cast<int>(_worker_slots.size());
@@ -620,10 +620,8 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     for (auto& level : _levels) {
         for (QueryState* qs : level) {
             qs->rr_grant = 0;
-            qs->rr_demand = std::max(qs->active_tasks.load(),
-                                     qs->pending_approx.load() + qs->in_flight.load());
-            if (remaining > 0 && qs->rr_demand > 0) {
-                qs->rr_grant = std::min(remaining, qs->rr_demand);
+            if (remaining > 0 && !qs->idle.load()) {
+                qs->rr_grant = std::min(remaining, TARGET_WORKERS_PER_QUERY);
                 remaining -= qs->rr_grant;
                 _granted_queries.push_back(qs);
             }

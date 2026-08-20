@@ -186,7 +186,6 @@ private:
         bool in_destroy_candidates = false;
         // Rebalance scratch (valid only within one rebalance pass).
         int rr_grant = 0;
-        int rr_demand = 0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // CPU time executed in this pool (per-pool statistic; the authoritative
@@ -380,6 +379,10 @@ private:
     std::thread _scheduler_thread;
 
     static constexpr auto SCHEDULER_TICK_MS = 20;
+    // Workers a query is granted while it has anything to run. Strict level order still
+    // applies: a higher-priority query takes its share first and lower levels divide
+    // whatever is left, so this is a per-query cap rather than a reservation.
+    static constexpr int TARGET_WORKERS_PER_QUERY = 8;
     // 2.8s, 10s, 25s of query-global runtime, same thresholds as before.
     static constexpr uint64_t QUEUE_LEVEL_LIMIT[SUB_QUEUE_LEVEL - 1] = {
             2800000000ULL, 10000000000ULL, 25000000000ULL};
