@@ -54,8 +54,8 @@ public:
         return id;
     }
     bool is_inelastic() const override { return _inelastic; }
-    // Defaults to 0, which leaves demand at sub-queue depth for tests that do not care
-    // about the active-task signal (demand is the max of the two).
+    // Mirrored into QueryState::active_tasks by the enqueue/release paths. The grant is
+    // a fixed per-query target now, so this no longer feeds the allocation.
     int active_task_num() const override { return _active_task_num; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
@@ -91,13 +91,6 @@ PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
 PipelineTaskSPtr make_inelastic_task(QueryContext* key, uint64_t runtime_ns) {
     return std::make_shared<MockPipelineTask>(key, runtime_ns, /*inelastic=*/true);
 }
-// A task reporting `active` live tasks for its query, i.e. a query whose demand exceeds
-// what is sitting in its sub-queue.
-PipelineTaskSPtr make_task_with_active(QueryContext* key, uint64_t runtime_ns, int active) {
-    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
-    task->set_active_task_num(active);
-    return task;
-}
 } // namespace
 
 // A lower-runtime query is staffed before a higher-runtime query, regardless of push
@@ -126,10 +119,10 @@ TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
 }
 
 // Within one level, cores are dealt greedily in arrival order: the oldest query takes
-// everything it can use before the next one is considered, so with three two-task
-// queries and three workers the split is 2/1/0 in push order.
+// its full per-query share (8) before the next one is considered, so on a ten-worker
+// pool three queries split 8/2/0 in push order.
 TEST(PushBasedTaskQueueTest, WithinLevelGreedyFcfs) {
-    TestTaskQueue q(3);
+    TestTaskQueue q(10);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
     auto* qc = qkey(0xC);
@@ -141,29 +134,25 @@ TEST(PushBasedTaskQueueTest, WithinLevelGreedyFcfs) {
     }
     q.wait_scheduler_settled_for_test();
 
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
 
     q.close();
 }
 
-// Demand is the query's active task count, not its sub-queue depth: a query with a
-// single queued task but three live tasks (the rest blocked on dependencies elsewhere)
-// is granted three cores, and the trailing query is left to the fallback.
-TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
-    TestTaskQueue q(4);
+// The grant is a fixed per-query target, not a function of how much work the query has
+// queued: a single task still draws the full share, and the share caps the query below
+// the pool size so the rest stays available to whoever comes next.
+TEST(PushBasedTaskQueueTest, GrantIgnoresSubQueueDepth) {
+    TestTaskQueue q(10);
     auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
 
-    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/3)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     q.wait_scheduler_settled_for_test();
 
-    // Sub-queue depth alone would have granted A a single core.
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    // Sub-queue depth would have granted a single core; the cap stops it at 8 of 10.
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
 
     q.close();
 }
@@ -172,7 +161,7 @@ TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
 // opposite order produce the mirrored allocation.
 TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
     auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
-        TestTaskQueue q(3);
+        TestTaskQueue q(10);
         for (uintptr_t id : push_order) {
             EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
             EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
@@ -187,14 +176,14 @@ TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
     };
 
     // Indexed by push position, not by query id: the first pushed always wins.
-    EXPECT_EQ(allocation({0xA, 0xB, 0xC}), (std::array<int, 3> {2, 1, 0}));
-    EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {2, 1, 0}));
+    EXPECT_EQ(allocation({0xA, 0xB, 0xC}), (std::array<int, 3> {8, 2, 0}));
+    EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {8, 2, 0}));
 }
 
-// Levels are strictly ordered: L0 is satisfied to its full demand first, and only the
-// leftover cores spill into L1, again in arrival order there.
+// Levels are strictly ordered: L0 takes its full share first, and only the leftover
+// cores spill into L1, again in arrival order there.
 TEST(PushBasedTaskQueueTest, AllocationSpillsIntoNextLevel) {
-    TestTaskQueue q(3);
+    TestTaskQueue q(10);
     auto* qa = qkey(0xA); // runtime 0 -> L0
     auto* qb = qkey(0xB); // runtime 5s -> L1, first of the two L1 queries
     auto* qc = qkey(0xC); // runtime 5s -> L1
@@ -206,8 +195,8 @@ TEST(PushBasedTaskQueueTest, AllocationSpillsIntoNextLevel) {
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     q.wait_scheduler_settled_for_test();
 
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
 
     q.close();
