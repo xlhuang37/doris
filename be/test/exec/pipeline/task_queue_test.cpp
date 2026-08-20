@@ -17,11 +17,12 @@
 
 #include "exec/pipeline/task_queue.h"
 
+#include <gen_cpp/Types_types.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
-#include <set>
 
 #include "common/config.h"
 #include "exec/pipeline/pipeline_task.h"
@@ -30,13 +31,13 @@ namespace doris {
 
 // Tests for the push-based, query-granular pipeline task queue. Level thresholds are
 // derived from the query-global runtime surfaced via PipelineTask::query_runtime_ns()
-// (<= 2.8s -> L0, (2.8s, 10s] -> L1, ...). The bucket key is query_ctx_raw(), which is
-// compared but never dereferenced, so opaque fake pointers are fine here.
+// (<= 2.8s -> L0, (2.8s, 10s] -> L1, ...). Registry keys are TUniqueId values from
+// query_id(); tests encode a fake QueryContext* into that id and never dereference it.
 //
 // The central scheduler runs on its own thread; tests use
 // wait_scheduler_settled_for_test() to make its assignment decisions deterministic:
-// it blocks until every event posted before the call (new queries, detach acks, idle
-// reports, demotions) has been processed and the resulting worker assignments have
+// it blocks until every event posted before the call (new queries, detach acks,
+// demotions, terminate) has been processed and the resulting worker assignments have
 // been dispatched.
 static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
 
@@ -47,14 +48,24 @@ public:
 
     uint64_t query_runtime_ns() const override { return _runtime_ns; }
     QueryContext* query_ctx_raw() const override { return _key; }
+    TUniqueId query_id() const override {
+        TUniqueId id;
+        id.lo = static_cast<int64_t>(reinterpret_cast<uintptr_t>(_key));
+        return id;
+    }
     bool is_inelastic() const override { return _inelastic; }
+    // Mirrored into QueryState::active_tasks by the enqueue/release paths. The grant is
+    // a fixed per-query target now, so this no longer feeds the allocation.
+    int active_task_num() const override { return _active_task_num; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
+    void set_active_task_num(int num) { _active_task_num = num; }
 
 private:
     QueryContext* _key;
     uint64_t _runtime_ns;
     bool _inelastic;
+    int _active_task_num = 0;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -68,6 +79,11 @@ public:
 namespace {
 QueryContext* qkey(uintptr_t id) {
     return reinterpret_cast<QueryContext*>(id);
+}
+TUniqueId qid(uintptr_t id) {
+    TUniqueId tid;
+    tid.lo = static_cast<int64_t>(id);
+    return tid;
 }
 PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
     return std::make_shared<MockPipelineTask>(key, runtime_ns);
@@ -102,10 +118,11 @@ TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
     q.close();
 }
 
-// Within one level, the chunked fair-share dealing spreads distinct workers across
-// co-resident queries rather than dogpiling one query.
-TEST(PushBasedTaskQueueTest, WithinLevelFairSpread) {
-    TestTaskQueue q(3);
+// Within one level, cores are dealt greedily in arrival order: the oldest query takes
+// its full per-query share (8) before the next one is considered, so on a ten-worker
+// pool three queries split 8/2/0 in push order.
+TEST(PushBasedTaskQueueTest, WithinLevelGreedyFcfs) {
+    TestTaskQueue q(10);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
     auto* qc = qkey(0xC);
@@ -117,14 +134,97 @@ TEST(PushBasedTaskQueueTest, WithinLevelFairSpread) {
     }
     q.wait_scheduler_settled_for_test();
 
-    // Three different workers each take once: they land on three different queries.
-    std::set<QueryContext*> served;
-    for (int worker = 0; worker < 3; ++worker) {
-        auto t = q.take(worker);
-        ASSERT_NE(t, nullptr) << "worker " << worker;
-        served.insert(t->query_ctx_raw());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.close();
+}
+
+// The grant is a fixed per-query target, not a function of how much work the query has
+// queued: a single task still draws the full share, and the share caps the query below
+// the pool size so the rest stays available to whoever comes next.
+TEST(PushBasedTaskQueueTest, GrantIgnoresSubQueueDepth) {
+    TestTaskQueue q(10);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    // Sub-queue depth would have granted a single core; the cap stops it at 8 of 10.
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+
+    q.close();
+}
+
+// Arrival order decides who gets the cores: the same three queries pushed in the
+// opposite order produce the mirrored allocation.
+TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
+    auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
+        TestTaskQueue q(10);
+        for (uintptr_t id : push_order) {
+            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
+            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
+        }
+        q.wait_scheduler_settled_for_test();
+        std::array<int, 3> assigned {};
+        for (size_t i = 0; i < push_order.size(); ++i) {
+            assigned[i] = q.assigned_workers_for_test(qid(push_order[i]));
+        }
+        q.close();
+        return assigned;
+    };
+
+    // Indexed by push position, not by query id: the first pushed always wins.
+    EXPECT_EQ(allocation({0xA, 0xB, 0xC}), (std::array<int, 3> {8, 2, 0}));
+    EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {8, 2, 0}));
+}
+
+// Levels are strictly ordered: L0 takes its full share first, and only the leftover
+// cores spill into L1, again in arrival order there.
+TEST(PushBasedTaskQueueTest, AllocationSpillsIntoNextLevel) {
+    TestTaskQueue q(10);
+    auto* qa = qkey(0xA); // runtime 0 -> L0
+    auto* qb = qkey(0xB); // runtime 5s -> L1, first of the two L1 queries
+    auto* qc = qkey(0xC); // runtime 5s -> L1
+
+    // Pushed lowest priority first to show level order beats arrival order.
+    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qc, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.close();
+}
+
+// Once settled, repeated scheduler passes with no state change leave the allocation
+// exactly where it was.
+TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
+    TestTaskQueue q(2);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     }
-    EXPECT_EQ(served.size(), 3);
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    const int a_assigned = q.assigned_workers_for_test(qid(0xA));
+    const int b_assigned = q.assigned_workers_for_test(qid(0xB));
+    EXPECT_EQ(a_assigned, 2);
+    EXPECT_EQ(b_assigned, 0);
+
+    for (int i = 0; i < 3; ++i) {
+        q.wait_scheduler_settled_for_test();
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), a_assigned) << "pass " << i;
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), b_assigned) << "pass " << i;
+    }
 
     q.close();
 }
@@ -220,10 +320,9 @@ TEST(PushBasedTaskQueueTest, DemotionReassignsWorker) {
     q.close();
 }
 
-// Two-phase teardown: once a query has nothing queued and nothing in flight, the
-// assigned worker detaches, and after the grace period the scheduler reclaims the
-// per-query state. A later push resurrects the query from scratch.
-TEST(PushBasedTaskQueueTest, IdleTeardownAndResurrection) {
+// Idle + detach does not reclaim a live query. Only terminate + workers_attached==0
+// frees the QueryState. A later push after reclaim recreates it.
+TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -233,21 +332,19 @@ TEST(PushBasedTaskQueueTest, IdleTeardownAndResurrection) {
 
     auto t = q.take(0);
     ASSERT_NE(t, nullptr);
-    // Release the in-flight slot: the query becomes idle (empty + nothing running).
     q.update_statistics(t.get(), 1000);
 
-    // The attached worker observes the idle query on its next take and detaches.
+    // Worker observes idle and detaches; the query is still valid so state stays.
     EXPECT_EQ(q.take(0), nullptr);
-
-    // First settle processes the detach ack and idle report (candidacy); the second
-    // settle is a later generation, so the grace period has passed and the state is
-    // reclaimed.
     q.wait_scheduler_settled_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
-    // Resurrection: a late task (e.g. a fragment arriving late, or a task migrating
-    // back from the blocking pool) recreates the state and executes normally.
+    // Recreate after reclaim (production will not enqueue after QueryContext dtor).
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     EXPECT_EQ(q.registry_size_for_test(), 1);
     q.wait_scheduler_settled_for_test();
@@ -259,9 +356,9 @@ TEST(PushBasedTaskQueueTest, IdleTeardownAndResurrection) {
     q.close();
 }
 
-// Revive during the grace period: a task that arrives after the idle report but
-// before teardown disarms the candidacy, and the state is kept.
-TEST(PushBasedTaskQueueTest, ReviveDuringGracePeriod) {
+// Terminate while a worker is still attached: the scheduler writes a null
+// assignment; after the worker acks, the state is reclaimed.
+TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -270,10 +367,31 @@ TEST(PushBasedTaskQueueTest, ReviveDuringGracePeriod) {
 
     auto t = q.take(0);
     ASSERT_NE(t, nullptr);
-    q.update_statistics(t.get(), 1000); // query goes idle
-    q.wait_scheduler_settled_for_test(); // candidacy recorded
+    q.update_statistics(t.get(), 1000);
 
-    // Revive before the grace period elapses.
+    q.notify_query_terminated(qid(0xA));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.take(0), nullptr);
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 0);
+
+    q.close();
+}
+
+// Work returning after a temporary drain keeps the same QueryState; idle never
+// starts reclaim for a real query.
+TEST(PushBasedTaskQueueTest, IdleDoesNotTeardownWhileQueryAlive) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    auto t = q.take(0);
+    ASSERT_NE(t, nullptr);
+    q.update_statistics(t.get(), 1000);
+    q.wait_scheduler_settled_for_test();
+
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     q.wait_scheduler_settled_for_test();
     q.wait_scheduler_settled_for_test();
@@ -364,8 +482,8 @@ TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
     q.close();
 }
 
-// Inelastic tasks keep full per-query accounting: after execution and release the
-// query goes idle and its state is torn down; a later inelastic push resurrects it.
+// Inelastic tasks keep full per-query accounting; idle does not reclaim, terminate
+// after detach does. A later inelastic push recreates the state.
 TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
@@ -377,15 +495,17 @@ TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     auto t = q.take(0);
     ASSERT_NE(t, nullptr);
     EXPECT_EQ(t->query_ctx_raw(), qa);
-    q.update_statistics(t.get(), 1000); // in_flight -> 0, pending 0: query idle
+    q.update_statistics(t.get(), 1000);
 
-    // Worker observes the idle query and detaches; grace period passes; reclaimed.
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
     q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    q.notify_query_terminated(qid(0xA));
+    q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
-    // Resurrection through the inelastic path works like the normal one.
     ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
     EXPECT_EQ(q.registry_size_for_test(), 1);
     auto t2 = q.take(0);
@@ -419,11 +539,33 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
         q.update_statistics(t.get(), 1000);
     }
 
-    // All released: the query reaches idle and is reclaimed after the grace period.
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
     q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    q.notify_query_terminated(qid(0xA));
+    q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
+
+    q.close();
+}
+
+// Tasks with no QueryContext share one sentinel bucket. Idle does not reclaim it
+// (no QUERY_TERMINATED will ever arrive); the state lives until queue close.
+TEST(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
+    TestTaskQueue q(1);
+    ASSERT_TRUE(q.push_back(make_task(nullptr, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    auto t = q.take(0);
+    ASSERT_NE(t, nullptr);
+    q.update_statistics(t.get(), 1000);
+    EXPECT_EQ(q.take(0), nullptr);
+    q.wait_scheduler_settled_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.registry_size_for_test(), 1);
 
     q.close();
 }
