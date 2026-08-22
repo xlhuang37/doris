@@ -103,8 +103,8 @@ public:
     ExecEnv* exec_env() const { return _exec_env; }
 
     // Query-global CPU/exec runtime counter shared by every PipelineFragmentContext
-    // of this query. It drives the query-granular absolute-priority MLFQ in both the
-    // pipeline task scheduler and the scan time-sharing scheduler, so all fragments of
+    // of this query. It is the attained-service key for the pipeline task scheduler
+    // (and is still charged by the scan time-sharing scheduler), so all fragments of
     // a small query share one low "attained service" value and win priority together.
     std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
 
