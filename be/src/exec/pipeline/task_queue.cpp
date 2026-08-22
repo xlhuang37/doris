@@ -21,10 +21,10 @@
 #include <algorithm>
 #include <chrono> // IWYU pragma: keep
 #include <gen_cpp/Types_types.h>
-#include <iterator>
 #include <memory>
 #include <utility>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "exec/pipeline/pipeline_task.h"
@@ -46,15 +46,6 @@ MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
 
 MultiCoreTaskQueue::~MultiCoreTaskQueue() {
     close();
-}
-
-int MultiCoreTaskQueue::_compute_level(uint64_t runtime) const {
-    for (int i = 0; i < SUB_QUEUE_LEVEL - 1; ++i) {
-        if (runtime <= QUEUE_LEVEL_LIMIT[i]) {
-            return i;
-        }
-    }
-    return SUB_QUEUE_LEVEL - 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +90,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
     auto do_enqueue = [&](QueryState* qs) -> bool {
         qs->pending_approx.fetch_add(1);
         revived = qs->idle.exchange(false);
+        qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
         _refresh_active_tasks(qs, task.get());
         bool ok = inelastic ? _inelastic_queue.enqueue(std::move(task))
                             : _queue.enqueue(qs->token, std::move(task));
@@ -133,8 +125,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         }
         auto& slot = _registry[query_id];
         if (slot == nullptr) {
-            slot = std::make_unique<QueryState>(_queue, query_id,
-                                                _compute_level(task->query_runtime_ns()));
+            slot = std::make_unique<QueryState>(_queue, query_id);
             created = true;
         }
         QueryState* qs = slot.get();
@@ -166,8 +157,8 @@ PipelineTaskSPtr MultiCoreTaskQueue::take(int core_id) {
 }
 
 PipelineTaskSPtr MultiCoreTaskQueue::_take(int worker_id, uint32_t timeout_ms) {
-    // Genuinely, this park semaphore thing is quite dumb. It should be 
-    // replaced with a semaphore design similar to DuckDB. 
+    // Genuinely, this park semaphore thing is quite dumb. It should be
+    // replaced with a semaphore design similar to DuckDB.
     PipelineTaskSPtr task = _try_take_once(worker_id);
     if (!task && !_closed.load() && timeout_ms > 0) {
         // Park until a producer or the scheduler signals, bounded by `timeout_ms`.
@@ -232,8 +223,9 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             _check_assignment(worker_id);
         }
         // "Inelastic first": single-task pipelines outrank everything, including the
-        // worker's own assignment and the MLFQ. Accounting is the same as the
-        // tokenless fallback below (the task was never in a per-query sub-queue).
+        // worker's own assignment and attained-service ranking. Accounting is the
+        // same as the tokenless fallback below (the task was never in a per-query
+        // sub-queue).
         if (_inelastic_queue.try_dequeue(task)) {
             {
                 std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
@@ -306,11 +298,7 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
 }
 
 void MultiCoreTaskQueue::_refresh_active_tasks(QueryState* qs, const PipelineTask* task) {
-    const int active = task->active_task_num();
-    if (qs->active_tasks.exchange(active, std::memory_order_relaxed) != active) {
-        // Demand changed with no scheduler message behind it, so wake the rebalance.
-        _demand_dirty.store(true, std::memory_order_relaxed);
-    }
+    qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -318,9 +306,9 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     if (charge) {
         // Charge the executed CPU time to the owning query's global counter. This
         // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers, and drives the
-        // query-granular MLFQ demotion. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op and they stay at the highest level.
+        // and cores) and across the pipeline/scan schedulers, and drives
+        // attained-service ranking. For tasks without a query counter (e.g.
+        // RevokableTask) the charge is a no-op and they stay at attained 0.
         task->add_query_runtime_ns(charged_ns);
     }
     if (_mode != Mode::FULL) {
@@ -338,16 +326,7 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     _refresh_active_tasks(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
-        // Event-driven demotion: exactly one worker per level crossing (the CAS
-        // winner) notifies the scheduler, which reacts instead of polling clocks.
-        int want = _compute_level(task->query_runtime_ns());
-        int cur = qs->level.load(std::memory_order_relaxed);
-        if (want > cur && qs->level.compare_exchange_strong(cur, want)) {
-            SchedulerMessage msg;
-            msg.type = SchedulerMessage::Type::LEVEL_DEMOTED;
-            msg.query_id = query_id;
-            _post_message(std::move(msg));
-        }
+        qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
     if (remaining == 0 && qs->pending_approx.load() == 0) {
@@ -422,13 +401,10 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             _handle_message(msg, syncs);
         }
         if (!closing) {
+            // Every pass: compact tombstones, re-sort by attained service, dispatch.
+            // Destroy is only attempted after compact has cleared in_sched.
+            _rebalance_and_dispatch();
             _try_teardown();
-            // Rebalance only when an input to the allocation changed: an MLFQ event, a
-            // worker coming free, a demand change, or grants left unplaced last pass.
-            if (_rebalance_dirty || _demand_dirty.exchange(false, std::memory_order_relaxed)) {
-                _rebalance_and_dispatch();
-                _rebalance_dirty = _grants_pending;
-            }
         }
         for (auto& promise : syncs) {
             promise->set_value();
@@ -456,11 +432,6 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
             WorkerSched& ws = _worker_sched[msg.worker_id];
             if (msg.seq == ws.written_seq) {
                 ws.acked = true;
-                // This worker is movable again, which may unblock a grant the previous
-                // pass could not place.
-                if (_grants_pending) {
-                    _rebalance_dirty = true;
-                }
             }
         }
         if (msg.state != nullptr) {
@@ -483,32 +454,12 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         }
         msg.state->workers_attached--;
         DCHECK_GE(msg.state->workers_attached, 0);
-        // A worker came free; some other query may be able to use it.
-        _rebalance_dirty = true;
-        break;
-    }
-    case SchedulerMessage::Type::LEVEL_DEMOTED: {
-        QueryState* qs = _resolve(msg.query_id);
-        if (qs != nullptr && qs->linked && !qs->terminated) {
-            int level = qs->level.load(std::memory_order_relaxed);
-            if (level != qs->linked_level) {
-                // Re-linking appends, so the query lands behind everything already in
-                // its new level.
-                _unlink(qs);
-                _link(qs, level);
-                _rebalance_dirty = true;
-            }
-        }
         break;
     }
     case SchedulerMessage::Type::NEW_QUERY: {
         QueryState* qs = _resolve(msg.query_id);
         if (qs != nullptr && !qs->terminated) {
-            if (!qs->linked) {
-                _link(qs, qs->level.load(std::memory_order_relaxed));
-            }
-            // Created or revived: this query has demand again.
-            _rebalance_dirty = true;
+            _add_to_sched(qs);
         }
         break;
     }
@@ -519,8 +470,7 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
         }
         qs->terminated = true;
         qs->rr_grant = 0;
-        _unlink(qs);
-        _rebalance_dirty = true;
+        // Stay in `_queries` as a live tombstone until the next compact. Do not erase.
         if (!qs->in_destroy_candidates) {
             qs->in_destroy_candidates = true;
             _destroy_candidates.push_back(qs);
@@ -545,27 +495,21 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
     }
 }
 
-void MultiCoreTaskQueue::_link(QueryState* node, int level) {
-    DCHECK(!node->linked);
-    node->linked_level = level;
-    _levels[level].push_back(node);
-    node->pos = std::prev(_levels[level].end());
-    node->linked = true;
-}
-
-void MultiCoreTaskQueue::_unlink(QueryState* node) {
-    if (!node->linked) {
+void MultiCoreTaskQueue::_add_to_sched(QueryState* node) {
+    if (node->in_sched) {
         return;
     }
-    _levels[node->linked_level].erase(node->pos);
-    node->linked = false;
+    _queries.push_back(node);
+    node->in_sched = true;
 }
 
 void MultiCoreTaskQueue::_try_teardown() {
     auto it = _destroy_candidates.begin();
     while (it != _destroy_candidates.end()) {
         QueryState* qs = *it;
-        if (qs->workers_attached > 0) {
+        // Compact must have dropped this pointer from `_queries` first. Destroying
+        // while in_sched would leave a dead address in the vector.
+        if (qs->in_sched || qs->workers_attached > 0) {
             ++it;
             continue;
         }
@@ -573,7 +517,7 @@ void MultiCoreTaskQueue::_try_teardown() {
         {
             std::unique_lock<std::shared_mutex> wlock(_registry_mutex);
             if (qs->terminated && qs->in_flight.load() == 0 && qs->pending_approx.load() == 0) {
-                _unlink(qs);
+                DCHECK(!qs->in_sched);
                 _registry.erase(qs->query_id);
                 erased = true;
             }
@@ -605,28 +549,50 @@ void MultiCoreTaskQueue::_write_assignment(int worker_id, QueryState* value) {
 }
 
 void MultiCoreTaskQueue::_rebalance_and_dispatch() {
-    // Phase 1: desired grants per query - greedy first-come-first-served. Queries are
-    // visited in strict level order and, within a level, in arrival order, and each
-    // takes as many workers as it can use before the next is considered. Demand is the
-    // query's runnable task count, which counts its tasks wherever they sit while
-    // excluding those parked on a dependency, so a query cannot hold cores for work it
-    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
-    // (whose tasks have no QueryContext, so no active count) schedulable, and they cover
-    // the window where a task has already blocked but its worker has yet to release it.
-    // Every linked query gets its scratch reset, not just the granted ones, because
-    // phase 2 reads the grant of whatever query a worker currently sits on.
-    int remaining = static_cast<int>(_worker_slots.size());
-    _granted_queries.clear();
-    for (auto& level : _levels) {
-        for (QueryState* qs : level) {
+    // Compact: drop terminated tombstones from the vector and clear in_sched. The
+    // object stays in `_registry` until `_try_teardown` sees !in_sched and the
+    // reclaim gate. This is the only place that removes a pointer from `_queries`.
+    size_t live = 0;
+    for (QueryState* qs : _queries) {
+        if (qs->terminated) {
+            qs->in_sched = false;
             qs->rr_grant = 0;
-            qs->rr_demand = std::max(qs->active_tasks.load(),
-                                     qs->pending_approx.load() + qs->in_flight.load());
-            if (remaining > 0 && qs->rr_demand > 0) {
-                qs->rr_grant = std::min(remaining, qs->rr_demand);
-                remaining -= qs->rr_grant;
-                _granted_queries.push_back(qs);
-            }
+            continue;
+        }
+        _queries[live++] = qs;
+    }
+    _queries.resize(live);
+
+    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
+        return a->attained_ns.load(std::memory_order_relaxed) <
+               b->attained_ns.load(std::memory_order_relaxed);
+    });
+
+    // Phase 1: desired grants per query - greedy least-attained-first. Each query
+    // takes as many workers as it can use (capped by pipeline_query_worker_cap)
+    // before the next is considered. Demand is the query's runnable task count,
+    // which counts its tasks wherever they sit while excluding those parked on a
+    // dependency, so a query cannot hold cores for work it cannot perform. The
+    // sub-queue terms are a floor: they keep the sentinel bucket (whose tasks have
+    // no QueryContext, so no active count) schedulable, and they cover the window
+    // where a task has already blocked but its worker has yet to release it.
+    // Every scheduled query gets its scratch reset, not just the granted ones,
+    // because phase 2 reads the grant of whatever query a worker currently sits on.
+    int remaining = static_cast<int>(_worker_slots.size());
+    const int cap = config::pipeline_query_worker_cap;
+    _granted_queries.clear();
+    for (QueryState* qs : _queries) {
+        qs->rr_grant = 0;
+        qs->rr_demand = std::max(qs->active_tasks.load(),
+                                 qs->pending_approx.load() + qs->in_flight.load());
+        int want = qs->rr_demand;
+        if (cap > 0) {
+            want = std::min(want, cap);
+        }
+        if (remaining > 0 && want > 0) {
+            qs->rr_grant = std::min(remaining, want);
+            remaining -= qs->rr_grant;
+            _granted_queries.push_back(qs);
         }
     }
 
@@ -643,13 +609,12 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
 
     // Phase 3: hand leftover grants to movable workers. `_granted_queries` is already
-    // in (level, arrival) order, so the highest-priority query is served first. A worker
+    // in attained-service order, so the least-attained query is served first. A worker
     // is movable when its last slot write was acked (never two outstanding writes per
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.
     bool wrote = false;
     size_t scan = 0;
-    _grants_pending = false;
     for (QueryState* qs : _granted_queries) {
         while (qs->rr_grant > 0) {
             int chosen = -1;
@@ -665,7 +630,6 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
             if (chosen < 0) {
                 // No movable worker anywhere; the rest of the grants wait for the
                 // pending acks and are recomputed next pass.
-                _grants_pending = true;
                 if (wrote) {
                     _notify_workers(true);
                 }
