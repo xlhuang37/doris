@@ -90,7 +90,8 @@ public:
     // assignment slot every execution slice" invariant that the push-based scheduler
     // relies on, so its queue runs in the degenerate general-only mode (plain shared
     // lock-free queue, no scheduler thread). Runtime is still charged to the
-    // query-global counter, so MLFQ accounting in the simple pool is unaffected.
+    // query-global counter, so attained-service accounting in the simple pool is
+    // unaffected.
     HybridTaskScheduler(int exec_thread_num, int blocking_exec_thread_num, std::string name,
                         std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
             : _blocking_scheduler(blocking_exec_thread_num, name + "_blocking_scheduler",

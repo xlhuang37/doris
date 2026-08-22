@@ -134,10 +134,10 @@ public:
     // Execution phase should be terminated. This is called if this task is canceled or waken up early.
     void terminate();
 
-    // Used by the query-granular MLFQ in the pipeline task scheduler. The
+    // Used by attained-service ranking in the pipeline task scheduler. The
     // scheduler charges executed CPU time to the owning query's global counter
     // (shared across all of the query's fragments, instances and pipeline tasks),
-    // and reads it back to decide which priority level this task belongs in.
+    // and reads it back so least-attained queries are staffed first.
     void add_query_runtime_ns(uint64_t delta_time) {
         if (_query_runtime_ptr != nullptr) {
             _query_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
@@ -157,7 +157,7 @@ public:
         return _active_tasks_ptr != nullptr ? _active_tasks_ptr->load(std::memory_order_relaxed)
                                             : 0;
     }
-    // Opaque key identifying the owning query, used by the global query-granular MLFQ
+    // Opaque key identifying the owning query, used by the query-granular task queue
     // to bucket this task. The query context outlives its tasks; the pointer is only
     // ever compared/used as a map key, never dereferenced by the queue.
     MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
@@ -258,8 +258,8 @@ private:
     // counts as active; see _counts_as_active().
     std::atomic<int>* _active_tasks_ptr = nullptr;
 
-    // Cached owning QueryContext pointer (bucket key for the global query MLFQ). Null
-    // for tasks not tied to a query (e.g. RevokableTask), which bucket together.
+    // Cached owning QueryContext pointer (bucket key for the query-granular queue).
+    // Null for tasks not tied to a query (e.g. RevokableTask), which bucket together.
     QueryContext* _query_ctx_raw = nullptr;
 
     RuntimeProfile* _parent_profile = nullptr;

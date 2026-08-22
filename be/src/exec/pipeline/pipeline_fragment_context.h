@@ -90,8 +90,8 @@ public:
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
     // Query-global CPU runtime counter, owned by QueryContext and shared by every
-    // fragment of the query. It drives the query-granular absolute-priority MLFQ in
-    // both the pipeline task scheduler and the scan time-sharing scheduler.
+    // fragment of the query. It is the attained-service key for the pipeline task
+    // scheduler (and is still charged by the scan time-sharing scheduler).
     std::atomic<uint64_t>* query_runtime_counter() override {
         return _query_ctx->query_runtime_counter();
     }

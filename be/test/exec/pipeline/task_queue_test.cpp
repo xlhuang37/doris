@@ -26,19 +26,20 @@
 
 #include "common/config.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "util/defer_op.h"
 
 namespace doris {
 
-// Tests for the push-based, query-granular pipeline task queue. Level thresholds are
-// derived from the query-global runtime surfaced via PipelineTask::query_runtime_ns()
-// (<= 2.8s -> L0, (2.8s, 10s] -> L1, ...). Registry keys are TUniqueId values from
-// query_id(); tests encode a fake QueryContext* into that id and never dereference it.
+// Tests for the push-based, query-granular pipeline task queue. Ranking is by
+// attained service (PipelineTask::query_runtime_ns()), least first; equal service
+// keeps arrival order. Registry keys are TUniqueId values from query_id(); tests
+// encode a fake QueryContext* into that id and never dereference it.
 //
 // The central scheduler runs on its own thread; tests use
 // wait_scheduler_settled_for_test() to make its assignment decisions deterministic:
 // it blocks until every event posted before the call (new queries, detach acks,
-// demotions, terminate) has been processed and the resulting worker assignments have
-// been dispatched.
+// terminate) has been processed and the resulting worker assignments have been
+// dispatched.
 static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
 
 class MockPipelineTask : public PipelineTask {
@@ -100,15 +101,15 @@ PipelineTaskSPtr make_task_with_active(QueryContext* key, uint64_t runtime_ns, i
 }
 } // namespace
 
-// A lower-runtime query is staffed before a higher-runtime query, regardless of push
-// order: the scheduler assigns the single worker to the L0 query, and the L1 query is
-// only reached through the work-conserving fallback afterwards.
+// A lower-attained query is staffed before a higher-attained query, regardless of
+// push order: the scheduler assigns the single worker to the 0-runtime query, and
+// the 5s query is only reached through the work-conserving fallback afterwards.
 TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
     TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // runtime 0 -> L0
-    auto* qb = qkey(0xB); // runtime 5s -> L1
+    auto* qa = qkey(0xA); // runtime 0
+    auto* qb = qkey(0xB); // runtime 5s
 
-    // Push the lower-priority query first.
+    // Push the higher-attained query first.
     ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     q.wait_scheduler_settled_for_test();
@@ -125,16 +126,16 @@ TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
     q.close();
 }
 
-// Within one level, cores are dealt greedily in arrival order: the oldest query takes
-// everything it can use before the next one is considered, so with three two-task
-// queries and three workers the split is 2/1/0 in push order.
-TEST(PushBasedTaskQueueTest, WithinLevelGreedyFcfs) {
+// At equal attained service, cores are dealt greedily in arrival order: the oldest
+// query takes everything it can use before the next one is considered, so with three
+// two-task queries and three workers the split is 2/1/0 in push order.
+TEST(PushBasedTaskQueueTest, EqualAttainedGreedyFcfs) {
     TestTaskQueue q(3);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
     auto* qc = qkey(0xC);
 
-    // All at L0, two tasks each.
+    // All at attained 0, two tasks each.
     for (auto* key : {qa, qb, qc}) {
         ASSERT_TRUE(q.push_back(make_task(key, 0)).ok());
         ASSERT_TRUE(q.push_back(make_task(key, 0)).ok());
@@ -170,7 +171,7 @@ TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
 
 // Arrival order decides who gets the cores: the same three queries pushed in the
 // opposite order produce the mirrored allocation.
-TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
+TEST(PushBasedTaskQueueTest, AllocationAtEqualAttainedIsFifo) {
     auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
         TestTaskQueue q(3);
         for (uintptr_t id : push_order) {
@@ -191,15 +192,15 @@ TEST(PushBasedTaskQueueTest, AllocationWithinLevelIsFifo) {
     EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {2, 1, 0}));
 }
 
-// Levels are strictly ordered: L0 is satisfied to its full demand first, and only the
-// leftover cores spill into L1, again in arrival order there.
-TEST(PushBasedTaskQueueTest, AllocationSpillsIntoNextLevel) {
+// Least attained is satisfied to its full demand first; leftover cores spill to
+// higher-attained queries, and equal attained among those keeps arrival order.
+TEST(PushBasedTaskQueueTest, AllocationSpillsToHigherAttained) {
     TestTaskQueue q(3);
-    auto* qa = qkey(0xA); // runtime 0 -> L0
-    auto* qb = qkey(0xB); // runtime 5s -> L1, first of the two L1 queries
-    auto* qc = qkey(0xC); // runtime 5s -> L1
+    auto* qa = qkey(0xA); // runtime 0
+    auto* qb = qkey(0xB); // runtime 5s, first of the two higher-attained queries
+    auto* qc = qkey(0xC); // runtime 5s
 
-    // Pushed lowest priority first to show level order beats arrival order.
+    // Pushed highest-attained first to show sort order beats arrival order.
     ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
     ASSERT_TRUE(q.push_back(make_task(qc, 5 * kSecondNs)).ok());
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
@@ -244,8 +245,8 @@ TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
 // (locality: steady state generates no reassignments).
 TEST(PushBasedTaskQueueTest, QueryLocality) {
     TestTaskQueue q(2);
-    auto* qa = qkey(0xA); // L0
-    auto* qb = qkey(0xB); // L1
+    auto* qa = qkey(0xA); // attained 0
+    auto* qb = qkey(0xB); // attained 5s
 
     for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
@@ -266,13 +267,13 @@ TEST(PushBasedTaskQueueTest, QueryLocality) {
     q.close();
 }
 
-// A newly arrived higher-priority query pulls the worker off its current lower
-// priority query: the scheduler overwrites the assignment slot and the worker
-// obeys it on its next take (push-based preemption).
+// A newly arrived lower-attained query pulls the worker off its current
+// higher-attained query: the scheduler overwrites the assignment slot and the
+// worker obeys it on its next take (push-based preemption).
 TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
     TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // L1 (5s)
-    auto* qc = qkey(0xC); // L0 (0)
+    auto* qa = qkey(0xA); // attained 5s
+    auto* qc = qkey(0xC); // attained 0
 
     ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
     ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
@@ -282,7 +283,7 @@ TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qa);
 
-    // Higher-priority query C arrives; the scheduler reassigns the worker.
+    // Lower-attained query C arrives; the scheduler reassigns the worker.
     ASSERT_TRUE(q.push_back(make_task(qc, 0)).ok());
     q.wait_scheduler_settled_for_test();
 
@@ -293,16 +294,15 @@ TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
     q.close();
 }
 
-// Event-driven demotion: when a query's accumulated runtime crosses a level
-// threshold, the CAS-winning release posts the demotion, the scheduler relinks the
-// query at the deeper level and hands the worker to the fresh L0 query.
-TEST(PushBasedTaskQueueTest, DemotionReassignsWorker) {
+// After a running query accumulates more attained service, a fresh zero-attained
+// query is staffed first on the next settled rebalance.
+TEST(PushBasedTaskQueueTest, HigherAttainedYieldsToFresherQuery) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
 
     for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok()); // L0 at push time
+        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     }
     q.wait_scheduler_settled_for_test();
 
@@ -310,23 +310,73 @@ TEST(PushBasedTaskQueueTest, DemotionReassignsWorker) {
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qa);
 
-    // The query burned 5s of runtime during this slice: releasing the task detects
-    // the L0 -> L1 crossing and notifies the scheduler.
+    // A burned 5s of runtime during this slice; B arrives at attained 0.
     static_cast<MockPipelineTask*>(t1.get())->set_runtime_ns(5 * kSecondNs);
     q.update_statistics(t1.get(), 1000);
 
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok()); // fresh L0 query
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
     q.wait_scheduler_settled_for_test();
 
-    // The worker was stripped from the demoted query and pushed to the L0 one.
     auto t2 = q.take(0);
     ASSERT_NE(t2, nullptr);
     EXPECT_EQ(t2->query_ctx_raw(), qb);
 
-    // The demoted query is still drained through the fallback (work conservation).
+    // The higher-attained query is still drained through the fallback.
     auto t3 = q.take(0);
     ASSERT_NE(t3, nullptr);
     EXPECT_EQ(t3->query_ctx_raw(), qa);
+
+    q.close();
+}
+
+// A and B start at equal attained service (A arrives first and holds the worker).
+// After A accumulates service, the next settled pass moves the worker to B.
+TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qa);
+    static_cast<MockPipelineTask*>(t1.get())->set_runtime_ns(5 * kSecondNs);
+    q.update_statistics(t1.get(), 1000);
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    auto t2 = q.take(0);
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qb);
+
+    q.close();
+}
+
+// pipeline_query_worker_cap bounds a single query even when its demand and the
+// pool are larger; leftover cores spill to the next query.
+TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 8;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    TestTaskQueue q(12);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/20)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/5)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 4);
 
     q.close();
 }
@@ -466,8 +516,8 @@ TEST(PushBasedTaskQueueTest, GeneralOnlyMode) {
 // the inelastic task from query B is served first.
 TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
     TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // elastic backlog, L0
-    auto* qb = qkey(0xB); // inelastic, L1 (worse MLFQ level - priority still wins)
+    auto* qa = qkey(0xA); // elastic backlog
+    auto* qb = qkey(0xB); // inelastic, higher attained — still served first
 
     for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
@@ -476,7 +526,7 @@ TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
 
     ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 5 * kSecondNs)).ok());
 
-    // The inelastic task jumps ahead of A's backlog and of the MLFQ.
+    // The inelastic task jumps ahead of A's backlog and of attained-service ranking.
     auto t1 = q.take(0);
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qb);
