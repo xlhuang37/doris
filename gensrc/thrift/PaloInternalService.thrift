@@ -495,6 +495,12 @@ struct TQueryOptions {
   // -1 means not set. Sent by FE session variable expected_service.
   219: optional i64 expected_service_ms = -1
 
+  // Per-query cap on how many pipeline workers this query may be assigned
+  // concurrently by the attained-service scheduler. -1 means "inherit the BE's
+  // pipeline_query_worker_cap config", 0 means unbounded, > 0 is the cap itself.
+  // Sent by FE session variable pipeline_query_worker_cap.
+  220: optional i32 pipeline_query_worker_cap = -1
+
   // For cloud, to control if the content would be written into file cache
   // In write path, to control if the content would be written into file cache.
   // In read path, read from file cache or remote storage when execute query.
