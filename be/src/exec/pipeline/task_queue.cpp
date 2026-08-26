@@ -91,7 +91,7 @@ Status MultiCoreTaskQueue::_push(PipelineTaskSPtr task) {
         qs->pending_approx.fetch_add(1);
         revived = qs->idle.exchange(false);
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
-        _refresh_active_tasks(qs, task.get());
+        _refresh_query_mirror(qs, task.get());
         bool ok = inelastic ? _inelastic_queue.enqueue(std::move(task))
                             : _queue.enqueue(qs->token, std::move(task));
         if (!ok) {
@@ -297,8 +297,9 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
     _release_in_flight(task, /*charge=*/false, 0);
 }
 
-void MultiCoreTaskQueue::_refresh_active_tasks(QueryState* qs, const PipelineTask* task) {
+void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTask* task) {
     qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
+    qs->worker_cap.store(task->query_worker_cap(), std::memory_order_relaxed);
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -323,7 +324,7 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     QueryState* qs = it->second.get();
     // Both ways a task stops wanting a core - blocking on a dependency and finishing -
     // happen inside the run that is ending here, so the mirror picks up the decrement.
-    _refresh_active_tasks(qs, task);
+    _refresh_query_mirror(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
@@ -569,23 +570,31 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     });
 
     // Phase 1: desired grants per query - greedy least-attained-first. Each query
-    // takes as many workers as it can use (capped by pipeline_query_worker_cap)
-    // before the next is considered. Demand is the query's runnable task count,
-    // which counts its tasks wherever they sit while excluding those parked on a
-    // dependency, so a query cannot hold cores for work it cannot perform. The
-    // sub-queue terms are a floor: they keep the sentinel bucket (whose tasks have
-    // no QueryContext, so no active count) schedulable, and they cover the window
-    // where a task has already blocked but its worker has yet to release it.
+    // takes as many workers as it can use (capped by its own worker cap: the per-query
+    // session variable when set, otherwise the BE config, both re-read every pass so a
+    // runtime change lands within one tick) before the next is considered. Demand is
+    // the query's runnable task count, which counts its tasks wherever they sit while
+    // excluding those parked on a dependency, so a query cannot hold cores for work it
+    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
+    // (whose tasks have no QueryContext, so no active count) schedulable, and they
+    // cover the window where a task has already blocked but its worker has yet to
+    // release it.
     // Every scheduled query gets its scratch reset, not just the granted ones,
     // because phase 2 reads the grant of whatever query a worker currently sits on.
     int remaining = static_cast<int>(_worker_slots.size());
-    const int cap = config::pipeline_query_worker_cap;
+    const int default_cap = config::pipeline_query_worker_cap;
     _granted_queries.clear();
     for (QueryState* qs : _queries) {
         qs->rr_grant = 0;
         qs->rr_demand = std::max(qs->active_tasks.load(),
                                  qs->pending_approx.load() + qs->in_flight.load());
         int want = qs->rr_demand;
+        // A negative mirror means the query set no session-level override (and is
+        // also what the sentinel bucket reports), so fall back to the BE config.
+        int cap = qs->worker_cap.load(std::memory_order_relaxed);
+        if (cap < 0) {
+            cap = default_cap;
+        }
         if (cap > 0) {
             want = std::min(want, cap);
         }

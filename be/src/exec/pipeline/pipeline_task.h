@@ -157,6 +157,14 @@ public:
         return _active_tasks_ptr != nullptr ? _active_tasks_ptr->load(std::memory_order_relaxed)
                                             : 0;
     }
+    // Per-query ceiling on concurrently assigned pipeline workers, from the owning
+    // query's `pipeline_query_worker_cap` session variable. -1 means "no per-query
+    // override, use the BE config"; 0 means unbounded; > 0 is the cap. Tasks with no
+    // QueryContext (e.g. RevokableTask) report -1. Read by producers and workers, who
+    // mirror it into the scheduler's per-query state (the scheduler thread must never
+    // dereference a QueryContext).
+    MOCK_FUNCTION int query_worker_cap() const { return _query_worker_cap; }
+
     // Opaque key identifying the owning query, used by the query-granular task queue
     // to bucket this task. The query context outlives its tasks; the pointer is only
     // ever compared/used as a map key, never dereferenced by the queue.
@@ -261,6 +269,11 @@ private:
     // Cached owning QueryContext pointer (bucket key for the query-granular queue).
     // Null for tasks not tied to a query (e.g. RevokableTask), which bucket together.
     QueryContext* _query_ctx_raw = nullptr;
+
+    // Snapshot of the owning query's worker cap session variable, taken once at
+    // construction because query options are immutable for the life of a query.
+    // Caching it keeps the scheduler's mirror refresh off the QueryContext cacheline.
+    int _query_worker_cap = -1;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

@@ -57,8 +57,10 @@ namespace doris {
 //     a single append-only vector, re-sorted on every rebalance; equal attained
 //     service keeps arrival order (stable_sort).
 //   - Core allocation is greedy first-come-first-served in that order: each query
-//     takes as many of the pool's workers as it can use (capped by
-//     pipeline_query_worker_cap when > 0) before the next is considered. A query's
+//     takes as many of the pool's workers as it can use (capped by its own
+//     `pipeline_query_worker_cap` session variable, or by the BE config of the same
+//     name when the query does not override it) before the next is considered. Both
+//     are read fresh on every rebalance, so either can be retuned at runtime. A query's
 //     demand is its active task count (tasks created and not yet finalized, so
 //     blocked tasks count too), which is what lets a query that is momentarily
 //     empty but about to unblock keep its cores. Queries reached after the workers
@@ -214,6 +216,11 @@ private:
         // release, since the scheduler thread must never dereference a QueryContext.
         // Stays 0 for the sentinel bucket, whose tasks have no QueryContext.
         std::atomic<int> active_tasks {0};
+        // Mirror of the owning query's `pipeline_query_worker_cap` session variable:
+        // -1 to defer to the BE config, 0 for unbounded, > 0 for the cap. Refreshed
+        // alongside `active_tasks` for the same reason (only producers and workers may
+        // touch a QueryContext). Constant for the life of a query in practice.
+        std::atomic<int> worker_cap {-1};
     };
 
     // ------------------------------------------------------------------
@@ -285,9 +292,10 @@ private:
     PipelineTaskSPtr _try_take_once(int worker_id);
     void _check_assignment(int worker_id);
     void _release_in_flight(PipelineTask* task, bool charge, int64_t time_spent);
-    // Republishes the query's active task count into `qs`. Called by producers and
-    // workers, which are the only threads allowed to read it off a task.
-    void _refresh_active_tasks(QueryState* qs, const PipelineTask* task);
+    // Republishes the query's active task count and worker cap into `qs`. Called by
+    // producers and workers, which are the only threads allowed to read them off a
+    // task (they resolve through the QueryContext, which the scheduler must not touch).
+    void _refresh_query_mirror(QueryState* qs, const PipelineTask* task);
     void _post_message(SchedulerMessage msg);
     void _notify_workers(bool all);
 
