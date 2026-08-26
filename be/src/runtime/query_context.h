@@ -114,6 +114,15 @@ public:
     // understates once a query's runnable tasks are spread over the workers.
     std::atomic<int>* active_task_counter() { return &_active_task_num; }
 
+    // Per-query cap on concurrently assigned pipeline workers, from the session
+    // variable of the same name. -1 (the default) defers to the BE config
+    // `pipeline_query_worker_cap`; 0 means unbounded; > 0 is the cap.
+    int pipeline_query_worker_cap() const {
+        return _query_options.__isset.pipeline_query_worker_cap
+                       ? _query_options.pipeline_query_worker_cap
+                       : -1;
+    }
+
     bool is_timeout(timespec now) const {
         if (_timeout_second <= 0) {
             return false;
