@@ -58,15 +58,21 @@ public:
     // Defaults to 0, which leaves demand at sub-queue depth for tests that do not care
     // about the active-task signal (demand is the max of the two).
     int active_task_num() const override { return _active_task_num; }
+    // Defaults to -1, i.e. no session-level override, so the BE config applies. The
+    // base implementation would go through the QueryContext, which is a fake pointer
+    // here and must never be dereferenced.
+    int query_worker_cap() const override { return _worker_cap; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
     void set_active_task_num(int num) { _active_task_num = num; }
+    void set_worker_cap(int cap) { _worker_cap = cap; }
 
 private:
     QueryContext* _key;
     uint64_t _runtime_ns;
     bool _inelastic;
     int _active_task_num = 0;
+    int _worker_cap = -1;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -97,6 +103,14 @@ PipelineTaskSPtr make_inelastic_task(QueryContext* key, uint64_t runtime_ns) {
 PipelineTaskSPtr make_task_with_active(QueryContext* key, uint64_t runtime_ns, int active) {
     auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
     task->set_active_task_num(active);
+    return task;
+}
+// As above, but the query also carries a session-level worker cap.
+PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runtime_ns, int active,
+                                               int cap) {
+    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
+    task->set_active_task_num(active);
+    task->set_worker_cap(cap);
     return task;
 }
 } // namespace
@@ -377,6 +391,78 @@ TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
 
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 4);
+
+    q.close();
+}
+
+// A query carrying its own pipeline_query_worker_cap session variable is bounded by
+// that value instead of the BE config, and only that query is affected: the query
+// without an override still gets the config's 8.
+TEST(PushBasedTaskQueueTest, SessionWorkerCapOverridesConfig) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 8;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    TestTaskQueue q(12);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active_and_cap(qa, 0, /*active=*/20, /*cap=*/3)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/20)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 8);
+
+    q.close();
+}
+
+// A session cap of 0 means unbounded, so it can also lift a restrictive BE config.
+TEST(PushBasedTaskQueueTest, SessionWorkerCapZeroIsUnbounded) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 4;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    TestTaskQueue q(6);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active_and_cap(qa, 0, /*active=*/20, /*cap=*/0)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 6);
+
+    q.close();
+}
+
+// The cap is re-read on every rebalance pass, so raising it after the query is already
+// running widens the grant without any restart or re-push.
+TEST(PushBasedTaskQueueTest, WorkerCapChangeTakesEffectAtRuntime) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 2;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    TestTaskQueue q(12);
+    auto* qa = qkey(0xA);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/20)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
+
+    // Let every worker run once so the two assigned ones ack their slot write; only
+    // acked workers are eligible to be kept in place or moved by the next pass. The
+    // dequeued task is held (never released), so the query stays non-idle and its
+    // demand stays at the active count.
+    PipelineTaskSPtr held;
+    for (int i = 0; i < 12; ++i) {
+        auto task = q.take(i);
+        if (task != nullptr) {
+            held = std::move(task);
+        }
+    }
+    ASSERT_NE(held, nullptr);
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
+
+    config::pipeline_query_worker_cap = 8;
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
 
     q.close();
 }
