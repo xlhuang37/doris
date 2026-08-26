@@ -310,7 +310,9 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // Soft per-query worker cap for attained-service pipeline scheduling. When > 0, a
 // single query holds at most this many pipeline workers concurrently; workers beyond
 // the cap spill to higher-attained queries (anti-starvation / anti-contention knob).
-// Default 8. <= 0 means unbounded.
+// Default 8. <= 0 means unbounded. This is only the default: a query that sets the
+// session variable of the same name to >= 0 uses its own value instead. Both are read
+// on every rebalance pass, so either can be retuned without a restart.
 DEFINE_mInt32(pipeline_query_worker_cap, "8");
 
 // task executor min concurrency per task
