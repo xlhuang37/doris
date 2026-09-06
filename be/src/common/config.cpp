@@ -1649,7 +1649,7 @@ DEFINE_mInt32(lz4_compression_block_size, "262144");
 
 DEFINE_mBool(enable_pipeline_task_leakage_detect, "false");
 
-DEFINE_mBool(enable_serial_pipeline_scheduler, "false");
+DEFINE_mBool(enable_serial_pipeline_scheduler, "true");
 
 DEFINE_mInt32(check_score_rounds_num, "1000");
 
