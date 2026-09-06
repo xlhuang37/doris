@@ -17,6 +17,7 @@
 
 #include "exec/pipeline/dependency.h"
 
+#include <limits>
 #include <memory>
 #include <mutex>
 
@@ -196,6 +197,9 @@ void LocalExchangeSharedState::sub_running_source_operators() {
 LocalExchangeSharedState::LocalExchangeSharedState(int num_instances) {
     source_deps.resize(num_instances, nullptr);
     mem_counters.resize(num_instances, nullptr);
+    if (config::enable_serial_pipeline_scheduler) {
+        _buffer_mem_limit = std::numeric_limits<size_t>::max();
+    }
 }
 
 MutableColumns AggSharedState::_get_keys_hash_table() {

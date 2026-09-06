@@ -153,4 +153,44 @@ TEST(SerialDispatchStateTest, IndependentPipelinesUseFragmentThenId) {
     EXPECT_EQ(cur->pipeline_id, 1);
 }
 
+// Intermediate fragment: exchange source feeds an exchange sink in the same fragment.
+// The sink must not delay the source (Kahn: source first), or nothing is eligible.
+TEST(SerialDispatchStateTest, SameFragmentExchangeSourceNotBlockedByOwnSink) {
+    SerialDispatchState state;
+    std::map<PipelineId, std::vector<PipelineId>> dag;
+    dag[1] = {0};
+    state.register_fragment(make_fragment(
+            1, 100, 0, {{0, true, false}, {1, false, true}}, dag));
+    auto cur = state.current();
+    ASSERT_TRUE(cur.has_value());
+    EXPECT_EQ(cur->fragment_id, 0);
+    EXPECT_EQ(cur->pipeline_id, 0);
+
+    state.on_pipeline_finished({make_qid(1), 0, 0});
+    cur = state.current();
+    ASSERT_TRUE(cur.has_value());
+    EXPECT_EQ(cur->pipeline_id, 1);
+}
+
+// A downstream fragment's exchange source waits for another fragment's sink, not its own.
+TEST(SerialDispatchStateTest, OtherFragmentSinkDelaysExchangeSource) {
+    SerialDispatchState state;
+    std::map<PipelineId, std::vector<PipelineId>> dag;
+    dag[1] = {0};
+    state.register_fragment(make_fragment(
+            1, 100, 1, {{0, true, false}, {1, false, true}}, dag));
+    // Producer fragment with a local exchange sink.
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, true}}, {}));
+    auto cur = state.current();
+    ASSERT_TRUE(cur.has_value());
+    EXPECT_EQ(cur->fragment_id, 0);
+    EXPECT_EQ(cur->pipeline_id, 0);
+
+    state.on_pipeline_finished({make_qid(1), 0, 0});
+    cur = state.current();
+    ASSERT_TRUE(cur.has_value());
+    EXPECT_EQ(cur->fragment_id, 1);
+    EXPECT_EQ(cur->pipeline_id, 0);
+}
+
 } // namespace doris
