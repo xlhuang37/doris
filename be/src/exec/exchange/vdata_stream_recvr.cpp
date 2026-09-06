@@ -17,6 +17,8 @@
 
 #include "exec/exchange/vdata_stream_recvr.h"
 
+#include "common/config.h"
+
 #include <fmt/format.h>
 #include <gen_cpp/Metrics_types.h>
 #include <gen_cpp/Types_types.h>
@@ -474,7 +476,8 @@ void VDataStreamRecvr::SenderQueue::add_blocks_memory_usage(int64_t size) {
     DCHECK(size >= 0);
     _recvr->_mem_tracker->consume(size);
     _queue_mem_tracker->consume(size);
-    if (_local_channel_dependency && exceeds_limit()) {
+    if (_local_channel_dependency && exceeds_limit() &&
+        !config::enable_serial_pipeline_scheduler) {
         _local_channel_dependency->block();
     }
 }

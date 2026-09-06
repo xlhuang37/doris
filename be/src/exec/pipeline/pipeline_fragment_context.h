@@ -91,6 +91,9 @@ public:
 
     void decrement_running_task(PipelineId pipeline_id);
 
+    void record_pipeline_wallclock(PipelineId pipeline_id, int64_t start_ns, int64_t end_ns,
+                                   int64_t elapsed_ns);
+
     uint32_t rec_cte_stage() const { return _rec_cte_stage; }
     void set_rec_cte_stage(uint32_t stage) { _rec_cte_stage = stage; }
 

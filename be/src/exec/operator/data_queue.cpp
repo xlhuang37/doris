@@ -19,6 +19,8 @@
 
 #include <glog/logging.h>
 
+#include "common/config.h"
+
 #include <algorithm>
 #include <utility>
 
@@ -51,7 +53,8 @@ bool SubQueue::try_push(std::unique_ptr<Block> block, std::atomic_uint32_t& tota
     bytes_in_queue += block->allocated_bytes();
     blocks.emplace_back(std::move(block));
     blocks_in_queue += 1;
-    if (static_cast<int64_t>(blocks.size()) > max_blocks_in_queue.load()) {
+    if (static_cast<int64_t>(blocks.size()) > max_blocks_in_queue.load() &&
+        !config::enable_serial_pipeline_scheduler) {
         sink_dependency->block();
     }
     return true;
