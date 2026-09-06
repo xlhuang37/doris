@@ -45,6 +45,10 @@ struct SerialPipelineInfo {
     PipelineId pipeline_id = 0;
     bool is_exchange_source = false;
     bool is_exchange_sink = false;
+    // ExchangeSource recvr plan node id. -1 if not an exchange source.
+    int exchange_node_id = -1;
+    // ExchangeSink dest plan node id. -1 if not an exchange sink.
+    int dest_node_id = -1;
 };
 
 struct SerialFragmentInfo {
@@ -102,6 +106,8 @@ private:
         bool finished = false;
         bool is_exchange_source = false;
         bool is_exchange_sink = false;
+        int exchange_node_id = -1;
+        int dest_node_id = -1;
         int indegree = 0;
         std::vector<PipelineKey> successors;
         int64_t wallclock_start_ns = 0;
@@ -110,16 +116,14 @@ private:
     struct QueryState {
         int64_t arrival_ns = 0;
         bool query_finished = false;
-        int unfinished_exchange_sinks = 0;
         std::map<std::pair<int, PipelineId>, PipelineState> pipelines;
     };
 
     bool _is_eligible(const TUniqueId& query_id, const std::pair<int, PipelineId>& pip_key,
                       const QueryState& qs) const;
-    // True if some other fragment of this query still has an unfinished exchange sink.
-    // Same-fragment sinks must not delay this source: they often depend on it (repartition).
-    bool _has_unfinished_exchange_sink_in_other_fragment(
-            const QueryState& qs, int fragment_id) const;
+    // True if a local unfinished exchange sink sends to this recvr (dest_node_id match).
+    bool _has_unfinished_sink_to(const QueryState& qs, int exchange_node_id,
+                                 const std::pair<int, PipelineId>& self) const;
     std::optional<PipelineKey> _pick_ready_in_query(const TUniqueId& query_id) const;
     QueryState* _find_query(const TUniqueId& query_id);
     const QueryState* _find_query(const TUniqueId& query_id) const;
