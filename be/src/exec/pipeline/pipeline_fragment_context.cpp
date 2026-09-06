@@ -1829,13 +1829,19 @@ Status PipelineFragmentContext::submit() {
             SerialPipelineInfo pinfo;
             pinfo.pipeline_id = pipeline->id();
             if (!pipeline->operators().empty()) {
-                pinfo.is_exchange_source =
-                        dynamic_cast<ExchangeSourceOperatorX*>(pipeline->operators().front().get()) !=
-                        nullptr;
+                auto* src = dynamic_cast<ExchangeSourceOperatorX*>(
+                        pipeline->operators().front().get());
+                if (src != nullptr) {
+                    pinfo.is_exchange_source = true;
+                    pinfo.exchange_node_id = src->node_id();
+                }
             }
             if (pipeline->sink()) {
-                pinfo.is_exchange_sink =
-                        dynamic_cast<ExchangeSinkOperatorX*>(pipeline->sink()) != nullptr;
+                auto* sink = dynamic_cast<ExchangeSinkOperatorX*>(pipeline->sink());
+                if (sink != nullptr) {
+                    pinfo.is_exchange_sink = true;
+                    pinfo.dest_node_id = sink->dest_node_id();
+                }
             }
             info.pipelines.push_back(pinfo);
         }

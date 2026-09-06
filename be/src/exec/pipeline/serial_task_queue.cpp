@@ -64,16 +64,18 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
         });
     }
 
-    bool added_exchange_sink = false;
+    bool added_matching_sink = false;
     for (const auto& pinfo : info.pipelines) {
         auto pip_key = std::make_pair(info.fragment_id, pinfo.pipeline_id);
         auto [pit, pip_inserted] = qs.pipelines.try_emplace(pip_key);
         PipelineState& ps = pit->second;
         ps.is_exchange_source = pinfo.is_exchange_source;
         ps.is_exchange_sink = pinfo.is_exchange_sink;
-        if (pip_inserted && pinfo.is_exchange_sink) {
-            qs.unfinished_exchange_sinks++;
-            added_exchange_sink = true;
+        ps.exchange_node_id = pinfo.exchange_node_id;
+        ps.dest_node_id = pinfo.dest_node_id;
+        if (pip_inserted && pinfo.is_exchange_sink && _current.has_value() &&
+            _current->query_id == info.query_id) {
+            added_matching_sink = true;
         }
     }
 
@@ -94,12 +96,19 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
                     PipelineKey {info.query_id, info.fragment_id, downstream});
         }
     }
-    // Consumer fragment may have become current before the local producer arrived.
-    // Yield so the exchange sink can run first and avoid a recvr-buffer deadlock.
-    if (added_exchange_sink && _current.has_value() && _current->query_id == info.query_id) {
+    // Consumer may have become current before a local producer that sends to it arrived.
+    // Yield only if a newly registered sink actually targets the current source's recvr.
+    if (added_matching_sink && _current.has_value() && _current->query_id == info.query_id) {
         auto cur_it = qs.pipelines.find(std::make_pair(_current->fragment_id, _current->pipeline_id));
-        if (cur_it != qs.pipelines.end() && cur_it->second.is_exchange_source) {
-            _current.reset();
+        if (cur_it != qs.pipelines.end() && cur_it->second.is_exchange_source &&
+            cur_it->second.exchange_node_id >= 0) {
+            const int recvr = cur_it->second.exchange_node_id;
+            for (const auto& pinfo : info.pipelines) {
+                if (pinfo.is_exchange_sink && pinfo.dest_node_id == recvr) {
+                    _current.reset();
+                    break;
+                }
+            }
         }
     }
     advance();
@@ -120,9 +129,6 @@ void SerialDispatchState::on_pipeline_finished(const PipelineKey& key) {
         return;
     }
     ps.finished = true;
-    if (ps.is_exchange_sink && qs->unfinished_exchange_sinks > 0) {
-        qs->unfinished_exchange_sinks--;
-    }
     for (const auto& succ : ps.successors) {
         auto* succ_qs = _find_query(succ.query_id);
         if (succ_qs == nullptr) {
@@ -166,18 +172,21 @@ bool SerialDispatchState::_is_eligible(const TUniqueId& query_id,
     if (ps.finished || ps.indegree > 0) {
         return false;
     }
-    if (ps.is_exchange_source &&
-        _has_unfinished_exchange_sink_in_other_fragment(qs, pip_key.first)) {
+    if (ps.is_exchange_source && ps.exchange_node_id >= 0 &&
+        _has_unfinished_sink_to(qs, ps.exchange_node_id, pip_key)) {
         return false;
     }
     (void)query_id;
     return true;
 }
 
-bool SerialDispatchState::_has_unfinished_exchange_sink_in_other_fragment(
-        const QueryState& qs, int fragment_id) const {
+bool SerialDispatchState::_has_unfinished_sink_to(const QueryState& qs, int exchange_node_id,
+                                                  const std::pair<int, PipelineId>& self) const {
     for (const auto& [other_key, other_ps] : qs.pipelines) {
-        if (!other_ps.finished && other_ps.is_exchange_sink && other_key.first != fragment_id) {
+        if (other_key == self || other_ps.finished || !other_ps.is_exchange_sink) {
+            continue;
+        }
+        if (other_ps.dest_node_id == exchange_node_id) {
             return true;
         }
     }
