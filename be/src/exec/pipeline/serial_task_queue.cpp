@@ -166,11 +166,22 @@ bool SerialDispatchState::_is_eligible(const TUniqueId& query_id,
     if (ps.finished || ps.indegree > 0) {
         return false;
     }
-    if (ps.is_exchange_source && qs.unfinished_exchange_sinks > 0) {
+    if (ps.is_exchange_source &&
+        _has_unfinished_exchange_sink_in_other_fragment(qs, pip_key.first)) {
         return false;
     }
     (void)query_id;
     return true;
+}
+
+bool SerialDispatchState::_has_unfinished_exchange_sink_in_other_fragment(
+        const QueryState& qs, int fragment_id) const {
+    for (const auto& [other_key, other_ps] : qs.pipelines) {
+        if (!other_ps.finished && other_ps.is_exchange_sink && other_key.first != fragment_id) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::optional<PipelineKey> SerialDispatchState::_pick_ready_in_query(const TUniqueId& query_id) const {
