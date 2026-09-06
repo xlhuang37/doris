@@ -742,7 +742,8 @@ public:
     }
 
     void add_total_mem_usage(size_t delta) {
-        if (cast_set<int64_t>(mem_usage.fetch_add(delta) + delta) > _buffer_mem_limit) {
+        if (cast_set<int64_t>(mem_usage.fetch_add(delta) + delta) > _buffer_mem_limit &&
+            !config::enable_serial_pipeline_scheduler) {
             sink_deps.front()->block();
         }
     }
