@@ -169,6 +169,7 @@ public:
     void stop_if_finished();
 
     virtual PipelineId pipeline_id() const { return _pipeline->id(); }
+    TUniqueId query_id() const { return _query_id; }
     [[nodiscard]] size_t get_revocable_size() const;
     [[nodiscard]] Status revoke_memory(const std::shared_ptr<SpillContext>& spill_context);
 
