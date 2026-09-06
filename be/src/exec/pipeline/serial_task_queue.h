@@ -116,6 +116,10 @@ private:
 
     bool _is_eligible(const TUniqueId& query_id, const std::pair<int, PipelineId>& pip_key,
                       const QueryState& qs) const;
+    // True if some other fragment of this query still has an unfinished exchange sink.
+    // Same-fragment sinks must not delay this source: they often depend on it (repartition).
+    bool _has_unfinished_exchange_sink_in_other_fragment(
+            const QueryState& qs, int fragment_id) const;
     std::optional<PipelineKey> _pick_ready_in_query(const TUniqueId& query_id) const;
     QueryState* _find_query(const TUniqueId& query_id);
     const QueryState* _find_query(const TUniqueId& query_id) const;
