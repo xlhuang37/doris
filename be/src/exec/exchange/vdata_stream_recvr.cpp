@@ -17,6 +17,8 @@
 
 #include "exec/exchange/vdata_stream_recvr.h"
 
+#include "common/config.h"
+
 #include <fmt/format.h>
 #include <gen_cpp/Metrics_types.h>
 #include <gen_cpp/Types_types.h>
@@ -474,7 +476,8 @@ void VDataStreamRecvr::SenderQueue::add_blocks_memory_usage(int64_t size) {
     DCHECK(size >= 0);
     _recvr->_mem_tracker->consume(size);
     _queue_mem_tracker->consume(size);
-    if (_local_channel_dependency && exceeds_limit()) {
+    if (_local_channel_dependency && exceeds_limit() &&
+        !config::enable_serial_pipeline_scheduler) {
         _local_channel_dependency->block();
     }
 }
@@ -489,15 +492,24 @@ void VDataStreamRecvr::SenderQueue::sub_blocks_memory_usage(int64_t size) {
 }
 
 bool VDataStreamRecvr::SenderQueue::exceeds_limit() {
+    if (config::enable_serial_pipeline_scheduler) {
+        return false;
+    }
     const size_t queue_byte_size = _queue_mem_tracker->consumption();
     return _recvr->queue_exceeds_limit(queue_byte_size);
 }
 
 bool VDataStreamRecvr::exceeds_limit(size_t block_byte_size) {
+    if (config::enable_serial_pipeline_scheduler) {
+        return false;
+    }
     return _mem_tracker->consumption() + block_byte_size > config::exchg_node_buffer_size_bytes;
 }
 
 bool VDataStreamRecvr::queue_exceeds_limit(size_t queue_byte_size) const {
+    if (config::enable_serial_pipeline_scheduler) {
+        return false;
+    }
     return queue_byte_size >= _sender_queue_mem_limit;
 }
 
