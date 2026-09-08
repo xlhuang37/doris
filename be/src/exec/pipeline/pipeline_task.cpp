@@ -50,6 +50,7 @@
 #include "runtime/workload_group/workload_group_manager.h"
 #include "util/defer_op.h"
 #include "util/mem_info.h"
+#include "util/time.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -241,6 +242,7 @@ void PipelineTask::_init_profile() {
 
     static const char* exec_time = "ExecuteTime";
     _exec_timer = ADD_TIMER(_task_profile, exec_time);
+    _wall_clock_timer = ADD_TIMER(_task_profile, "WallClockTime");
     _prepare_timer = ADD_CHILD_TIMER(_task_profile, "PrepareTime", exec_time);
     _open_timer = ADD_CHILD_TIMER(_task_profile, "OpenTime", exec_time);
     _get_block_timer = ADD_CHILD_TIMER(_task_profile, "GetBlockTime", exec_time);
@@ -521,6 +523,11 @@ Status PipelineTask::execute(bool* done) {
 
     SCOPED_TIMER(_task_profile->total_time_counter());
     SCOPED_TIMER(_exec_timer);
+    if (_exec_wallclock_start_ns == 0) {
+        _exec_wallclock_start_ns = MonotonicNanos();
+        _task_profile->add_info_string("WallClockStartNs",
+                                       std::to_string(_exec_wallclock_start_ns));
+    }
 
     if (!_wake_up_early) {
         RETURN_IF_ERROR(_prepare());
@@ -915,6 +922,13 @@ Status PipelineTask::close(Status exec_status, bool close_sink) {
 
     if (close_sink && _opened) {
         _task_profile->add_info_string("WakeUpEarly", std::to_string(_wake_up_early.load()));
+        if (_exec_wallclock_start_ns > 0) {
+            const int64_t end_ns = MonotonicNanos();
+            const int64_t elapsed =
+                    end_ns >= _exec_wallclock_start_ns ? end_ns - _exec_wallclock_start_ns : 0;
+            COUNTER_SET(_wall_clock_timer, elapsed);
+            _task_profile->add_info_string("WallClockEndNs", std::to_string(end_ns));
+        }
         _fresh_profile_counter();
     }
 
