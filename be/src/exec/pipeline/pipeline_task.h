@@ -230,6 +230,8 @@ private:
     RuntimeProfile::Counter* _prepare_timer = nullptr;
     RuntimeProfile::Counter* _open_timer = nullptr;
     RuntimeProfile::Counter* _exec_timer = nullptr;
+    RuntimeProfile::Counter* _wall_clock_timer = nullptr;
+    int64_t _exec_wallclock_start_ns = 0;
     RuntimeProfile::Counter* _get_block_timer = nullptr;
     RuntimeProfile::Counter* _get_block_counter = nullptr;
     RuntimeProfile::Counter* _sink_timer = nullptr;
