@@ -266,6 +266,8 @@ public:
 
         // Nested SCOPED_TIMER on the same counter counts as one window. Each outermost
         // start/stop (including after a pipeline task blocks and is rescheduled) is stored.
+        // Timestamps use MonotonicNanos() so they are comparable with pipeline/task WallClockStartNs
+        // and WallClockEndNs.
         void mark_start() {
             if (!_track_wallclock.load(std::memory_order_acquire)) {
                 return;
@@ -276,7 +278,7 @@ public:
             }
             std::lock_guard<std::mutex> l(tracker->mutex);
             if (tracker->nest_depth++ == 0) {
-                tracker->starts.push_back(GetCurrentTimeNanos());
+                tracker->starts.push_back(MonotonicNanos());
             }
         }
 
@@ -293,7 +295,7 @@ public:
                 return;
             }
             if (--tracker->nest_depth == 0) {
-                tracker->ends.push_back(GetCurrentTimeNanos());
+                tracker->ends.push_back(MonotonicNanos());
             }
         }
 
