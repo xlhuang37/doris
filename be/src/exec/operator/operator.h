@@ -245,6 +245,7 @@ public:
 
     RuntimeProfile::Counter* exec_time_counter() { return _exec_timer; }
     RuntimeProfile::Counter* memory_used_counter() { return _memory_used_counter; }
+    void emit_exec_time_wallclock(RuntimeProfile* task_profile) const;
     OperatorXBase* parent() { return _parent; }
     RuntimeState* state() { return _state; }
     [[nodiscard]] const BlockBudget& block_budget() const { return _budget; }
@@ -524,6 +525,7 @@ public:
     RuntimeProfile::Counter* rows_input_counter() { return _rows_input_counter; }
     RuntimeProfile::Counter* exec_time_counter() { return _exec_timer; }
     RuntimeProfile::Counter* memory_used_counter() { return _memory_used_counter; }
+    void emit_exec_time_wallclock(RuntimeProfile* task_profile) const;
 
     virtual std::vector<Dependency*> dependencies() const { return {nullptr}; }
 

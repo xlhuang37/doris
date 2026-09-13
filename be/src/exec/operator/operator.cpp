@@ -105,6 +105,28 @@ class RuntimeState;
 
 namespace doris {
 
+namespace {
+void append_exec_time_wallclock(RuntimeProfile::Counter* exec_timer, RuntimeProfile* common_profile,
+                                RuntimeProfile* task_profile, const std::string& op_name) {
+    if (exec_timer == nullptr || !exec_timer->is_wallclock_tracking()) {
+        return;
+    }
+    const auto starts = RuntimeProfile::Counter::join_ns(exec_timer->wallclock_starts_ns());
+    const auto ends = RuntimeProfile::Counter::join_ns(exec_timer->wallclock_ends_ns());
+    if (starts.empty()) {
+        return;
+    }
+    if (common_profile != nullptr) {
+        common_profile->add_info_string("ExecTimeStart", starts);
+        common_profile->add_info_string("ExecTimeEnd", ends);
+    }
+    if (task_profile != nullptr) {
+        task_profile->add_info_string(fmt::format("{} ExecTimeStart", op_name), starts);
+        task_profile->add_info_string(fmt::format("{} ExecTimeEnd", op_name), ends);
+    }
+}
+} // namespace
+
 Status OperatorBase::close(RuntimeState* state) {
     if (_is_closed) {
         return Status::OK();
@@ -302,6 +324,18 @@ Status PipelineXLocalStateBase::filter_block(const VExprContextSPtrs& expr_conte
 bool PipelineXLocalStateBase::is_blockable() const {
     return std::any_of(_projections.begin(), _projections.end(),
                        [&](VExprContextSPtr expr) -> bool { return expr->is_blockable(); });
+}
+
+void PipelineXLocalStateBase::emit_exec_time_wallclock(RuntimeProfile* task_profile) const {
+    const auto* profile = _operator_profile.get();
+    append_exec_time_wallclock(_exec_timer, _common_profile.get(), task_profile,
+                               profile != nullptr ? profile->name() : "UnknownOperator");
+}
+
+void PipelineXSinkLocalStateBase::emit_exec_time_wallclock(RuntimeProfile* task_profile) const {
+    append_exec_time_wallclock(
+            _exec_timer, _common_profile, task_profile,
+            _operator_profile != nullptr ? _operator_profile->name() : "UnknownSink");
 }
 
 Status OperatorXBase::do_projections(RuntimeState* state, Block* origin_block,
@@ -561,6 +595,7 @@ Status PipelineXLocalState<SharedStateArg>::init(RuntimeState* state, LocalState
     _open_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "OpenTime", 2);
     _close_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "CloseTime", 2);
     _exec_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "ExecTime", 1);
+    _exec_timer->enable_wallclock_tracking();
     _output_block_bytes_counter =
             ADD_COUNTER_WITH_LEVEL(_common_profile, "OutputBlockBytes", TUnit::BYTES, 1);
     _max_output_block_bytes_counter =
@@ -670,6 +705,7 @@ Status PipelineXSinkLocalState<SharedState>::init(RuntimeState* state, LocalSink
     _open_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "OpenTime", 2);
     _close_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "CloseTime", 2);
     _exec_timer = ADD_TIMER_WITH_LEVEL(_common_profile, "ExecTime", 1);
+    _exec_timer->enable_wallclock_tracking();
     _memory_used_counter =
             _common_profile->AddHighWaterMarkCounter("MemoryUsage", TUnit::BYTES, "", 1);
     _common_profile->add_info_string("IsColocate",
