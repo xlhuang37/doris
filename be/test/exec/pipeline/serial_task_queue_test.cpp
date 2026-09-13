@@ -131,18 +131,26 @@ TEST(SerialDispatchStateTest, DelayExchangeSourceUntilSinkFinishes) {
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 1);
 
+    const PipelineKey source_key {make_qid(1), 1, 0};
+    state.mark_wallclock_start(source_key, 1000);
+    EXPECT_EQ(state.wallclock_start_ns(source_key), 1000);
+
     // Local producer arrives: yield the source so the sink can finish first.
     state.register_fragment(make_fragment(1, 100, 0, {{0, false, true, -1, 10}}, {}));
     cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 0);
     EXPECT_EQ(cur->pipeline_id, 0);
+    EXPECT_EQ(state.wallclock_start_ns(source_key), 0);
 
     state.on_pipeline_finished({make_qid(1), 0, 0});
     cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 1);
     EXPECT_EQ(cur->pipeline_id, 0);
+
+    state.mark_wallclock_start(source_key, 2000);
+    EXPECT_EQ(state.wallclock_start_ns(source_key), 2000);
 }
 
 TEST(SerialDispatchStateTest, IndependentPipelinesUseFragmentThenId) {
