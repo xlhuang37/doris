@@ -929,6 +929,14 @@ Status PipelineTask::close(Status exec_status, bool close_sink) {
             COUNTER_SET(_wall_clock_timer, elapsed);
             _task_profile->add_info_string("WallClockEndNs", std::to_string(end_ns));
         }
+        for (auto& op : _operators) {
+            if (auto* local_state = _state->get_local_state(op->operator_id())) {
+                local_state->emit_exec_time_wallclock(_task_profile.get());
+            }
+        }
+        if (auto* sink_state = _state->get_sink_local_state()) {
+            sink_state->emit_exec_time_wallclock(_task_profile.get());
+        }
         _fresh_profile_counter();
     }
 

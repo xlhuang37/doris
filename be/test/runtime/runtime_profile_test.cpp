@@ -558,4 +558,49 @@ TEST(RuntimeProfileTest, TestGetChild) {
     ASSERT_EQ(child2, root.get_child("Child2"));
 }
 
+TEST(RuntimeProfileTest, ExecTimeWallclock) {
+    RuntimeProfile profile("CommonCounters");
+    RuntimeProfile::Counter* exec_timer = ADD_TIMER(&profile, "ExecTime");
+    exec_timer->enable_wallclock_tracking();
+    EXPECT_TRUE(exec_timer->wallclock_starts_ns().empty());
+    EXPECT_TRUE(exec_timer->wallclock_ends_ns().empty());
+
+    {
+        SCOPED_TIMER(exec_timer);
+        {
+            // Nested timer on the same counter should not open a second window.
+            SCOPED_TIMER(exec_timer);
+        }
+    }
+    {
+        SCOPED_TIMER(exec_timer);
+    }
+    const auto starts = exec_timer->wallclock_starts_ns();
+    const auto ends = exec_timer->wallclock_ends_ns();
+    ASSERT_EQ(starts.size(), 2);
+    ASSERT_EQ(ends.size(), 2);
+    EXPECT_LE(starts[0], ends[0]);
+    EXPECT_LE(starts[1], ends[1]);
+    EXPECT_GE(starts[1], ends[0]);
+
+    std::stringstream ss;
+    profile.pretty_print(&ss);
+    const std::string printed = ss.str();
+    EXPECT_NE(printed.find("ExecTime"), std::string::npos);
+    EXPECT_NE(printed.find("start:"), std::string::npos);
+    EXPECT_NE(printed.find("end:"), std::string::npos);
+
+    RuntimeProfile task_profile("PipelineTask(index=0)");
+    task_profile.add_info_string("HASH_JOIN_OPERATOR ExecTimeStart",
+                                 RuntimeProfile::Counter::join_ns(starts));
+    task_profile.add_info_string("HASH_JOIN_OPERATOR ExecTimeEnd",
+                                 RuntimeProfile::Counter::join_ns(ends));
+    ss = std::stringstream();
+    task_profile.pretty_print(&ss);
+    const std::string task_printed = ss.str();
+    EXPECT_NE(task_printed.find("HASH_JOIN_OPERATOR ExecTimeStart"), std::string::npos);
+    EXPECT_NE(task_printed.find("HASH_JOIN_OPERATOR ExecTimeEnd"), std::string::npos);
+    EXPECT_NE(task_printed.find(","), std::string::npos);
+}
+
 } // namespace doris
