@@ -105,6 +105,10 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
             const int recvr = cur_it->second.exchange_node_id;
             for (const auto& pinfo : info.pipelines) {
                 if (pinfo.is_exchange_sink && pinfo.dest_node_id == recvr) {
+                    // First take() may have already stamped start while this source was
+                    // current with no producer registered. Drop it so the next take()
+                    // after the sink finishes records the real start.
+                    cur_it->second.wallclock_start_ns = 0;
                     _current.reset();
                     break;
                 }
