@@ -44,6 +44,7 @@
 #include "core/binary_cast.hpp"
 #include "util/pretty_printer.h"
 #include "util/stopwatch.hpp"
+#include "util/time.h"
 
 namespace doris {
 #include "common/compile_check_begin.h"
@@ -229,8 +230,19 @@ public:
                                   const std::string& name) const {
             std::ostream& stream = *s;
             stream << prefix << "   - " << name << ": "
-                   << PrettyPrinter::print(_value.load(std::memory_order_relaxed), type())
-                   << std::endl;
+                   << PrettyPrinter::print(_value.load(std::memory_order_relaxed), type());
+            if (is_wallclock_tracking()) {
+                const auto starts = wallclock_starts_ns();
+                const auto ends = wallclock_ends_ns();
+                if (!starts.empty()) {
+                    stream << " (start: " << join_ns(starts);
+                    if (!ends.empty()) {
+                        stream << ", end: " << join_ns(ends);
+                    }
+                    stream << ")";
+                }
+            }
+            stream << std::endl;
         }
 
         TUnit::type type() const { return _type; }
@@ -241,13 +253,95 @@ public:
 
         bool operator==(const Counter& other) const;
 
+        void enable_wallclock_tracking() {
+            if (_wallclock == nullptr) {
+                _wallclock = std::make_unique<WallclockTracker>();
+            }
+            _track_wallclock.store(true, std::memory_order_release);
+        }
+
+        bool is_wallclock_tracking() const {
+            return _track_wallclock.load(std::memory_order_acquire);
+        }
+
+        // Nested SCOPED_TIMER on the same counter counts as one window. Each outermost
+        // start/stop (including after a pipeline task blocks and is rescheduled) is stored.
+        // Timestamps use MonotonicNanos() so they are comparable with pipeline/task WallClockStartNs
+        // and WallClockEndNs.
+        void mark_start() {
+            if (!_track_wallclock.load(std::memory_order_acquire)) {
+                return;
+            }
+            auto* tracker = _wallclock.get();
+            if (tracker == nullptr) {
+                return;
+            }
+            std::lock_guard<std::mutex> l(tracker->mutex);
+            if (tracker->nest_depth++ == 0) {
+                tracker->starts.push_back(MonotonicNanos());
+            }
+        }
+
+        void mark_end() {
+            if (!_track_wallclock.load(std::memory_order_acquire)) {
+                return;
+            }
+            auto* tracker = _wallclock.get();
+            if (tracker == nullptr) {
+                return;
+            }
+            std::lock_guard<std::mutex> l(tracker->mutex);
+            if (tracker->nest_depth == 0) {
+                return;
+            }
+            if (--tracker->nest_depth == 0) {
+                tracker->ends.push_back(MonotonicNanos());
+            }
+        }
+
+        std::vector<int64_t> wallclock_starts_ns() const {
+            if (_wallclock == nullptr) {
+                return {};
+            }
+            std::lock_guard<std::mutex> l(_wallclock->mutex);
+            return _wallclock->starts;
+        }
+
+        std::vector<int64_t> wallclock_ends_ns() const {
+            if (_wallclock == nullptr) {
+                return {};
+            }
+            std::lock_guard<std::mutex> l(_wallclock->mutex);
+            return _wallclock->ends;
+        }
+
+        static std::string join_ns(const std::vector<int64_t>& values) {
+            std::string out;
+            for (size_t i = 0; i < values.size(); i++) {
+                if (i != 0) {
+                    out += ',';
+                }
+                out += std::to_string(values[i]);
+            }
+            return out;
+        }
+
     private:
         friend class RuntimeProfile;
         friend class RuntimeProfileCounterTreeNode;
 
+        struct WallclockTracker {
+            mutable std::mutex mutex;
+            int nest_depth = 0;
+            std::vector<int64_t> starts;
+            std::vector<int64_t> ends;
+        };
+
         std::atomic<int64_t> _value;
         TUnit::type _type;
         int64_t _level;
+        std::atomic<bool> _track_wallclock {false};
+        std::unique_ptr<WallclockTracker> _wallclock;
     };
 
     /// A counter that keeps track of the highest value seen (reporting that
@@ -770,6 +864,7 @@ public:
             return;
         }
         DCHECK_EQ(counter->type(), TUnit::TIME_NS);
+        _counter->mark_start();
         _sw.start();
     }
 
@@ -792,6 +887,7 @@ public:
         }
         _sw.stop();
         UpdateCounter();
+        _counter->mark_end();
     }
 
     // Disable copy constructor and assignment

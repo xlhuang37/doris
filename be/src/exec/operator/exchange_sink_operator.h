@@ -225,6 +225,7 @@ public:
     std::shared_ptr<ExchangeSinkBuffer> get_sink_buffer(RuntimeState* state,
                                                         InstanceLoId sender_ins_id);
     VExprContextSPtrs& tablet_sink_expr_ctxs() { return _tablet_sink_expr_ctxs; }
+    [[nodiscard]] PlanNodeId dest_node_id() const { return _dest_node_id; }
 
 private:
     friend class ExchangeSinkLocalState;

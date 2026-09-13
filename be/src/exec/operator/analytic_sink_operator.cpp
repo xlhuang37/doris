@@ -26,6 +26,7 @@
 
 #include "exec/operator/operator.h"
 #include "exprs/vectorized_agg_fn.h"
+#include "common/config.h"
 #include "runtime/runtime_state.h"
 
 namespace doris {
@@ -465,7 +466,7 @@ void AnalyticSinkLocalState::_refresh_buffer_and_dependency_state(Block* block) 
         _shared_state->blocks_buffer.push(std::move(*block));
         buffer_size = _shared_state->blocks_buffer.size();
     }
-    if (buffer_size > 128) {
+    if (buffer_size > 128 && !config::enable_serial_pipeline_scheduler) {
         // buffer have enough data, could block the sink
         _dependency->block();
     }

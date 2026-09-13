@@ -742,7 +742,11 @@ public:
     }
 
     void add_total_mem_usage(size_t delta) {
-        if (cast_set<int64_t>(mem_usage.fetch_add(delta) + delta) > _buffer_mem_limit) {
+        auto after = mem_usage.fetch_add(delta) + delta;
+        if (config::enable_serial_pipeline_scheduler) {
+            return;
+        }
+        if (cast_set<int64_t>(after) > _buffer_mem_limit) {
             sink_deps.front()->block();
         }
     }
@@ -751,12 +755,18 @@ public:
         auto prev_usage = mem_usage.fetch_sub(delta);
         DCHECK_GE(prev_usage, cast_set<int64_t>(delta))
                 << "prev_usage: " << prev_usage << " delta: " << delta;
+        if (config::enable_serial_pipeline_scheduler) {
+            return;
+        }
         if (cast_set<int64_t>(prev_usage - delta) <= _buffer_mem_limit) {
             sink_deps.front()->set_ready();
         }
     }
 
     void set_low_memory_mode(RuntimeState* state) {
+        if (config::enable_serial_pipeline_scheduler) {
+            return;
+        }
         _buffer_mem_limit = std::min<int64_t>(config::local_exchange_buffer_mem_limit,
                                               state->low_memory_mode_buffer_limit());
     }

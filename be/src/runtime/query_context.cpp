@@ -17,6 +17,8 @@
 
 #include "runtime/query_context.h"
 
+#include "exec/pipeline/task_scheduler.h"
+
 #include <fmt/core.h>
 #include <gen_cpp/FrontendService_types.h>
 #include <gen_cpp/RuntimeProfile_types.h>
@@ -246,6 +248,10 @@ QueryContext::~QueryContext() {
     file_scan_range_params_map.clear();
     obj_pool.clear();
     _merge_controller_handler.reset();
+
+    if (_task_scheduler) {
+        _task_scheduler->notify_query_finished(_query_id);
+    }
 
     DorisMetrics::instance()->query_ctx_cnt->increment(-1);
     // fragment_mgr is nullptr in unittest

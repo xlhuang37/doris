@@ -27,8 +27,10 @@
 #include <utility>
 #include <vector>
 
+#include "common/be_mock_util.h"
 #include "common/status.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "exec/pipeline/serial_task_queue.h"
 #include "exec/pipeline/task_queue.h"
 #include "runtime/query_context.h"
 #include "runtime/workload_group/workload_group.h"
@@ -43,6 +45,9 @@ class ThreadPool;
 namespace doris {
 
 class HybridTaskScheduler;
+class SerialTaskScheduler;
+class PipelineFragmentContext;
+
 class TaskScheduler {
 public:
     virtual ~TaskScheduler();
@@ -53,12 +58,21 @@ public:
 
     virtual void stop();
 
+    virtual Status register_fragment(const SerialFragmentInfo& /*info*/) { return Status::OK(); }
+
+    virtual void notify_pipeline_finished(const TUniqueId& /*query_id*/, int /*fragment_id*/,
+                                          PipelineId /*pipeline_id*/,
+                                          PipelineFragmentContext* /*ctx*/) {}
+
+    virtual void notify_query_finished(const TUniqueId& /*query_id*/) {}
+
     virtual std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() {
         return {{_name, _fix_thread_pool->debug_info()}};
     }
 
-private:
+protected:
     friend class HybridTaskScheduler;
+    friend class SerialTaskScheduler;
 
     TaskScheduler(int core_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
             : _name(std::move(name)),
@@ -66,6 +80,17 @@ private:
               _num_threads(core_num),
               _cgroup_cpu_ctl(cgroup_cpu_ctl) {}
     TaskScheduler() : _task_queue(0), _num_threads(0) {}
+
+    virtual PipelineTaskSPtr _take_task(int index) { return _task_queue.take(index); }
+    virtual Status _push_task(PipelineTaskSPtr task) { return _task_queue.push_back(task); }
+    virtual Status _push_task(PipelineTaskSPtr task, int core_id) {
+        return _task_queue.push_back(task, core_id);
+    }
+    virtual void _close_queue() { _task_queue.close(); }
+    virtual void _update_statistics(PipelineTask* task, int64_t time_spent) {
+        _task_queue.update_statistics(task, time_spent);
+    }
+
     std::string _name;
     std::unique_ptr<ThreadPool> _fix_thread_pool;
 

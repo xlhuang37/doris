@@ -116,6 +116,7 @@
 #include "exec/operator/union_source_operator.h"
 #include "exec/pipeline/dependency.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "exec/pipeline/serial_task_queue.h"
 #include "exec/pipeline/task_scheduler.h"
 #include "exec/runtime_filter/runtime_filter_mgr.h"
 #include "exec/sort/topn_sorter.h"
@@ -127,12 +128,14 @@
 #include "runtime/result_block_buffer.h"
 #include "runtime/result_buffer_mgr.h"
 #include "runtime/runtime_state.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/thread_context.h"
 #include "service/backend_options.h"
 #include "util/client_cache.h"
 #include "util/countdown_latch.h"
 #include "util/debug_util.h"
 #include "util/network_util.h"
+#include "util/time.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -1814,6 +1817,36 @@ Status PipelineFragmentContext::submit() {
     int submit_tasks = 0;
     Status st;
     auto* scheduler = _query_ctx->get_pipe_exec_scheduler();
+    {
+        SerialFragmentInfo info;
+        info.query_id = _query_id;
+        const auto ts = _query_ctx->get_query_arrival_timestamp();
+        info.arrival_ns = static_cast<int64_t>(ts.tv_sec) * NANOS_PER_SEC + ts.tv_nsec;
+        info.fragment_id = _fragment_id;
+        info.dag = _dag;
+        info.pipelines.reserve(_pipelines.size());
+        for (const auto& pipeline : _pipelines) {
+            SerialPipelineInfo pinfo;
+            pinfo.pipeline_id = pipeline->id();
+            if (!pipeline->operators().empty()) {
+                auto* src = dynamic_cast<ExchangeSourceOperatorX*>(
+                        pipeline->operators().front().get());
+                if (src != nullptr) {
+                    pinfo.is_exchange_source = true;
+                    pinfo.exchange_node_id = src->node_id();
+                }
+            }
+            if (pipeline->sink()) {
+                auto* sink = dynamic_cast<ExchangeSinkOperatorX*>(pipeline->sink());
+                if (sink != nullptr) {
+                    pinfo.is_exchange_sink = true;
+                    pinfo.dest_node_id = sink->dest_node_id();
+                }
+            }
+            info.pipelines.push_back(pinfo);
+        }
+        RETURN_IF_ERROR(scheduler->register_fragment(info));
+    }
     for (auto& task : _tasks) {
         for (auto& t : task) {
             st = scheduler->submit(t.first);
@@ -1922,6 +1955,28 @@ bool PipelineFragmentContext::_close_fragment_instance() {
     return !_need_notify_close;
 }
 
+void PipelineFragmentContext::record_pipeline_wallclock(PipelineId pipeline_id, int64_t start_ns,
+                                                        int64_t end_ns, int64_t elapsed_ns) {
+    if (!_runtime_state) {
+        return;
+    }
+    auto profiles = _runtime_state->pipeline_id_to_profile();
+    for (size_t i = 0; i < _pipelines.size() && i < profiles.size(); i++) {
+        if (_pipelines[i]->id() != pipeline_id) {
+            continue;
+        }
+        auto* profile = profiles[i].get();
+        if (profile == nullptr) {
+            break;
+        }
+        auto* counter = ADD_TIMER(profile, "WallClockTime");
+        COUNTER_SET(counter, elapsed_ns);
+        profile->add_info_string("WallClockStartNs", std::to_string(start_ns));
+        profile->add_info_string("WallClockEndNs", std::to_string(end_ns));
+        break;
+    }
+}
+
 void PipelineFragmentContext::decrement_running_task(PipelineId pipeline_id) {
     // If all tasks of this pipeline has been closed, upstream tasks is never needed, and we just make those runnable here
     DCHECK(_pip_id_to_pipeline.contains(pipeline_id));
@@ -1931,6 +1986,8 @@ void PipelineFragmentContext::decrement_running_task(PipelineId pipeline_id) {
                 _pip_id_to_pipeline[dep]->make_all_runnable(pipeline_id);
             }
         }
+        _query_ctx->get_pipe_exec_scheduler()->notify_pipeline_finished(
+                _query_id, _fragment_id, pipeline_id, this);
     }
     bool need_remove = false;
     {
