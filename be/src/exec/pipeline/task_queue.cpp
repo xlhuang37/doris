@@ -312,8 +312,12 @@ void MultiCoreTaskQueue::_admit(const QueryStatePtr& qs) {
     {
         std::lock_guard<std::mutex> l(_admission_mutex);
         if (qs->terminated) {
-            // The QueryContext is already gone; whatever is left in its sub-queue is
-            // dropped when the state is reclaimed.
+            // The QueryContext is already gone, so this query gets no slot. Make sure it
+            // is still tracked for reclamation: it may have been dropped from `_dying`
+            // after it looked drained, and this push put work back into it.
+            if (std::find(_dying.begin(), _dying.end(), qs) == _dying.end()) {
+                _dying.push_back(qs);
+            }
             return;
         }
         std::vector<int> changed;
@@ -336,8 +340,8 @@ void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id) {
     std::vector<QueryStatePtr> reclaimed;
     {
         std::lock_guard<std::mutex> l(_admission_mutex);
-        if (!qs->terminated) {
-            qs->terminated = true;
+        qs->terminated = true;
+        if (std::find(_dying.begin(), _dying.end(), qs) == _dying.end()) {
             _dying.push_back(qs);
         }
         std::vector<int> changed;
