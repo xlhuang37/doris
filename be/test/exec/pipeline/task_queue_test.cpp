@@ -290,6 +290,38 @@ TEST(ClosedTaskQueueTest, TerminateReclaimsWhenPoolIsDone) {
     q.close();
 }
 
+// A push landing on a query whose QueryContext is already gone (which production does not
+// do) gets no slot, and must not strand the pool or the queries that are running.
+TEST(ClosedTaskQueueTest, PushToTerminatedQueryIsHarmless) {
+    ScopedSlotCount slots {1};
+    TestTaskQueue q(4);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    push_tasks(q, qa, 2);
+    // Hold one task in flight so terminate cannot reclaim the state, which is what makes
+    // the push below land on the terminated state instead of creating a fresh query.
+    auto held = q.take(0);
+    ASSERT_NE(held, nullptr);
+    q.notify_query_terminated(qid(0xA));
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+
+    push_tasks(q, qa, 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), -1);
+    EXPECT_EQ(q.take(0), nullptr); // its leftovers never run
+    q.update_statistics(held.get(), 1000);
+
+    // The freed slot is still there for the next query.
+    push_tasks(q, qb, 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 0);
+    auto from_b = q.take(0);
+    ASSERT_NE(from_b, nullptr);
+    EXPECT_EQ(from_b->query_ctx_raw(), qb);
+    q.update_statistics(from_b.get(), 1000);
+
+    q.close();
+}
+
 // Tasks with no QueryContext (e.g. RevokableTask) share the all-zero id and are admitted
 // like any other query rather than getting a private fast path.
 TEST(ClosedTaskQueueTest, SentinelBucketIsAdmittedLikeAQuery) {
