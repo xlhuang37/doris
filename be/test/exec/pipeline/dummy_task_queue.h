@@ -23,7 +23,10 @@
 namespace doris {
 
 class DummyTaskQueue final : public MultiCoreTaskQueue {
-    explicit DummyTaskQueue(int core_size) : MultiCoreTaskQueue(core_size) {}
+    // General-only mode: tests that merely need somewhere to park tasks should not have to
+    // care about the closed-system partition or its slot-count config.
+    explicit DummyTaskQueue(int core_size)
+            : MultiCoreTaskQueue(core_size, Mode::GENERAL_ONLY) {}
     ~DummyTaskQueue() override = default;
     // Use a short wait so unit tests don't block when the queue is empty.
     std::shared_ptr<PipelineTask> take(int core_id) override { return _take(core_id, 1); }
