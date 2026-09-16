@@ -307,13 +307,12 @@ DEFINE_Int32(be_service_threads, "64");
 DEFINE_mInt32(pipeline_status_report_interval, "10");
 DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 
-// Soft per-query worker cap for attained-service pipeline scheduling. When > 0, a
-// single query holds at most this many pipeline workers concurrently; workers beyond
-// the cap spill to higher-attained queries (anti-starvation / anti-contention knob).
-// Default 8. <= 0 means unbounded. This is only the default: a query that sets the
-// session variable of the same name to >= 0 uses its own value instead. Both are read
-// on every rebalance pass, so either can be retuned without a restart.
-DEFINE_mInt32(pipeline_query_worker_cap, "8");
+// Closed-system profiling: number of query slots the pipeline workers are split into.
+// Worker i serves slot i * slots / workers and only that slot's query; queries beyond
+// the slot count wait in arrival order. 32 workers with slots=4 gives 4 queries x 8
+// workers. Clamped to [1, worker count]. Read on every admission event, so a change
+// takes effect as queries arrive and finish.
+DEFINE_mInt32(pipeline_closed_system_slots, "1");
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");

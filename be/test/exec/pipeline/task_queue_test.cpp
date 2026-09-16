@@ -20,67 +20,47 @@
 #include <gen_cpp/Types_types.h>
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
+#include <vector>
 
 #include "common/config.h"
+#include "exec/pipeline/closed_slot_table.h"
 #include "exec/pipeline/pipeline_task.h"
-#include "util/defer_op.h"
 
 namespace doris {
 
-// Tests for the push-based, query-granular pipeline task queue. Ranking is by
-// attained service (PipelineTask::query_runtime_ns()), least first; equal service
-// keeps arrival order. Registry keys are TUniqueId values from query_id(); tests
-// encode a fake QueryContext* into that id and never dereference it.
+// Tests for the closed-system pipeline task queue: the pool's workers are cut into
+// `pipeline_closed_system_slots` equal groups, each group serves exactly one query, and a
+// query that finds every slot taken waits its turn. Registry keys are TUniqueId values
+// from query_id(); tests encode a fake QueryContext* into that id and never dereference it.
 //
-// The central scheduler runs on its own thread; tests use
-// wait_scheduler_settled_for_test() to make its assignment decisions deterministic:
-// it blocks until every event posted before the call (new queries, detach acks,
-// terminate) has been processed and the resulting worker assignments have been
-// dispatched.
-static constexpr uint64_t kSecondNs = 1'000'000'000ULL;
+// The queue reads the slot count when it is constructed and on every admission event, so
+// tests set the config before constructing the queue.
 
 class MockPipelineTask : public PipelineTask {
 public:
-    MockPipelineTask(QueryContext* key, uint64_t runtime_ns, bool inelastic = false)
-            : _key(key), _runtime_ns(runtime_ns), _inelastic(inelastic) {}
+    explicit MockPipelineTask(QueryContext* key) : _key(key) {}
 
-    uint64_t query_runtime_ns() const override { return _runtime_ns; }
     QueryContext* query_ctx_raw() const override { return _key; }
     TUniqueId query_id() const override {
         TUniqueId id;
         id.lo = static_cast<int64_t>(reinterpret_cast<uintptr_t>(_key));
         return id;
     }
-    bool is_inelastic() const override { return _inelastic; }
-    // Defaults to 0, which leaves demand at sub-queue depth for tests that do not care
-    // about the active-task signal (demand is the max of the two).
-    int active_task_num() const override { return _active_task_num; }
-    // Defaults to -1, i.e. no session-level override, so the BE config applies. The
-    // base implementation would go through the QueryContext, which is a fake pointer
-    // here and must never be dereferenced.
-    int query_worker_cap() const override { return _worker_cap; }
-
-    void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
-    void set_active_task_num(int num) { _active_task_num = num; }
-    void set_worker_cap(int cap) { _worker_cap = cap; }
 
 private:
     QueryContext* _key;
-    uint64_t _runtime_ns;
-    bool _inelastic;
-    int _active_task_num = 0;
-    int _worker_cap = -1;
 };
 
-// Use a short empty-queue wait so tests don't block for the production 100ms.
+// Single dequeue attempt with no parking, so tests are deterministic and never sleep.
 class TestTaskQueue final : public MultiCoreTaskQueue {
 public:
-    explicit TestTaskQueue(int core_size, Mode mode = Mode::FULL)
+    explicit TestTaskQueue(int core_size, Mode mode = Mode::CLOSED)
             : MultiCoreTaskQueue(core_size, mode) {}
-    PipelineTaskSPtr take(int core_id) override { return _take(core_id, 1); }
+    PipelineTaskSPtr take(int core_id) override { return _take(core_id, 0); }
 };
 
 namespace {
@@ -92,663 +72,437 @@ TUniqueId qid(uintptr_t id) {
     tid.lo = static_cast<int64_t>(id);
     return tid;
 }
-PipelineTaskSPtr make_task(QueryContext* key, uint64_t runtime_ns) {
-    return std::make_shared<MockPipelineTask>(key, runtime_ns);
+PipelineTaskSPtr make_task(QueryContext* key) {
+    return std::make_shared<MockPipelineTask>(key);
 }
-PipelineTaskSPtr make_inelastic_task(QueryContext* key, uint64_t runtime_ns) {
-    return std::make_shared<MockPipelineTask>(key, runtime_ns, /*inelastic=*/true);
+void push_tasks(TestTaskQueue& q, QueryContext* key, int count) {
+    for (int i = 0; i < count; ++i) {
+        ASSERT_TRUE(q.push_back(make_task(key)).ok());
+    }
 }
-// A task reporting `active` live tasks for its query, i.e. a query whose demand exceeds
-// what is sitting in its sub-queue.
-PipelineTaskSPtr make_task_with_active(QueryContext* key, uint64_t runtime_ns, int active) {
-    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
-    task->set_active_task_num(active);
-    return task;
-}
-// As above, but the query also carries a session-level worker cap.
-PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runtime_ns, int active,
-                                               int cap) {
-    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
-    task->set_active_task_num(active);
-    task->set_worker_cap(cap);
-    return task;
-}
+// Sets the slot count for the duration of a test and restores it afterwards.
+struct ScopedSlotCount {
+    explicit ScopedSlotCount(int32_t slots) : _previous(config::pipeline_closed_system_slots) {
+        config::pipeline_closed_system_slots = slots;
+    }
+    ~ScopedSlotCount() { config::pipeline_closed_system_slots = _previous; }
+
+private:
+    const int32_t _previous;
+};
 } // namespace
 
-// A lower-attained query is staffed before a higher-attained query, regardless of
-// push order: the scheduler assigns the single worker to the 0-runtime query, and
-// the 5s query is only reached through the work-conserving fallback afterwards.
-TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // runtime 0
-    auto* qb = qkey(0xB); // runtime 5s
+// Two queries, eight workers, two slots: each query owns half the pool, and the halves are
+// contiguous ranges of worker ids.
+TEST(ClosedTaskQueueTest, PartitionsWorkersAcrossQueries) {
+    ScopedSlotCount slots {2};
+    TestTaskQueue q(8);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
 
-    // Push the higher-attained query first.
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
+    push_tasks(q, qa, 1);
+    push_tasks(q, qb, 1);
 
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qa);
+    EXPECT_EQ(q.slot_count_for_test(), 2);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), 0);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 4);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 4);
+    for (int worker = 0; worker < 4; ++worker) {
+        EXPECT_EQ(q.slot_of_worker_for_test(worker), 0) << "worker " << worker;
+    }
+    for (int worker = 4; worker < 8; ++worker) {
+        EXPECT_EQ(q.slot_of_worker_for_test(worker), 1) << "worker " << worker;
+    }
 
-    // The assigned query is drained; the fallback picks up the unassigned one.
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qb);
+    // A worker only ever gets tasks of the query its slot points at.
+    auto from_a = q.take(0);
+    ASSERT_NE(from_a, nullptr);
+    EXPECT_EQ(from_a->query_ctx_raw(), qa);
+    q.update_statistics(from_a.get(), 1000);
+
+    auto from_b = q.take(7);
+    ASSERT_NE(from_b, nullptr);
+    EXPECT_EQ(from_b->query_ctx_raw(), qb);
+    q.update_statistics(from_b.get(), 1000);
 
     q.close();
 }
 
-// At equal attained service, cores are dealt greedily in arrival order: the oldest
-// query takes everything it can use before the next one is considered, so with three
-// two-task queries and three workers the split is 2/1/0 in push order.
-TEST(PushBasedTaskQueueTest, EqualAttainedGreedyFcfs) {
-    TestTaskQueue q(3);
+// The experiment this mode exists for: 32 workers over 1, 2, 4, ... queries, each query
+// getting an equal share and never seeing another query's worker.
+TEST(ClosedTaskQueueTest, PartitionMatrixOver32Workers) {
+    for (int32_t slots : {1, 2, 4, 8, 16, 32}) {
+        ScopedSlotCount scoped {slots};
+        TestTaskQueue q(32);
+        for (int32_t query = 1; query <= slots; ++query) {
+            push_tasks(q, qkey(static_cast<uintptr_t>(query)), 2);
+        }
+        ASSERT_EQ(q.slot_count_for_test(), slots);
+        for (int32_t query = 1; query <= slots; ++query) {
+            EXPECT_EQ(q.assigned_workers_for_test(qid(static_cast<uintptr_t>(query))), 32 / slots)
+                    << "slots " << slots << " query " << query;
+        }
+
+        // Drain twice over: no worker ever sees a second query.
+        std::map<int, std::set<QueryContext*>> seen;
+        for (int round = 0; round < 2; ++round) {
+            for (int worker = 0; worker < 32; ++worker) {
+                auto task = q.take(worker);
+                if (task != nullptr) {
+                    seen[worker].insert(task->query_ctx_raw());
+                    q.update_statistics(task.get(), 1000);
+                }
+            }
+        }
+        for (const auto& [worker, queries] : seen) {
+            EXPECT_EQ(queries.size(), 1U) << "slots " << slots << " worker " << worker;
+        }
+        q.close();
+    }
+}
+
+// No stealing and no fallback queue: a worker whose query has nothing runnable idles even
+// when another query has a deep backlog.
+TEST(ClosedTaskQueueTest, WorkerNeverServesAnotherSlot) {
+    ScopedSlotCount slots {2};
+    TestTaskQueue q(8);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    push_tasks(q, qa, 1);
+    push_tasks(q, qb, 1);
+    auto drain_b = q.take(4);
+    ASSERT_NE(drain_b, nullptr);
+    q.update_statistics(drain_b.get(), 1000);
+
+    push_tasks(q, qa, 16);
+    for (int worker = 4; worker < 8; ++worker) {
+        EXPECT_EQ(q.take(worker), nullptr) << "worker " << worker << " must not serve A";
+    }
+    auto from_a = q.take(1);
+    ASSERT_NE(from_a, nullptr);
+    EXPECT_EQ(from_a->query_ctx_raw(), qa);
+    q.update_statistics(from_a.get(), 1000);
+
+    q.close();
+}
+
+// A query that arrives when every slot is taken makes no progress at all until one frees,
+// and slots are handed out in arrival order.
+TEST(ClosedTaskQueueTest, AdmissionIsFifoAndWaitsForASlot) {
+    ScopedSlotCount slots {2};
+    TestTaskQueue q(8);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
     auto* qc = qkey(0xC);
 
-    // All at attained 0, two tasks each.
-    for (auto* key : {qa, qb, qc}) {
-        ASSERT_TRUE(q.push_back(make_task(key, 0)).ok());
-        ASSERT_TRUE(q.push_back(make_task(key, 0)).ok());
-    }
-    q.wait_scheduler_settled_for_test();
+    push_tasks(q, qa, 2);
+    push_tasks(q, qb, 2);
+    push_tasks(q, qc, 2);
 
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xC)), -1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+    for (int worker = 0; worker < 8; ++worker) {
+        auto task = q.take(worker);
+        if (task != nullptr) {
+            EXPECT_NE(task->query_ctx_raw(), qc) << "C holds no slot and must not run";
+            q.update_statistics(task.get(), 1000);
+        }
+    }
+
+    // A is gone: C inherits its slot, and therefore its workers.
+    q.notify_query_terminated(qid(0xA));
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xC)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 4);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 1);
+
+    auto from_c = q.take(0);
+    ASSERT_NE(from_c, nullptr);
+    EXPECT_EQ(from_c->query_ctx_raw(), qc);
+    q.update_statistics(from_c.get(), 1000);
 
     q.close();
 }
 
-// Demand is the query's active task count, not its sub-queue depth: a query with a
-// single queued task but three live tasks (the rest blocked on dependencies elsewhere)
-// is granted three cores, and the trailing query is left to the fallback.
-TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
+// Retuning the slot count at runtime re-partitions the workers at the next admission
+// event. Queries evicted by a shrink go back to the front of the waiting queue.
+TEST(ClosedTaskQueueTest, SlotCountChangeRepartitions) {
+    ScopedSlotCount slots {4};
+    TestTaskQueue q(8);
+    for (uintptr_t query = 1; query <= 4; ++query) {
+        push_tasks(q, qkey(query), 1);
+    }
+    EXPECT_EQ(q.assigned_workers_for_test(qid(1)), 2);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(4)), 3);
+
+    config::pipeline_closed_system_slots = 2;
+    push_tasks(q, qkey(1), 1); // any push re-checks the configured slot count
+    EXPECT_EQ(q.slot_count_for_test(), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(1)), 4);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(3)), -1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(4)), -1);
+    for (int worker = 4; worker < 8; ++worker) {
+        auto task = q.take(worker);
+        if (task != nullptr) {
+            EXPECT_EQ(task->query_ctx_raw(), qkey(2)) << "slot 1 serves query 2 only";
+            q.update_statistics(task.get(), 1000);
+        }
+    }
+
+    config::pipeline_closed_system_slots = 4;
+    push_tasks(q, qkey(1), 1);
+    EXPECT_EQ(q.slot_count_for_test(), 4);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(3)), 2);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(4)), 3);
+
+    q.close();
+}
+
+// A terminated query is reclaimed once the pool has nothing of it left, not before, and a
+// later push starts it over as a fresh query waiting for a slot.
+TEST(ClosedTaskQueueTest, TerminateReclaimsWhenPoolIsDone) {
+    ScopedSlotCount slots {1};
     TestTaskQueue q(4);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
 
-    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/3)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/2)).ok());
-    q.wait_scheduler_settled_for_test();
+    push_tasks(q, qa, 1);
+    EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    // Sub-queue depth alone would have granted A a single core.
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    auto task = q.take(0);
+    ASSERT_NE(task, nullptr);
+    q.notify_query_terminated(qid(0xA));
+    // Still in flight on this worker, so the state has to stay alive.
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+    q.update_statistics(task.get(), 1000);
 
-    q.close();
-}
+    // The next admission event reaps A and gives its slot to B.
+    push_tasks(q, qb, 1);
+    EXPECT_EQ(q.registry_size_for_test(), 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 0);
 
-// Arrival order decides who gets the cores: the same three queries pushed in the
-// opposite order produce the mirrored allocation.
-TEST(PushBasedTaskQueueTest, AllocationAtEqualAttainedIsFifo) {
-    auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
-        TestTaskQueue q(3);
-        for (uintptr_t id : push_order) {
-            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
-            EXPECT_TRUE(q.push_back(make_task(qkey(id), 0)).ok());
-        }
-        q.wait_scheduler_settled_for_test();
-        std::array<int, 3> assigned {};
-        for (size_t i = 0; i < push_order.size(); ++i) {
-            assigned[i] = q.assigned_workers_for_test(qid(push_order[i]));
-        }
-        q.close();
-        return assigned;
-    };
-
-    // Indexed by push position, not by query id: the first pushed always wins.
-    EXPECT_EQ(allocation({0xA, 0xB, 0xC}), (std::array<int, 3> {2, 1, 0}));
-    EXPECT_EQ(allocation({0xC, 0xB, 0xA}), (std::array<int, 3> {2, 1, 0}));
-}
-
-// Least attained is satisfied to its full demand first; leftover cores spill to
-// higher-attained queries, and equal attained among those keeps arrival order.
-TEST(PushBasedTaskQueueTest, AllocationSpillsToHigherAttained) {
-    TestTaskQueue q(3);
-    auto* qa = qkey(0xA); // runtime 0
-    auto* qb = qkey(0xB); // runtime 5s, first of the two higher-attained queries
-    auto* qc = qkey(0xC); // runtime 5s
-
-    // Pushed highest-attained first to show sort order beats arrival order.
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qc, 5 * kSecondNs)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+    // A push after reclaim recreates A, which now waits for a slot.
+    push_tasks(q, qa, 1);
+    EXPECT_EQ(q.registry_size_for_test(), 2);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), -1);
 
     q.close();
 }
 
-// Once settled, repeated scheduler passes with no state change leave the allocation
-// exactly where it was.
-TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
-    TestTaskQueue q(2);
+// A push landing on a query whose QueryContext is already gone (which production does not
+// do) gets no slot, and must not strand the pool or the queries that are running.
+TEST(ClosedTaskQueueTest, PushToTerminatedQueryIsHarmless) {
+    ScopedSlotCount slots {1};
+    TestTaskQueue q(4);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
 
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    }
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    const int a_assigned = q.assigned_workers_for_test(qid(0xA));
-    const int b_assigned = q.assigned_workers_for_test(qid(0xB));
-    EXPECT_EQ(a_assigned, 2);
-    EXPECT_EQ(b_assigned, 0);
-
-    for (int i = 0; i < 3; ++i) {
-        q.wait_scheduler_settled_for_test();
-        EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), a_assigned) << "pass " << i;
-        EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), b_assigned) << "pass " << i;
-    }
-
-    q.close();
-}
-
-// A worker keeps serving its assigned query across takes while that query has demand
-// (locality: steady state generates no reassignments).
-TEST(PushBasedTaskQueueTest, QueryLocality) {
-    TestTaskQueue q(2);
-    auto* qa = qkey(0xA); // attained 0
-    auto* qb = qkey(0xB); // attained 5s
-
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    }
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    // Worker 0 sticks to query A for all three of its tasks before touching B.
-    for (int i = 0; i < 3; ++i) {
-        auto t = q.take(0);
-        ASSERT_NE(t, nullptr);
-        EXPECT_EQ(t->query_ctx_raw(), qa) << "iteration " << i;
-    }
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    EXPECT_EQ(t->query_ctx_raw(), qb);
-
-    q.close();
-}
-
-// A newly arrived lower-attained query pulls the worker off its current
-// higher-attained query: the scheduler overwrites the assignment slot and the
-// worker obeys it on its next take (push-based preemption).
-TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // attained 5s
-    auto* qc = qkey(0xC); // attained 0
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    auto t1 = q.take(0); // worker latches onto A (only query present)
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qa);
-
-    // Lower-attained query C arrives; the scheduler reassigns the worker.
-    ASSERT_TRUE(q.push_back(make_task(qc, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    auto t2 = q.take(0); // preempts to C despite A still having a runnable task
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qc);
-
-    q.close();
-}
-
-// After a running query accumulates more attained service, a fresh zero-attained
-// query is staffed first on the next settled rebalance.
-TEST(PushBasedTaskQueueTest, HigherAttainedYieldsToFresherQuery) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    }
-    q.wait_scheduler_settled_for_test();
-
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qa);
-
-    // A burned 5s of runtime during this slice; B arrives at attained 0.
-    static_cast<MockPipelineTask*>(t1.get())->set_runtime_ns(5 * kSecondNs);
-    q.update_statistics(t1.get(), 1000);
-
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qb);
-
-    // The higher-attained query is still drained through the fallback.
-    auto t3 = q.take(0);
-    ASSERT_NE(t3, nullptr);
-    EXPECT_EQ(t3->query_ctx_raw(), qa);
-
-    q.close();
-}
-
-// A and B start at equal attained service (A arrives first and holds the worker).
-// After A accumulates service, the next settled pass moves the worker to B.
-TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
-
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qa);
-    static_cast<MockPipelineTask*>(t1.get())->set_runtime_ns(5 * kSecondNs);
-    q.update_statistics(t1.get(), 1000);
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
-
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qb);
-
-    q.close();
-}
-
-// pipeline_query_worker_cap bounds a single query even when its demand and the
-// pool are larger; leftover cores spill to the next query.
-TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
-    const int32_t old_cap = config::pipeline_query_worker_cap;
-    config::pipeline_query_worker_cap = 8;
-    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
-    TestTaskQueue q(12);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-
-    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/20)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/5)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 4);
-
-    q.close();
-}
-
-// A query carrying its own pipeline_query_worker_cap session variable is bounded by
-// that value instead of the BE config, and only that query is affected: the query
-// without an override still gets the config's 8.
-TEST(PushBasedTaskQueueTest, SessionWorkerCapOverridesConfig) {
-    const int32_t old_cap = config::pipeline_query_worker_cap;
-    config::pipeline_query_worker_cap = 8;
-    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
-    TestTaskQueue q(12);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-
-    ASSERT_TRUE(q.push_back(make_task_with_active_and_cap(qa, 0, /*active=*/20, /*cap=*/3)).ok());
-    ASSERT_TRUE(q.push_back(make_task_with_active(qb, 0, /*active=*/20)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 8);
-
-    q.close();
-}
-
-// A session cap of 0 means unbounded, so it can also lift a restrictive BE config.
-TEST(PushBasedTaskQueueTest, SessionWorkerCapZeroIsUnbounded) {
-    const int32_t old_cap = config::pipeline_query_worker_cap;
-    config::pipeline_query_worker_cap = 4;
-    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
-    TestTaskQueue q(6);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_task_with_active_and_cap(qa, 0, /*active=*/20, /*cap=*/0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 6);
-
-    q.close();
-}
-
-// The cap is re-read on every rebalance pass, so raising it after the query is already
-// running widens the grant without any restart or re-push.
-TEST(PushBasedTaskQueueTest, WorkerCapChangeTakesEffectAtRuntime) {
-    const int32_t old_cap = config::pipeline_query_worker_cap;
-    config::pipeline_query_worker_cap = 2;
-    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
-    TestTaskQueue q(12);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_task_with_active(qa, 0, /*active=*/20)).ok());
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-
-    // Let every worker run once so the two assigned ones ack their slot write; only
-    // acked workers are eligible to be kept in place or moved by the next pass. The
-    // dequeued task is held (never released), so the query stays non-idle and its
-    // demand stays at the active count.
-    PipelineTaskSPtr held;
-    for (int i = 0; i < 12; ++i) {
-        auto task = q.take(i);
-        if (task != nullptr) {
-            held = std::move(task);
-        }
-    }
+    push_tasks(q, qa, 2);
+    // Hold one task in flight so terminate cannot reclaim the state, which is what makes
+    // the push below land on the terminated state instead of creating a fresh query.
+    auto held = q.take(0);
     ASSERT_NE(held, nullptr);
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
-
-    config::pipeline_query_worker_cap = 8;
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 8);
-
-    q.close();
-}
-
-// Idle + detach does not reclaim a live query. Only terminate + workers_attached==0
-// frees the QueryState. A later push after reclaim recreates it.
-TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    q.update_statistics(t.get(), 1000);
-
-    // Worker observes idle and detaches; the query is still valid so state stays.
-    EXPECT_EQ(q.take(0), nullptr);
-    q.wait_scheduler_settled_for_test();
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
     q.notify_query_terminated(qid(0xA));
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 0);
-
-    // Recreate after reclaim (production will not enqueue after QueryContext dtor).
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     EXPECT_EQ(q.registry_size_for_test(), 1);
-    q.wait_scheduler_settled_for_test();
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qa);
-    q.update_statistics(t2.get(), 1000);
+
+    push_tasks(q, qa, 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), -1);
+    EXPECT_EQ(q.take(0), nullptr); // its leftovers never run
+    q.update_statistics(held.get(), 1000);
+
+    // The freed slot is still there for the next query.
+    push_tasks(q, qb, 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 0);
+    auto from_b = q.take(0);
+    ASSERT_NE(from_b, nullptr);
+    EXPECT_EQ(from_b->query_ctx_raw(), qb);
+    q.update_statistics(from_b.get(), 1000);
 
     q.close();
 }
 
-// Terminate while a worker is still attached: the scheduler writes a null
-// assignment; after the worker acks, the state is reclaimed.
-TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
+// Tasks with no QueryContext (e.g. RevokableTask) share the all-zero id and are admitted
+// like any other query rather than getting a private fast path.
+TEST(ClosedTaskQueueTest, SentinelBucketIsAdmittedLikeAQuery) {
+    ScopedSlotCount slots {1};
+    TestTaskQueue q(4);
+    auto* sentinel = qkey(0);
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
+    push_tasks(q, sentinel, 1);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0)), 4);
 
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    q.update_statistics(t.get(), 1000);
-
-    q.notify_query_terminated(qid(0xA));
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.take(0), nullptr);
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 0);
-
-    q.close();
-}
-
-// Work returning after a temporary drain keeps the same QueryState; idle never
-// starts reclaim for a real query.
-TEST(PushBasedTaskQueueTest, IdleDoesNotTeardownWhileQueryAlive) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    q.update_statistics(t.get(), 1000);
-    q.wait_scheduler_settled_for_test();
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qa);
-    q.update_statistics(t2.get(), 1000);
+    auto task = q.take(2);
+    ASSERT_NE(task, nullptr);
+    EXPECT_EQ(task->query_ctx_raw(), sentinel);
+    q.update_statistics(task.get(), 1000);
 
     q.close();
 }
 
 // release_task (the "task already running elsewhere" re-queue dance) releases the
-// in-flight slot without charging runtime, and the re-queued task is still served.
-TEST(PushBasedTaskQueueTest, ReleaseAndRequeue) {
-    TestTaskQueue q(1);
+// in-flight reference without charging runtime, and the re-queued task stays with its
+// query rather than becoming visible to other slots.
+TEST(ClosedTaskQueueTest, ReleaseAndRequeue) {
+    ScopedSlotCount slots {2};
+    TestTaskQueue q(8);
     auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
+    push_tasks(q, qa, 1);
+    push_tasks(q, qb, 1);
+    auto drain_b = q.take(4);
+    ASSERT_NE(drain_b, nullptr);
+    q.update_statistics(drain_b.get(), 1000);
 
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    q.release_task(t.get());
-    ASSERT_TRUE(q.push_back(t, 0).ok());
+    auto task = q.take(0);
+    ASSERT_NE(task, nullptr);
+    q.release_task(task.get());
+    ASSERT_TRUE(q.push_back(task, 0).ok());
 
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2.get(), t.get());
-    q.update_statistics(t2.get(), 1000);
+    EXPECT_EQ(q.take(5), nullptr); // B's group still cannot see it
+    auto again = q.take(1);
+    ASSERT_NE(again, nullptr);
+    EXPECT_EQ(again.get(), task.get());
+    q.update_statistics(again.get(), 1000);
 
     q.close();
 }
 
-// Degenerate mode (blocking pool): plain shared queue, no scheduler thread, no
-// per-query state; produce/consume and accounting calls are safe.
-TEST(PushBasedTaskQueueTest, GeneralOnlyMode) {
-    TestTaskQueue q(1, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
+// Degenerate mode (blocking pool): one plain shared queue, no partition, no per-query
+// state; produce/consume and accounting calls are safe.
+TEST(ClosedTaskQueueTest, GeneralOnlyMode) {
+    TestTaskQueue q(4, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb)).ok());
+    EXPECT_EQ(q.registry_size_for_test(), 0);
 
-    auto t1 = q.take(0);
+    // Any worker may run anything here.
+    auto t1 = q.take(3);
     ASSERT_NE(t1, nullptr);
     q.update_statistics(t1.get(), 1000);
-    auto t2 = q.take(0);
+    auto t2 = q.take(3);
     ASSERT_NE(t2, nullptr);
     q.release_task(t2.get());
     EXPECT_EQ(q.take(0), nullptr);
 
+    q.notify_query_terminated(qid(0xA)); // no-op in this mode
+
     q.close();
-    EXPECT_FALSE(q.push_back(make_task(qa, 0)).ok());
 }
 
-// "Inelastic first": a single-task pipeline's task outranks a pre-existing backlog
-// from another query, including the worker's own assignment. Even though the worker
-// was assigned to query A (the only query known to the scheduler when it settled),
-// the inelastic task from query B is served first.
-TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // elastic backlog
-    auto* qb = qkey(0xB); // inelastic, higher attained — still served first
+TEST(ClosedTaskQueueTest, CloseRejectsWork) {
+    ScopedSlotCount slots {1};
+    TestTaskQueue q(4);
+    auto* qa = qkey(0xA);
 
-    for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    push_tasks(q, qa, 1);
+    q.close();
+    EXPECT_FALSE(q.push_back(make_task(qa)).ok());
+    EXPECT_EQ(q.take(0), nullptr);
+}
+
+// The partition policy on its own, for the cases that are awkward to reach through the
+// queue: uneven worker counts, clamping, and the order evicted queries come back in.
+TEST(ClosedSlotTableTest, SplitsWorkersEvenlyWhenDivisible) {
+    ClosedSlotTable<int> table(32);
+    std::vector<int> changed;
+    for (int query = 1; query <= 4; ++query) {
+        table.add(query);
     }
-    q.wait_scheduler_settled_for_test(); // worker 0 assigned to A
-
-    ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 5 * kSecondNs)).ok());
-
-    // The inelastic task jumps ahead of A's backlog and of attained-service ranking.
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qb);
-    q.update_statistics(t1.get(), 1000);
-
-    // Elastic work is drained normally afterwards.
-    for (int i = 0; i < 3; ++i) {
-        auto t = q.take(0);
-        ASSERT_NE(t, nullptr);
-        EXPECT_EQ(t->query_ctx_raw(), qa) << "iteration " << i;
-        q.update_statistics(t.get(), 1000);
+    table.rebind(4, &changed);
+    ASSERT_EQ(table.slot_count(), 4);
+    for (int slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(table.workers_of_slot(slot), 8);
     }
-
-    q.close();
+    EXPECT_EQ(table.slot_of_worker(0), 0);
+    EXPECT_EQ(table.slot_of_worker(8), 1);
+    EXPECT_EQ(table.slot_of_worker(31), 3);
+    EXPECT_EQ(table.slot_of_worker(32), -1);
+    EXPECT_EQ(table.slot_of_worker(-1), -1);
 }
 
-// Inelastic tasks keep full per-query accounting; idle does not reclaim, terminate
-// after detach does. A later inelastic push recreates the state.
-TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    EXPECT_EQ(t->query_ctx_raw(), qa);
-    q.update_statistics(t.get(), 1000);
-
-    EXPECT_EQ(q.take(0), nullptr);
-    q.wait_scheduler_settled_for_test();
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
-    q.notify_query_terminated(qid(0xA));
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 0);
-
-    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qa);
-    q.update_statistics(t2.get(), 1000);
-
-    q.close();
-}
-
-// One query mixing both kinds: the inelastic task is served first even if pushed
-// last, everything drains, and the counters reconcile so teardown still happens.
-TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_inelastic_task(qa, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_TRUE(t1->is_inelastic());
-    q.update_statistics(t1.get(), 1000);
-
-    for (int i = 0; i < 2; ++i) {
-        auto t = q.take(0);
-        ASSERT_NE(t, nullptr);
-        EXPECT_FALSE(t->is_inelastic()) << "iteration " << i;
-        q.update_statistics(t.get(), 1000);
+TEST(ClosedSlotTableTest, SpreadsTheRemainderWhenNotDivisible) {
+    ClosedSlotTable<int> table(10);
+    std::vector<int> changed;
+    for (int query = 1; query <= 3; ++query) {
+        table.add(query);
     }
-
-    EXPECT_EQ(q.take(0), nullptr);
-    q.wait_scheduler_settled_for_test();
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
-
-    q.notify_query_terminated(qid(0xA));
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 0);
-
-    q.close();
+    table.rebind(3, &changed);
+    int total = 0;
+    for (int slot = 0; slot < 3; ++slot) {
+        const int workers = table.workers_of_slot(slot);
+        EXPECT_GE(workers, 3);
+        EXPECT_LE(workers, 4);
+        total += workers;
+    }
+    EXPECT_EQ(total, 10); // every worker still belongs to exactly one slot
 }
 
-// Tasks with no QueryContext share one sentinel bucket. Idle does not reclaim it
-// (no QUERY_TERMINATED will ever arrive); the state lives until queue close.
-TEST(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
-    TestTaskQueue q(1);
-    ASSERT_TRUE(q.push_back(make_task(nullptr, 0)).ok());
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
+TEST(ClosedSlotTableTest, AdmitsInArrivalOrderAndIsIdempotent) {
+    ClosedSlotTable<int> table(8);
+    std::vector<int> changed;
+    for (int query = 1; query <= 4; ++query) {
+        table.add(query);
+        table.add(query); // repeated pushes must not re-queue a query
+    }
+    table.rebind(2, &changed);
+    EXPECT_EQ(table.slot_of(1), 0);
+    EXPECT_EQ(table.slot_of(2), 1);
+    EXPECT_EQ(table.slot_of(3), -1);
+    EXPECT_EQ(table.waiting_size(), 2U);
 
-    auto t = q.take(0);
-    ASSERT_NE(t, nullptr);
-    q.update_statistics(t.get(), 1000);
-    EXPECT_EQ(q.take(0), nullptr);
-    q.wait_scheduler_settled_for_test();
-    q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.registry_size_for_test(), 1);
+    changed.clear();
+    EXPECT_EQ(table.remove(1), 0);
+    table.rebind(2, &changed);
+    EXPECT_EQ(changed, std::vector<int> {0});
+    EXPECT_EQ(table.slot_of(3), 0);
 
-    q.close();
+    changed.clear();
+    EXPECT_EQ(table.remove(4), -1); // still waiting, so it vacated no slot
+    table.rebind(2, &changed);
+    EXPECT_TRUE(changed.empty());
+    EXPECT_EQ(table.waiting_size(), 0U);
 }
 
-// Degenerate mode ignores the inelastic flag: everything goes through the one shared
-// queue in FIFO order.
-TEST(PushBasedTaskQueueTest, GeneralOnlyModeIgnoresInelastic) {
-    TestTaskQueue q(1, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
+TEST(ClosedSlotTableTest, ShrinkReturnsOwnersToTheFrontOfTheQueue) {
+    ClosedSlotTable<int> table(8);
+    std::vector<int> changed;
+    for (int query = 1; query <= 4; ++query) {
+        table.add(query);
+    }
+    table.rebind(4, &changed);
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 0)).ok());
+    changed.clear();
+    table.rebind(2, &changed);
+    EXPECT_EQ(table.slot_count(), 2);
+    EXPECT_EQ(table.waiting_size(), 2U);
+    EXPECT_EQ(changed.size(), 2U);
+    EXPECT_EQ(table.workers_of_slot(0), 4);
 
-    // FIFO: the elastic task pushed first comes out first.
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qa);
-    q.update_statistics(t1.get(), 1000);
-
-    auto t2 = q.take(0);
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qb);
-    q.update_statistics(t2.get(), 1000);
-
-    q.close();
+    changed.clear();
+    table.rebind(4, &changed);
+    EXPECT_EQ(table.slot_of(3), 2); // evicted queries return ahead of newer arrivals
+    EXPECT_EQ(table.slot_of(4), 3);
+    EXPECT_EQ(table.waiting_size(), 0U);
 }
 
-// close() rejects further pushes and unblocks takers.
-TEST(PushBasedTaskQueueTest, CloseRejectsWork) {
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    q.close();
-    EXPECT_FALSE(q.push_back(make_task(qa, 0)).ok());
-    EXPECT_EQ(q.take(0), nullptr);
+TEST(ClosedSlotTableTest, ClampsTheRequestedSlotCount) {
+    ClosedSlotTable<int> table(8);
+    std::vector<int> changed;
+    table.add(1);
+    table.rebind(0, &changed);
+    EXPECT_EQ(table.slot_count(), 1);
+    table.rebind(-5, &changed);
+    EXPECT_EQ(table.slot_count(), 1);
+    table.rebind(1000, &changed);
+    EXPECT_EQ(table.slot_count(), 8);
+    EXPECT_FALSE(table.owner_of(-1).has_value());
+    EXPECT_FALSE(table.owner_of(99).has_value());
 }
 
 } // namespace doris
