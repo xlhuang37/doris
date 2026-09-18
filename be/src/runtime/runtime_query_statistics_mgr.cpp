@@ -25,6 +25,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -122,7 +123,9 @@ static void _report_query_profiles_function(
                         std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>>>>
                 profile_copy,
         std::unordered_map<std::pair<TUniqueId, int32_t>, std::shared_ptr<TRuntimeProfileTree>>
-                load_channel_profile_copy) {
+                load_channel_profile_copy,
+        std::unordered_map<TUniqueId, std::pair<std::vector<TPipelineWorkerScheduleRecord>, int64_t>>
+                worker_timeline_copy) {
     // query_id -> {coordinator_addr, {fragment_id -> std::vectpr<pipeline_profile>}}
     for (auto& entry : profile_copy) {
         const auto& query_id = entry.first;
@@ -150,8 +153,16 @@ static void _report_query_profiles_function(
             load_channel_profiles.push_back(load_channel_profile.second);
         }
 
+        std::vector<TPipelineWorkerScheduleRecord> worker_schedule_records;
+        int64_t dropped_worker_schedule_records = 0;
+        if (auto it = worker_timeline_copy.find(query_id); it != worker_timeline_copy.end()) {
+            worker_schedule_records = std::move(it->second.first);
+            dropped_worker_schedule_records = it->second.second;
+        }
+
         TReportExecStatusParams req = RuntimeQueryStatisticsMgr::create_report_exec_status_params(
                 query_id, std::move(fragment_profile_map), std::move(load_channel_profiles),
+                std::move(worker_schedule_records), dropped_worker_schedule_records,
                 /*is_done=*/true);
         TReportExecStatusResult res;
 
@@ -170,7 +181,9 @@ TReportExecStatusParams RuntimeQueryStatisticsMgr::create_report_exec_status_par
         const TUniqueId& query_id,
         std::unordered_map<int32_t, std::vector<std::shared_ptr<TRuntimeProfileTree>>>
                 fragment_id_to_profile,
-        std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profiles, bool is_done) {
+        std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profiles,
+        std::vector<TPipelineWorkerScheduleRecord> worker_schedule_records,
+        int64_t dropped_worker_schedule_records, bool is_done) {
     // This function will clear the data of fragment_id_to_profile and load_channel_profiles.
     TQueryProfile profile;
     profile.__set_query_id(query_id);
@@ -227,6 +240,13 @@ TReportExecStatusParams RuntimeQueryStatisticsMgr::create_report_exec_status_par
         THRIFT_MOVE_VALUES(profile, load_channel_profiles, load_channel_profiles_req);
     }
 
+    if (!worker_schedule_records.empty()) {
+        THRIFT_MOVE_VALUES(profile, worker_schedule_records, worker_schedule_records);
+    }
+    if (dropped_worker_schedule_records > 0) {
+        profile.__set_dropped_worker_schedule_records(dropped_worker_schedule_records);
+    }
+
     TReportExecStatusParams req;
     THRIFT_MOVE_VALUES(req, query_profile, profile);
     req.__set_backend_id(ExecEnv::GetInstance()->cluster_info()->backend_id);
@@ -258,17 +278,21 @@ Status RuntimeQueryStatisticsMgr::start_report_thread() {
 void RuntimeQueryStatisticsMgr::trigger_profile_reporting() {
     decltype(_profile_map) profile_copy;
     decltype(_load_channel_profile_map) load_channel_profile_copy;
+    decltype(_worker_timeline_map) worker_timeline_copy;
 
     {
         std::unique_lock<std::mutex> lg(_profile_map_lock);
         _profile_map.swap(profile_copy);
         _load_channel_profile_map.swap(load_channel_profile_copy);
+        _worker_timeline_map.swap(worker_timeline_copy);
     }
 
     // ATTN: Local variables are copied to avoid memory reclamation issues.
-    auto st = _thread_pool->submit_func([profile_copy, load_channel_profile_copy]() {
-        _report_query_profiles_function(profile_copy, load_channel_profile_copy);
-    });
+    auto st = _thread_pool->submit_func(
+            [profile_copy, load_channel_profile_copy, worker_timeline_copy]() {
+                _report_query_profiles_function(profile_copy, load_channel_profile_copy,
+                                                worker_timeline_copy);
+            });
 
     if (!st.ok()) {
         LOG_WARNING("Failed to submit profile reporting task, reason: {}", st.to_string());
@@ -320,6 +344,20 @@ void RuntimeQueryStatisticsMgr::register_fragment_profile(
 
     VLOG_CRITICAL << fmt::format("register x profile done {}, fragment {}, profiles {}",
                                  print_id(query_id), fragment_id, p_profiles.size());
+}
+
+void RuntimeQueryStatisticsMgr::register_worker_timeline(
+        const TUniqueId& query_id, std::vector<TPipelineWorkerScheduleRecord> records,
+        int64_t dropped) {
+    std::unique_lock<std::mutex> lg(_profile_map_lock);
+    auto& entry = _worker_timeline_map[query_id];
+    if (entry.first.empty()) {
+        entry.first = std::move(records);
+    } else {
+        entry.first.insert(entry.first.end(), std::make_move_iterator(records.begin()),
+                           std::make_move_iterator(records.end()));
+    }
+    entry.second += dropped;
 }
 
 void RuntimeQueryStatisticsMgr::register_resource_context(

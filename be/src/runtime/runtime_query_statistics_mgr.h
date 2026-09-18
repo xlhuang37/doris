@@ -18,6 +18,7 @@
 #pragma once
 
 #include <gen_cpp/Data_types.h>
+#include <gen_cpp/FrontendService_types.h>
 #include <gen_cpp/RuntimeProfile_types.h>
 #include <gen_cpp/Types_types.h>
 
@@ -44,7 +45,9 @@ public:
             const TUniqueId& q_id,
             std::unordered_map<int32_t, std::vector<std::shared_ptr<TRuntimeProfileTree>>>
                     fragment_id_to_profile,
-            std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profile, bool is_done);
+            std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profile,
+            std::vector<TPipelineWorkerScheduleRecord> worker_schedule_records,
+            int64_t dropped_worker_schedule_records, bool is_done);
 
     void register_resource_context(std::string query_id,
                                    std::shared_ptr<ResourceContext> resource_ctx);
@@ -67,6 +70,11 @@ public:
                                    int32_t fragment_id,
                                    std::vector<std::shared_ptr<TRuntimeProfileTree>> p_profiles,
                                    std::shared_ptr<TRuntimeProfileTree> load_channel_profile_x);
+
+    // Pipeline worker timeline of one query, reported together with its profile.
+    void register_worker_timeline(const TUniqueId& query_id,
+                                  std::vector<TPipelineWorkerScheduleRecord> records,
+                                  int64_t dropped);
     // When query is finished, try to report query profiles to FE.
     // ATTN: Profile is reported to fe fragment by fragment.
     void trigger_profile_reporting();
@@ -90,6 +98,10 @@ private:
 
     std::unordered_map<std::pair<TUniqueId, int32_t>, std::shared_ptr<TRuntimeProfileTree>>
             _load_channel_profile_map;
+
+    // query_id -> {worker schedule records, number of records dropped by the per query cap}
+    std::unordered_map<TUniqueId, std::pair<std::vector<TPipelineWorkerScheduleRecord>, int64_t>>
+            _worker_timeline_map;
 
     std::unique_ptr<ThreadPool> _thread_pool;
 };

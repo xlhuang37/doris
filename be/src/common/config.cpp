@@ -306,6 +306,7 @@ DEFINE_Int32(be_service_threads, "64");
 // The pipeline task has a high concurrency, therefore reducing its report frequency
 DEFINE_mInt32(pipeline_status_report_interval, "10");
 DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
+DEFINE_mInt64(max_pipeline_worker_timeline_records_per_query, "200000");
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");

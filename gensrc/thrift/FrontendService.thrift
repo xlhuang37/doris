@@ -227,6 +227,22 @@ struct TReportWorkloadRuntimeStatusParams {
     3: optional map<string, TQueryStatisticsResult> query_statistics_result_map
 }
 
+// One interval during which a single pipeline worker held one pipeline task, from the
+// moment the task was taken out of the task queue until it was released.
+struct TPipelineWorkerScheduleRecord {
+    // Scheduler the worker belongs to. Together with worker_index it identifies the worker.
+    1: optional string scheduler
+    2: optional i32 worker_index
+    3: optional i32 fragment_id
+    4: optional i32 pipeline_id
+    5: optional string task_name
+    // Monotonic microseconds, local to the reporting backend.
+    6: optional i64 take_us
+    7: optional i64 release_us
+    // Why the worker released the task, see doris::WorkerReleaseReason.
+    8: optional string release_reason
+}
+
 struct TQueryProfile {
     1: optional Types.TUniqueId query_id
 
@@ -239,6 +255,12 @@ struct TQueryProfile {
     4: optional list<RuntimeProfile.TRuntimeProfileTree> instance_profiles
 
     5: optional list<RuntimeProfile.TRuntimeProfileTree> load_channel_profiles
+
+    // Pipeline worker timeline of this query on the reporting backend. Only collected
+    // when the query runs with profile_level >= 2.
+    6: optional list<TPipelineWorkerScheduleRecord> worker_schedule_records
+    // Number of records that were not reported because the per query cap was reached.
+    7: optional i64 dropped_worker_schedule_records
 }
 
 struct TFragmentInstanceReport {

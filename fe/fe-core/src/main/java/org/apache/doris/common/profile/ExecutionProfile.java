@@ -24,20 +24,24 @@ import org.apache.doris.common.util.SafeStringBuilder;
 import org.apache.doris.planner.PlanFragmentId;
 import org.apache.doris.thrift.TDetailedReportParams;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TPipelineWorkerScheduleRecord;
 import org.apache.doris.thrift.TQueryProfile;
 import org.apache.doris.thrift.TRuntimeProfileTree;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.TreeMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -72,6 +76,13 @@ public class ExecutionProfile {
     // use to merge profile from multi be
     private Map<Integer, Map<TNetworkAddress, List<RuntimeProfile>>> multiBeProfile = null;
     private ReentrantReadWriteLock multiBeProfileLock = new ReentrantReadWriteLock();
+
+    // Pipeline worker timeline reported by each BE, only collected when profile_level >= 2.
+    // Timestamps are monotonic microseconds local to the reporting BE, so records are kept
+    // grouped by host and never compared across hosts.
+    private Map<String, List<TPipelineWorkerScheduleRecord>> workerScheduleRecords = new TreeMap<>();
+    private Map<String, Long> droppedWorkerScheduleRecords = new TreeMap<>();
+    private ReentrantReadWriteLock workerScheduleRecordsLock = new ReentrantReadWriteLock();
 
     // Not serialize this property, it is only used to get profile id.
     private SummaryProfile summaryProfile;
@@ -273,7 +284,74 @@ public class ExecutionProfile {
             }
         }
 
+        updateWorkerScheduleRecords(profile, backendHBAddress);
+
         return new Status(TStatusCode.OK, "Success");
+    }
+
+    private void updateWorkerScheduleRecords(TQueryProfile profile, TNetworkAddress backendHBAddress) {
+        if (!profile.isSetWorkerScheduleRecords() && !profile.isSetDroppedWorkerScheduleRecords()) {
+            return;
+        }
+
+        String host = backendHBAddress.getHostname() + ":" + backendHBAddress.getPort();
+        workerScheduleRecordsLock.writeLock().lock();
+        try {
+            if (profile.isSetWorkerScheduleRecords()) {
+                workerScheduleRecords.computeIfAbsent(host, k -> Lists.newArrayList())
+                        .addAll(profile.getWorkerScheduleRecords());
+            }
+            if (profile.isSetDroppedWorkerScheduleRecords()) {
+                droppedWorkerScheduleRecords.merge(host, profile.getDroppedWorkerScheduleRecords(), Long::sum);
+            }
+        } finally {
+            workerScheduleRecordsLock.writeLock().unlock();
+        }
+    }
+
+    public boolean hasWorkerScheduleRecords() {
+        workerScheduleRecordsLock.readLock().lock();
+        try {
+            return !workerScheduleRecords.isEmpty() || !droppedWorkerScheduleRecords.isEmpty();
+        } finally {
+            workerScheduleRecordsLock.readLock().unlock();
+        }
+    }
+
+    // Appends one line per interval a pipeline worker held a task of this query. Lines are
+    // pipe delimited and flush left so that they can be split without stripping indentation.
+    public void appendWorkerTimeline(SafeStringBuilder builder) {
+        workerScheduleRecordsLock.readLock().lock();
+        try {
+            String queryIdStr = DebugUtil.printId(queryId);
+            for (Entry<String, Long> dropped : droppedWorkerScheduleRecords.entrySet()) {
+                if (dropped.getValue() > 0) {
+                    builder.append("# dropped|" + queryIdStr + "|" + dropped.getKey() + "|"
+                            + dropped.getValue() + "\n");
+                }
+            }
+            for (Entry<String, List<TPipelineWorkerScheduleRecord>> entry : workerScheduleRecords.entrySet()) {
+                String host = entry.getKey();
+                List<TPipelineWorkerScheduleRecord> records = Lists.newArrayList(entry.getValue());
+                // Group each worker's intervals together and order them in time.
+                records.sort(Comparator
+                        .<TPipelineWorkerScheduleRecord, String>comparing(
+                                record -> Strings.nullToEmpty(record.getScheduler()))
+                        .thenComparingInt(TPipelineWorkerScheduleRecord::getWorkerIndex)
+                        .thenComparingLong(TPipelineWorkerScheduleRecord::getTakeUs));
+                for (TPipelineWorkerScheduleRecord record : records) {
+                    String taskName = Strings.isNullOrEmpty(record.getTaskName()) ? "-" : record.getTaskName();
+                    builder.append(queryIdStr + "|" + host + "|" + record.getScheduler() + "|"
+                            + record.getWorkerIndex() + "|" + record.getFragmentId() + "|"
+                            + record.getPipelineId() + "|" + taskName + "|"
+                            + record.getTakeUs() + "|" + record.getReleaseUs() + "|"
+                            + (record.getReleaseUs() - record.getTakeUs()) + "|"
+                            + record.getReleaseReason() + "\n");
+                }
+            }
+        } finally {
+            workerScheduleRecordsLock.readLock().unlock();
+        }
     }
 
     public synchronized void addFragmentBackend(PlanFragmentId fragmentId, Long backendId) {

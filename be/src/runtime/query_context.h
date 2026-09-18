@@ -33,6 +33,7 @@
 #include "common/factory_creator.h"
 #include "common/object_pool.h"
 #include "common/status.h"
+#include "exec/pipeline/pipeline_worker_timeline.h"
 #include "exec/runtime_filter/runtime_filter_mgr.h"
 #include "exec/scan/scanner_scheduler.h"
 #include "runtime/exec_env.h"
@@ -385,7 +386,13 @@ private:
 
     std::shared_ptr<std::map<std::string, TAIResource>> _ai_resources;
 
+    // Take/release intervals of every pipeline worker that ran a task of this query.
+    // Only filled in when collect_worker_timeline() is true.
+    PipelineWorkerTimeline _worker_timeline;
+
     void _report_query_profile();
+
+    void _report_worker_timeline();
 
     std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>>
     _collect_realtime_query_profile();
@@ -415,6 +422,14 @@ public:
     bool enable_profile() const {
         return _query_options.__isset.enable_profile && _query_options.enable_profile;
     }
+
+    // The pipeline worker timeline is verbose, so it rides along with the detailed profile.
+    bool collect_worker_timeline() const {
+        return enable_profile() && _query_options.__isset.profile_level &&
+               _query_options.profile_level >= 2;
+    }
+
+    PipelineWorkerTimeline& worker_timeline() { return _worker_timeline; }
 
     timespec get_query_arrival_timestamp() const { return this->_query_arrival_timestamp; }
     QuerySource get_query_source() const { return this->_query_source; }
