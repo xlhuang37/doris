@@ -369,6 +369,10 @@ DECLARE_Int32(be_service_threads);
 DECLARE_mInt32(pipeline_status_report_interval);
 // Time slice for pipeline task execution (ms)
 DECLARE_mInt32(pipeline_task_exec_time_slice);
+// Upper bound on the number of pipeline worker timeline records kept per query. The
+// timeline is only collected when the query runs with profile_level >= 2. A negative
+// value means unlimited.
+DECLARE_mInt64(max_pipeline_worker_timeline_records_per_query);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

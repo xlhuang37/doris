@@ -40,9 +40,11 @@
 #include "core/value/vdatetime_value.h"
 #include "exec/pipeline/pipeline_fragment_context.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "exec/pipeline/pipeline_worker_timeline.h"
 #include "runtime/exec_env.h"
 #include "runtime/query_context.h"
 #include "runtime/thread_context.h"
+#include "util/defer_op.h"
 #include "util/thread.h"
 #include "util/threadpool.h"
 #include "util/time.h"
@@ -100,26 +102,62 @@ void TaskScheduler::_do_work(int index) {
         if (!task) {
             continue;
         }
+        const int64_t take_us = MonotonicMicros();
+
+        // Locked before any of the early exits below so that the iterations which hand the
+        // task straight back are still attributable to a query and end up on the timeline.
+        auto fragment_context = task->fragment_context().lock();
+
+        // One record per interval this worker holds the task, so that the query profile can
+        // show what every worker was doing at any point in time.
+        const bool collect_timeline =
+                fragment_context && fragment_context->get_query_ctx()->collect_worker_timeline();
+        WorkerScheduleRecord timeline_record;
+        auto release_reason = WorkerReleaseReason::EXECUTED;
+        if (collect_timeline) {
+            timeline_record.scheduler = _name;
+            timeline_record.worker_index = index;
+            timeline_record.fragment_id = fragment_context->get_fragment_id();
+            timeline_record.take_us = take_us;
+        }
+        // Declared before the release defer below so that it is destroyed after it, once the
+        // task has really been handed back.
+        Defer worker_timeline_defer {[&]() {
+            if (!collect_timeline) {
+                return;
+            }
+            timeline_record.release_us = MonotonicMicros();
+            timeline_record.reason = release_reason;
+            fragment_context->get_query_ctx()->worker_timeline().add(std::move(timeline_record));
+        }};
 
         // The task is already running, maybe block in now dependency wake up by other thread
         // but the block thread still hold the task, so put it back to the queue, until the hold
         // thread set task->set_running(false)
         // set_running return the old value
         if (task->set_running(true)) {
+            release_reason = WorkerReleaseReason::PUT_BACK;
             static_cast<void>(_task_queue.push_back(task, index));
             continue;
         }
 
         if (task->is_finalized()) {
+            release_reason = WorkerReleaseReason::FINALIZED;
             task->set_running(false);
             continue;
         }
 
-        auto fragment_context = task->fragment_context().lock();
         if (!fragment_context) {
             // Fragment already finished
             task->set_running(false);
             continue;
+        }
+
+        // Safe to read only now that this worker owns the task: a finalized task has already
+        // dropped its pipeline.
+        if (collect_timeline) {
+            timeline_record.pipeline_id = task->pipeline_id();
+            timeline_record.task_name = task->task_name();
         }
 
         task->set_thread_id(index);
@@ -131,6 +169,9 @@ void TaskScheduler::_do_work(int index) {
         Defer task_running_defer {[&]() {
             // If fragment is finished, fragment context will be de-constructed with all tasks in it.
             if (done || !status.ok()) {
+                if (release_reason == WorkerReleaseReason::EXECUTED) {
+                    release_reason = WorkerReleaseReason::CLOSED;
+                }
                 auto id = task->pipeline_id();
                 close_task(task.get(), status, fragment_context.get());
                 task->set_running(false);
@@ -144,6 +185,7 @@ void TaskScheduler::_do_work(int index) {
 
         // Close task if canceled
         if (canceled) {
+            release_reason = WorkerReleaseReason::CANCELED;
             status = fragment_context->get_query_ctx()->exec_status();
             DCHECK(!status.ok());
             continue;

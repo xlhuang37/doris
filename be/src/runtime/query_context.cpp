@@ -444,7 +444,37 @@ void QueryContext::add_fragment_profile(
     }
 }
 
+void QueryContext::_report_worker_timeline() {
+    auto records = _worker_timeline.drain();
+    const int64_t dropped = _worker_timeline.dropped();
+    if (records.empty() && dropped == 0) {
+        return;
+    }
+
+    std::vector<TPipelineWorkerScheduleRecord> treports;
+    treports.reserve(records.size());
+    for (const auto& record : records) {
+        TPipelineWorkerScheduleRecord treport;
+        treport.__set_scheduler(record.scheduler);
+        treport.__set_worker_index(record.worker_index);
+        treport.__set_fragment_id(record.fragment_id);
+        treport.__set_pipeline_id(record.pipeline_id);
+        treport.__set_task_name(record.task_name);
+        treport.__set_take_us(record.take_us);
+        treport.__set_release_us(record.release_us);
+        treport.__set_release_reason(to_string(record.reason));
+        treports.push_back(std::move(treport));
+    }
+
+    ExecEnv::GetInstance()->runtime_query_statistics_mgr()->register_worker_timeline(
+            _query_id, std::move(treports), dropped);
+}
+
 void QueryContext::_report_query_profile() {
+    if (collect_worker_timeline()) {
+        _report_worker_timeline();
+    }
+
     std::lock_guard<std::mutex> lg(_profile_mutex);
 
     for (auto& [fragment_id, fragment_profile] : _profile_map) {
@@ -506,8 +536,11 @@ TReportExecStatusParams QueryContext::get_realtime_exec_status() {
         }
     }
 
+    // The worker timeline is only drained once, for the final report, so that a realtime
+    // profile query does not steal records from it.
     exec_status = RuntimeQueryStatisticsMgr::create_report_exec_status_params(
             this->_query_id, std::move(realtime_query_profile), std::move(load_channel_profiles),
+            /*worker_schedule_records=*/{}, /*dropped_worker_schedule_records=*/0,
             /*is_done=*/false);
 
     return exec_status;

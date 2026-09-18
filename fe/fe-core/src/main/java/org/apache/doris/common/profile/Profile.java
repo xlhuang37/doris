@@ -102,6 +102,8 @@ import java.util.zip.ZipOutputStream;
 public class Profile {
     private static final Logger LOG = LogManager.getLogger(Profile.class);
     private static final int MergedProfileLevel = 1;
+    // The pipeline worker timeline is verbose, so it rides along with the detailed profile.
+    private static final int WorkerTimelineProfileLevel = 2;
     // profile file name format: time_id
     private static final String SEPERATOR = "_";
     private static final String PROFILE_ENTRY_SUFFIX = ".profile";
@@ -544,6 +546,43 @@ public class Profile {
             }
             builder.append(
                     physcialPlanBuilder.toString().replace("\n", "\n     "));
+        }
+
+        // Must stay the last section of the profile text.
+        getWorkerTimeline(builder);
+    }
+
+    // One line per interval a pipeline worker held a pipeline task of this query, so the
+    // schedule of every worker can be reconstructed. Only reported at profile_level >= 2.
+    private void getWorkerTimeline(SafeStringBuilder builder) {
+        if (profileLevel < WorkerTimelineProfileLevel) {
+            return;
+        }
+
+        boolean hasRecords = false;
+        for (ExecutionProfile executionProfile : executionProfiles) {
+            if (executionProfile.hasWorkerScheduleRecords()) {
+                hasRecords = true;
+                break;
+            }
+        }
+        if (!hasRecords) {
+            return;
+        }
+
+        try {
+            builder.append("\nPipelineWorkerTimeline:\n");
+            builder.append("# query_id|host|scheduler|worker|fragment|pipeline|task"
+                    + "|take_us|release_us|duration_us|release_reason\n");
+            builder.append("# take_us/release_us are monotonic microseconds local to each host,"
+                    + " only comparable within one host.\n");
+            builder.append("# release_reason EXECUTED/CLOSED ran the task, PUT_BACK/FINALIZED/CANCELED did not.\n");
+            for (ExecutionProfile executionProfile : executionProfiles) {
+                executionProfile.appendWorkerTimeline(builder);
+            }
+        } catch (Throwable t) {
+            LOG.warn("build pipeline worker timeline {} failed", getId(), t);
+            builder.append("build pipeline worker timeline failed\n");
         }
     }
 
