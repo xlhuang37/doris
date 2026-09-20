@@ -292,11 +292,11 @@ void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTas
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
     auto charged_ns = static_cast<uint64_t>(std::max<int64_t>(time_spent, 0));
     if (charge) {
-        // Charge the executed CPU time to the owning query's global counter. This
-        // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers, and drives
-        // attained-service ranking. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op and they stay at attained 0.
+        // Charge the executed time to the owning query's global counter. This counter is
+        // shared by all of the query's tasks (across fragments, instances and cores) and
+        // is charged by the scanner threads too, and drives attained-service ranking. For
+        // tasks without a query counter (e.g. RevokableTask) the charge is a no-op and
+        // they stay at attained 0.
         task->add_query_runtime_ns(charged_ns);
     }
     if (_mode != Mode::FULL) {
