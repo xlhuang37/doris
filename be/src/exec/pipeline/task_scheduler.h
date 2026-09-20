@@ -53,8 +53,9 @@ public:
 
     virtual void stop();
 
-    // QueryContext is going away: post an async terminate so each pool can reclaim
-    // its QueryState once no worker is still attached. Must not block.
+    // QueryContext is going away: post an async terminate so each pool can drop the
+    // query from its ranking and reclaim its QueryState once it has drained. Must not
+    // block.
     virtual void notify_query_terminated(const TUniqueId& query_id);
 
     virtual std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() {
@@ -86,12 +87,11 @@ private:
 class HybridTaskScheduler MOCK_REMOVE(final) : public TaskScheduler {
 public:
     // The blocking pool's workers sit inside blocking execute() calls (spill I/O,
-    // remote/AI functions, recursive CTEs) and cannot honor the "re-check the
-    // assignment slot every execution slice" invariant that the push-based scheduler
-    // relies on, so its queue runs in the degenerate general-only mode (plain shared
-    // lock-free queue, no scheduler thread). Runtime is still charged to the
-    // query-global counter, so attained-service accounting in the simple pool is
-    // unaffected.
+    // remote/AI functions, recursive CTEs) and cannot honor the "re-read the slot array
+    // every execution slice" invariant that the attained-service scheduler relies on, so
+    // its queue runs in the degenerate general-only mode (plain shared lock-free queue,
+    // no scheduler thread). Runtime is still charged to the query-global counter, so
+    // attained-service accounting in the simple pool is unaffected.
     HybridTaskScheduler(int exec_thread_num, int blocking_exec_thread_num, std::string name,
                         std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
             : _blocking_scheduler(blocking_exec_thread_num, name + "_blocking_scheduler",
