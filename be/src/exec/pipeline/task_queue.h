@@ -60,6 +60,16 @@ namespace doris {
 //     demand (runnable tasks), so momentarily empty queries do not hold the array, and
 //     queries past the array are served only by the fallback. Fewer live queries than
 //     slots leaves the tail of the array empty.
+//   - Attained service counts every pool that spends CPU on the query, not just this
+//     one: the pipeline workers charge the runtime of each execution slice and the
+//     scanner threads the thread CPU of each scan slice, so a scan-bound query gives up
+//     pipeline workers in proportion to the CPU it is really using. The mirror is a
+//     store of the absolute counter, refreshed by producers on enqueue and by workers on
+//     charge - the only threads allowed to touch a QueryContext. Both are also the
+//     moments a query enters or re-enters the competition for a slot (a task woken by a
+//     scan block is re-submitted through push_back), so a query can never win a slot on
+//     a stale value, and a late refresh loses nothing because the next one reads the
+//     true total.
 //   - The array is published as an immutable snapshot (`SlotTable`) rather than written
 //     in place: the scheduler builds the next table, swaps it in under `_slot_mutex` and
 //     bumps `_slot_epoch`; a worker compares the epoch (one relaxed load) on every

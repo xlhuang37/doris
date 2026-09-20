@@ -36,9 +36,9 @@ public:
     TaskExecutionContext();
     virtual ~TaskExecutionContext();
 
-    // Query-global CPU runtime counter, shared by the pipeline scheduler and the
-    // scan scheduler so both rank a query by one unified attained-service signal.
-    // Non-query contexts return nullptr.
+    // Query-global CPU runtime counter, charged by the pipeline workers and by the
+    // scanner threads so the pipeline scheduler ranks a query by one unified
+    // attained-service signal. Non-query contexts return nullptr.
     virtual std::atomic<uint64_t>* query_runtime_counter() { return nullptr; }
 };
 

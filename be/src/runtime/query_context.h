@@ -103,9 +103,13 @@ public:
     ExecEnv* exec_env() const { return _exec_env; }
 
     // Query-global CPU/exec runtime counter shared by every PipelineFragmentContext
-    // of this query. It is the attained-service key for the pipeline task scheduler
-    // (and is still charged by the scan time-sharing scheduler), so all fragments of
-    // a small query share one low "attained service" value and win priority together.
+    // of this query, so all fragments of a small query share one low "attained service"
+    // value and win priority together. It is the attained-service key for the pipeline
+    // task scheduler, and both pools that spend CPU on the query charge it: the pipeline
+    // workers with the runtime of each execution slice, and the scanner threads with the
+    // thread CPU of each scan slice (Scanner::update_scan_cpu_timer). A query that does
+    // its work in the scan pool therefore gives up pipeline workers just as if it had
+    // done it in the pipeline pool.
     std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
 
     // Tasks of this query that currently want a core, across all fragments and

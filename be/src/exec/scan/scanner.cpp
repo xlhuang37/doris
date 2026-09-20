@@ -265,7 +265,17 @@ void Scanner::update_scan_cpu_timer() {
     int64_t cpu_time = _cpu_watch.elapsed_time();
     _scan_cpu_timer += cpu_time;
     if (_state && _state->get_query_ctx()) {
-        _state->get_query_ctx()->resource_ctx()->cpu_context()->update_cpu_cost_ms(cpu_time);
+        QueryContext* query_ctx = _state->get_query_ctx();
+        query_ctx->resource_ctx()->cpu_context()->update_cpu_cost_ms(cpu_time);
+        // Scanner threads are a large share of a query's CPU, so the pipeline scheduler's
+        // attained-service ranking has to see them: this is the same query-global counter
+        // the pipeline workers charge, so a query that burns its CPU on scanner threads
+        // gives up pipeline workers exactly as if it had burned it in the pipeline pool.
+        // Charged once per scan slice, which is where the whole slice's CPU is known.
+        if (cpu_time > 0) {
+            query_ctx->query_runtime_counter()->fetch_add(static_cast<uint64_t>(cpu_time),
+                                                          std::memory_order_relaxed);
+        }
     }
 }
 

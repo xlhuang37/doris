@@ -31,7 +31,8 @@
 namespace doris {
 
 // Tests for the query-granular pipeline task queue. Ranking is by attained service
-// (PipelineTask::query_runtime_ns()), least first; equal service keeps arrival order.
+// (PipelineTask::query_runtime_ns(), the query-global counter that the pipeline workers
+// and the scanner threads both charge), least first; equal service keeps arrival order.
 // The top of that ranking is published into a shared slot array, slot 0 holding the
 // least-attained query. Registry keys are TUniqueId values from query_id(); tests encode
 // a fake QueryContext* into that id and never dereference it.
@@ -190,6 +191,38 @@ TEST_F(PushBasedTaskQueueTest, RankingOrdersSlotsByAttainedService) {
     EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), 0);
     EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 1);
     EXPECT_EQ(q.slot_of_query_for_test(qid(0xC)), 2);
+
+    q.close();
+}
+
+// What CPU burned outside this pool - scanner threads, above all - looks like from here:
+// the query-global counter grows with no charge of our own, and the ranking picks the new
+// total up on the query's next enqueue. That enqueue is also how a task woken by a scan
+// block re-enters the queue, so a scan-bound query cannot win slot 0 on a stale value.
+TEST_F(PushBasedTaskQueueTest, AttainedServiceComesFromTheQueryCounterOnEnqueue) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    // Both start with no attained service; A arrives first, so it holds slot 0.
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+    ASSERT_EQ(q.slot_of_query_for_test(qid(0xA)), 0);
+    ASSERT_EQ(q.slot_of_query_for_test(qid(0xB)), 1);
+
+    // A burns 5s on scanner threads: no task of A ran here, nothing was charged through
+    // update_statistics, but its next enqueue carries the counter's new value.
+    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xB)), 0);
+    EXPECT_EQ(q.slot_of_query_for_test(qid(0xA)), 1);
+
+    // The worker follows the array, so B is served ahead of A's backlog.
+    auto t = q.take(0);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->query_ctx_raw(), qb);
 
     q.close();
 }
