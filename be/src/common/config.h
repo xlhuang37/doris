@@ -372,6 +372,12 @@ DECLARE_mInt32(pipeline_task_exec_time_slice);
 // Default soft per-query worker cap for attained-service pipeline scheduling
 // (0 = unbounded); overridden per query by the session variable of the same name
 DECLARE_mInt32(pipeline_query_worker_cap);
+// Size of the shared slot array the attained-service pipeline scheduler publishes,
+// slot 0 being the least-attained query (values below 1 are clamped to 1)
+DECLARE_mInt32(pipeline_las_slot_count);
+// How workers consume that array: "ordered" (walk slot 0..N-1, take the first task) or
+// "fixed" (each worker pinned to one slot, workers spread evenly over the array)
+DECLARE_mString(pipeline_las_slot_policy);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

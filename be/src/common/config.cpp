@@ -42,6 +42,7 @@
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
+#include "exec/pipeline/las_slot_policy.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
 #include "load/memtable/memtable_flush_executor.h"
@@ -314,6 +315,24 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // session variable of the same name to >= 0 uses its own value instead. Both are read
 // on every rebalance pass, so either can be retuned without a restart.
 DEFINE_mInt32(pipeline_query_worker_cap, "8");
+
+// Size of the shared slot array the attained-service pipeline scheduler publishes.
+// Slot 0 holds the least-attained (most LAS) query with work to do, the last slot the
+// N-th; queries past the array are served only by the work-conserving fallback. Values
+// below 1 are clamped to 1. Read on every scheduler pass, so it can be retuned without
+// a restart.
+DEFINE_mInt32(pipeline_las_slot_count, "8");
+
+// How pipeline workers consume that array.
+//   "ordered": every worker walks the array from slot 0 to the last slot and takes the
+//              first task it finds, so the least-attained query gets as many workers as
+//              it can keep busy.
+//   "fixed":   every worker is pinned to one slot, with the workers spread evenly over
+//              the array, so per-query parallelism is workers-per-slot.
+// Read on every scheduler pass, so it can be retuned without a restart.
+DEFINE_mString(pipeline_las_slot_policy, "ordered");
+DEFINE_Validator(pipeline_las_slot_policy,
+                 [](const std::string& config) -> bool { return is_las_slot_policy_name(config); });
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
