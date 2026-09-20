@@ -35,14 +35,15 @@
 #include <gen_cpp/Types_types.h>
 
 #include "common/status.h"
+#include "exec/pipeline/las_slot_policy.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/hash_util.hpp"
 
 namespace doris {
 #include "common/compile_check_begin.h"
 
-// A push-based, query-granular task queue shared by all workers of one pipeline
-// scheduler (one per workload group).
+// A query-granular task queue shared by all workers of one pipeline scheduler (one per
+// workload group).
 //
 // Core design (full mode, used by the "simple" CPU pool):
 //   - All runnable PipelineTasks live in one shared moodycamel::ConcurrentQueue,
@@ -51,44 +52,62 @@ namespace doris {
 //     since explicit producers are single-producer). Sub-queues are drained lock-free
 //     via try_dequeue_from_producer.
 //   - A central scheduler thread ranks live queries by attained service (the
-//     query-global CPU runtime counter, mirrored onto each QueryState) and
-//     push-assigns workers by writing per-worker, cache-aligned assignment slots.
-//     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
-//     a single append-only vector, re-sorted on every rebalance; equal attained
-//     service keeps arrival order (stable_sort).
-//   - Core allocation is greedy first-come-first-served in that order: each query
-//     takes as many of the pool's workers as it can use (capped by its own
-//     `pipeline_query_worker_cap` session variable, or by the BE config of the same
-//     name when the query does not override it) before the next is considered. Both
-//     are read fresh on every rebalance, so either can be retuned at runtime. A query's
-//     demand is its active task count (tasks created and not yet finalized, so
-//     blocked tasks count too), which is what lets a query that is momentarily
-//     empty but about to unblock keep its cores. Queries reached after the workers
-//     run out hold no assigned worker and are served only by the fallback.
-//   - Workers obey their slot: dequeue from the assigned query's sub-queue. When the
-//     sub-queue is empty they fall back to a tokenless try_dequeue on the shared queue
-//     (work-conserving, priority-blind relief valve), re-checking the slot after every
-//     task so scheduler decisions take effect within one execution slice.
+//     query-global CPU runtime counter, mirrored onto each QueryState) and periodically
+//     publishes the top of that ranking into a shared slot array: slot 0 holds the
+//     least-attained (most LAS) query, the last slot the `pipeline_las_slot_count`-th.
+//     Ranking is a single append-only vector, re-sorted on every pass; equal attained
+//     service keeps arrival order (stable_sort). A query only takes a slot while it has
+//     demand (runnable tasks), so momentarily empty queries do not hold the array, and
+//     queries past the array are served only by the fallback. Fewer live queries than
+//     slots leaves the tail of the array empty.
+//   - Attained service counts every pool that spends CPU on the query, not just this
+//     one: the pipeline workers charge the runtime of each execution slice and the
+//     scanner threads the thread CPU of each scan slice, so a scan-bound query gives up
+//     pipeline workers in proportion to the CPU it is really using. The mirror is a
+//     store of the absolute counter, refreshed by producers on enqueue and by workers on
+//     charge - the only threads allowed to touch a QueryContext. Both are also the
+//     moments a query enters or re-enters the competition for a slot (a task woken by a
+//     scan block is re-submitted through push_back), so a query can never win a slot on
+//     a stale value, and a late refresh loses nothing because the next one reads the
+//     true total.
+//   - The array is published as an immutable snapshot (`SlotTable`) rather than written
+//     in place: the scheduler builds the next table, swaps it in under `_slot_mutex` and
+//     bumps `_slot_epoch`; a worker compares the epoch (one relaxed load) on every
+//     dequeue attempt and only takes the mutex to refresh its cached snapshot when it
+//     moved. The cached snapshot co-owns every QueryState it lists, which is what makes
+//     the pointers a worker holds safe without any attach/detach handshake.
+//   - How a worker consumes the array is `pipeline_las_slot_policy`: "ordered" walks
+//     slots 0..N-1 and takes the first task found (so the least-attained query gets as
+//     many workers as it can keep busy), "fixed" pins each worker to one slot with the
+//     workers spread evenly over the array (so per-query parallelism is
+//     workers-per-slot). Both knobs are re-read on every scheduler pass and travel
+//     inside the published snapshot, so a worker's view of the policy and of the slots
+//     is always consistent.
+//   - When the array yields nothing, workers fall back to a tokenless try_dequeue on the
+//     shared queue (work-conserving, priority-blind relief valve), and they re-read the
+//     array after every task so scheduler decisions take effect within one execution
+//     slice.
 //   - "Inelastic first": a task whose pipeline has exactly one task cannot be sped up
 //     by parallelism, so queueing it behind elastic work only lengthens the query's
 //     critical path. Such tasks keep full per-query bookkeeping (pending/in-flight
 //     counters, idle detection, teardown) but bypass the per-query sub-queue and go
 //     into a dedicated shared queue that every worker drains before anything else,
-//     ahead of its assignment and of attained-service ranking entirely.
-//   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
-//     new queries, query termination); the scheduler sleeps on a condition variable
-//     with a timer tick and rebalances every pass so accumulated CPU is visible
-//     without discrete level-crossing events.
+//     ahead of the slot array and of attained-service ranking entirely.
+//   - Workers and producers notify the scheduler through a mutex-guarded inbox (new
+//     queries, query termination); the scheduler sleeps on a condition variable with a
+//     timer tick and re-publishes every pass so accumulated CPU is visible without
+//     discrete level-crossing events.
 //   - Teardown happens only after QueryContext destruction posts QUERY_TERMINATED and
-//     every assigned worker has acked detaching (workers_attached == 0). Temporary
-//     emptiness while the query is still alive does not reclaim the node. Tasks with
-//     no QueryContext (RevokableTask) share a sentinel id and live until queue close.
-//     QUERY_TERMINATED only labels the live object; the pointer stays in the sched
-//     vector until the next rebalance compact, and _registry.erase is allowed only
-//     after that compact (never while in_sched).
+//     the query has nothing pending or in flight. Temporary emptiness while the query is
+//     still alive does not reclaim the node. Tasks with no QueryContext (RevokableTask)
+//     share a sentinel id and live until queue close. QUERY_TERMINATED only labels the
+//     live object; it leaves the ranking vector at the next compact, which is also what
+//     drops it from the slot array. Since every reference is a shared_ptr, a stale
+//     worker snapshot can outlive the registry entry without dangling - and it can never
+//     yield a task, because reclamation requires the sub-queue to be empty.
 //
 // Degenerate mode (used by the "blocking" pool, whose workers sit inside blocking
-// execute() calls and cannot honor the "re-check the slot every slice" invariant):
+// execute() calls and cannot honor the "re-read the array every slice" invariant):
 // no scheduler thread, no per-query state, no ranking - just the shared lock-free
 // queue plus worker parking. Runtime is still charged to the query-global counter
 // so attained-service accounting in the other pools is unaffected.
@@ -98,7 +117,7 @@ namespace doris {
 class MultiCoreTaskQueue {
 public:
     enum class Mode {
-        FULL,         // scheduler thread + per-query sub-queues + ranking + assignment
+        FULL,         // scheduler thread + per-query sub-queues + ranking + slot array
         GENERAL_ONLY, // plain shared lock-free queue (blocking pool)
     };
 
@@ -129,23 +148,35 @@ public:
     // re-queued without being executed.
     void release_task(PipelineTask* task);
 
-    // QueryContext is being destroyed. Posts QUERY_TERMINATED; the scheduler reclaims
-    // the QueryState once workers_attached == 0. No-op in degenerate mode.
+    // QueryContext is being destroyed. Posts QUERY_TERMINATED; the scheduler drops the
+    // query from the ranking and reclaims the QueryState once nothing of it is pending
+    // or in flight. No-op in degenerate mode.
     void notify_query_terminated(const TUniqueId& query_id);
 
     int cores() const { return _core_size; }
 
     // Test hook: block until the scheduler thread has fully processed every inbox
-    // message posted before this call and completed the rebalance/dispatch of that
+    // message posted before this call and completed the ranking/publication of that
     // pass. No-op in degenerate mode or after close().
     void wait_scheduler_settled_for_test();
 
     // Test hook: number of live per-query states (observes teardown/resurrection).
     size_t registry_size_for_test() const;
 
-    // Test hook: how many worker slots currently point at `query_id`, i.e. how many
-    // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
-    int assigned_workers_for_test(const TUniqueId& query_id) const;
+    // Test hook: the slot `query_id` occupies in the published array, or -1 when the
+    // ranking did not give it one. Call after wait_scheduler_settled_for_test().
+    int slot_of_query_for_test(const TUniqueId& query_id) const;
+
+    // Test hook: size of the published array, i.e. the configured slot count in effect.
+    int slot_count_for_test() const;
+
+    // Test hook: the slot worker `worker_id` serves under the published slot count and
+    // LasSlotPolicy::FIXED. Independent of the policy actually in effect.
+    int slot_of_worker_for_test(int worker_id) const;
+
+    // Test hook: how many times the array has been published, which is what tells a
+    // steady state (no publication) from a churning one.
+    uint64_t slot_epoch_for_test() const { return _slot_epoch.load(); }
 
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
@@ -154,10 +185,13 @@ protected:
 
 private:
     // ------------------------------------------------------------------
-    // Per-query state (full mode only). Created lazily by the enqueue path; destroyed
-    // exclusively by the scheduler thread, under the exclusive registry lock, once the
-    // query has been terminated, compacted out of `_queries` (`!in_sched`), and every
-    // assigned worker has acked detaching.
+    // Per-query state (full mode only). Created lazily by the enqueue path and owned by
+    // the registry, the scheduler's ranking vector and the published slot snapshots
+    // alike: whoever holds the last reference destroys it, which is what makes the
+    // pointer a worker reads out of a snapshot always safe. The registry entry - the
+    // only way a producer can find the state - is dropped by the scheduler thread, under
+    // the exclusive registry lock, once the query has been terminated, compacted out of
+    // `_queries` (`!in_sched`) and has nothing pending or in flight.
     // ------------------------------------------------------------------
     struct QueryState {
         QueryState(moodycamel::ConcurrentQueue<PipelineTaskSPtr>& shared_queue, TUniqueId id)
@@ -177,18 +211,14 @@ private:
         std::mutex enqueue_mutex;
 
         // ---- Scheduler-thread-only bookkeeping (no atomics needed) ----
-        int workers_attached = 0; // exact, via the acked attach/detach protocol
-        // True while this pointer is in `_queries`. Compact is the only thing that
-        // clears it; `_registry.erase` is forbidden while this is set.
+        // True while this query is in `_queries`. Compact is the only thing that clears
+        // it; `_registry.erase` is forbidden while this is set.
         bool in_sched = false;
-        // True after QUERY_TERMINATED. The object stays alive (and, until compact,
-        // in `_queries`) so the vector never holds a freed address.
+        // True after QUERY_TERMINATED. The object stays alive (and, until compact, in
+        // `_queries`) so nothing has to be unpublished synchronously.
         bool terminated = false;
         // Membership flag for _destroy_candidates (dedup).
         bool in_destroy_candidates = false;
-        // Rebalance scratch (valid only within one rebalance pass).
-        int rr_grant = 0;
-        int rr_demand = 0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // CPU time executed in this pool (per-pool statistic; the authoritative
@@ -207,8 +237,10 @@ private:
         // Approximate sub-queue length; invariant: >= real length.
         std::atomic<int> pending_approx {0};
         // "Nothing here right now": armed by the releaser that drove in_flight to
-        // zero while pending_approx was zero; disarmed by producers on enqueue.
-        // Assigned workers self-detach when they observe this. Not a reclaim trigger.
+        // zero while pending_approx was zero; disarmed by producers on enqueue, which
+        // is what makes the next push post NEW_QUERY and so wake the scheduler instead
+        // of waiting up to a tick for the query to be ranked again. Not a reclaim
+        // trigger.
         std::atomic<bool> idle {false};
         // Mirror of the owning query's runnable task count (tasks submitted and not yet
         // finished, minus those parked on a dependency, across every fragment of the
@@ -216,85 +248,60 @@ private:
         // release, since the scheduler thread must never dereference a QueryContext.
         // Stays 0 for the sentinel bucket, whose tasks have no QueryContext.
         std::atomic<int> active_tasks {0};
-        // Mirror of the owning query's `pipeline_query_worker_cap` session variable:
-        // -1 to defer to the BE config, 0 for unbounded, > 0 for the cap. Refreshed
-        // alongside `active_tasks` for the same reason (only producers and workers may
-        // touch a QueryContext). Constant for the life of a query in practice.
-        std::atomic<int> worker_cap {-1};
     };
+    using QueryStatePtr = std::shared_ptr<QueryState>;
 
     // ------------------------------------------------------------------
-    // Worker control blocks. `WorkerSlot` is written only by the scheduler thread and
-    // read only by the owning worker; `WorkerLocal` is private to the worker. Each is
-    // cache-aligned to prevent false sharing.
-    //
-    // Attach/detach protocol (exact workers_attached counting):
-    //   - Every scheduler write bumps `seq` (so re-assigning the same pointer after a
-    //     self-detach is still observed) and there is AT MOST ONE unacked write per
-    //     worker: the scheduler never writes a slot again until the worker acks the
-    //     previous write with an ACK message carrying that seq.
-    //   - The worker acks every observed seq change. The ack carries the query it was
-    //     attached to at the moment of the change (null if it had already
-    //     self-detached), which is what the scheduler decrements.
-    //   - A worker that finds its assigned query idle self-detaches: it posts DETACHED
-    //     and stops using the pointer, without touching the slot.
-    //   Each attach (the scheduler increments workers_attached at write time) is
-    //   balanced by exactly one decrement (ACK-with-previous or DETACHED), and the
-    //   decrement is posted only after the worker stopped using the pointer - which
-    //   makes `workers_attached == 0` a safe reclamation gate.
+    // The shared slot array, published as an immutable snapshot. `slots` is always
+    // exactly as long as the configured slot count - the tail is simply empty when
+    // fewer queries are ranked - so the fixed worker/slot mapping does not shift as
+    // queries come and go. The policy travels with it so a worker never mixes a policy
+    // from one pass with slots from another.
     // ------------------------------------------------------------------
-    struct alignas(64) WorkerSlot {
-        std::atomic<QueryState*> assigned {nullptr};
-        std::atomic<uint64_t> seq {0};
+    struct SlotTable {
+        std::vector<QueryStatePtr> slots;
+        LasSlotPolicy policy = LasSlotPolicy::ORDERED;
     };
+    using SlotTablePtr = std::shared_ptr<const SlotTable>;
+
+    // A worker's private view of the array: the last epoch it observed and the snapshot
+    // it took then. Holding the snapshot is what keeps the listed QueryStates alive
+    // while the worker may still touch them. Cache-aligned because every worker writes
+    // its own entry.
     struct alignas(64) WorkerLocal {
-        uint64_t seen_seq = 0;
-        QueryState* attached = nullptr;
-        // The worker observed its query idle, posted DETACHED, and stopped using
-        // `attached`. Reset on the next observed seq change.
-        bool detached = false;
-    };
-    // Scheduler-thread-only view of each worker.
-    struct WorkerSched {
-        QueryState* target = nullptr; // value of the last slot write
-        uint64_t written_seq = 0;
-        bool acked = true;          // the last slot write has been acked
-        bool self_detached = false; // a DETACHED for `target` was processed
-        bool rr_kept = false;       // rebalance scratch: kept in place this pass
+        uint64_t seen_epoch = 0;
+        SlotTablePtr table;
     };
 
     // ------------------------------------------------------------------
-    // Scheduler inbox. ACK/DETACHED may carry a QueryState pointer because the
-    // worker's attachment keeps `workers_attached` nonzero until the message is
-    // processed, which blocks teardown. All other query references travel as
-    // TUniqueId and are re-resolved through the registry at processing time, so a
-    // message can never dangle across QueryContext destruction.
+    // Scheduler inbox. Every query reference travels as a TUniqueId and is re-resolved
+    // through the registry at processing time, so a message can never dangle across
+    // QueryContext destruction.
     // ------------------------------------------------------------------
     struct SchedulerMessage {
         enum class Type {
-            ACK,              // worker observed slot write `seq`; `state` = what it was
-                              // attached to before (null if it had self-detached)
-            DETACHED,         // worker self-detached from `state` (observed it idle)
             NEW_QUERY,        // enqueue path created or revived query_id
-            QUERY_TERMINATED, // QueryContext destructor: reclaim once detached
+            QUERY_TERMINATED, // QueryContext destructor: reclaim once drained
             SYNC,             // test hook: fulfilled at the end of the draining pass
         };
         Type type;
-        QueryState* state = nullptr; // ACK / DETACHED only
-        TUniqueId query_id;          // NEW_QUERY / TERMINATED
-        int worker_id = -1;
-        uint64_t seq = 0;
+        TUniqueId query_id; // NEW_QUERY / TERMINATED
         std::shared_ptr<std::promise<void>> sync;
     };
 
     // ---- enqueue / dequeue helpers ----
     Status _push(PipelineTaskSPtr task);
     PipelineTaskSPtr _try_take_once(int worker_id);
-    void _check_assignment(int worker_id);
+    // Refresh the worker's cached slot snapshot if the scheduler published a new one,
+    // and return it (null before the first publication).
+    const SlotTable* _refresh_slots(int worker_id);
+    // Dequeue one task from `qs`'s sub-queue, with the per-query accounting. False when
+    // `qs` is empty or null.
+    bool _try_take_from(const QueryStatePtr& qs, PipelineTaskSPtr& task);
     void _release_in_flight(PipelineTask* task, bool charge, int64_t time_spent);
-    // Republishes the query's active task count and worker cap into `qs`. Called by
-    // producers and workers, which are the only threads allowed to read them off a
-    // task (they resolve through the QueryContext, which the scheduler must not touch).
+    // Republishes the query's active task count into `qs`. Called by producers and
+    // workers, which are the only threads allowed to read it off a task (they resolve
+    // through the QueryContext, which the scheduler must not touch).
     void _refresh_query_mirror(QueryState* qs, const PipelineTask* task);
     void _post_message(SchedulerMessage msg);
     void _notify_workers(bool all);
@@ -303,17 +310,20 @@ private:
     void _scheduler_loop();
     void _handle_message(SchedulerMessage& msg,
                          std::vector<std::shared_ptr<std::promise<void>>>& syncs);
-    QueryState* _resolve(const TUniqueId& query_id);
+    QueryStatePtr _resolve(const TUniqueId& query_id);
     static bool _is_sentinel(const TUniqueId& query_id) {
         return query_id.hi == 0 && query_id.lo == 0;
     }
-    void _add_to_sched(QueryState* node);
+    void _add_to_sched(QueryStatePtr node);
     void _try_teardown();
-    void _rebalance_and_dispatch();
-    void _write_assignment(int worker_id, QueryState* value);
+    // Compact, re-rank by attained service and publish the slot array if it changed.
+    void _rank_and_publish();
+    void _publish(SlotTablePtr table);
+    // The published snapshot, for the test hooks. Null before the first publication.
+    SlotTablePtr _published_for_test() const;
 
     bool _worker_in_range(int worker_id) const {
-        return worker_id >= 0 && worker_id < static_cast<int>(_worker_slots.size());
+        return worker_id >= 0 && worker_id < static_cast<int>(_worker_local.size());
     }
 
     const int _core_size;
@@ -331,27 +341,28 @@ private:
 
     // Registry of live QueryStates (full mode). Producers hold the shared lock for the
     // whole enqueue; the fallback dequeue and release paths hold it while mutating a
-    // query's counters; the scheduler holds the exclusive lock to create-check nothing
-    // (creation is on the enqueue path) and to verify-and-erase at teardown. A
-    // looked-up pointer is therefore valid for as long as the shared lock is held, or
-    // for as long as the holder is visible in `in_flight`/`workers_attached`.
+    // query's counters; the scheduler holds the exclusive lock to verify-and-erase at
+    // teardown (creation is on the enqueue path). A looked-up raw pointer is therefore
+    // valid for as long as the shared lock is held.
     mutable std::shared_mutex _registry_mutex;
-    std::unordered_map<TUniqueId, std::unique_ptr<QueryState>> _registry;
+    std::unordered_map<TUniqueId, QueryStatePtr> _registry;
 
-    // Worker control blocks (full mode), indexed by core_id.
-    std::vector<WorkerSlot> _worker_slots;
+    // Published slot array. Written only by the scheduler thread, under `_slot_mutex`
+    // together with the epoch bump; read by workers under the same mutex, but only when
+    // the epoch moved, so the steady-state cost on the dequeue path is one relaxed load.
+    mutable std::mutex _slot_mutex;
+    SlotTablePtr _published_slots;
+    std::atomic<uint64_t> _slot_epoch {0};
+
+    // Per-worker cached view of the array (full mode), indexed by core_id.
     std::vector<WorkerLocal> _worker_local;
-    std::vector<WorkerSched> _worker_sched; // scheduler-thread-only
 
     // Schedulable queries (scheduler-thread-only). Appended on NEW_QUERY; terminated
-    // entries stay as live tombstones until the next rebalance compact. While a
-    // pointer is here (`in_sched`), `_registry.erase` is forbidden.
-    std::vector<QueryState*> _queries;
+    // entries stay until the next compact. While a query is here (`in_sched`),
+    // `_registry.erase` is forbidden.
+    std::vector<QueryStatePtr> _queries;
     // Queries pending destroy after QUERY_TERMINATED (scheduler-thread-only).
-    std::vector<QueryState*> _destroy_candidates;
-    // Queries that received a grant in the current rebalance pass, in attained-service
-    // order. Reused across passes to avoid reallocating (scheduler-thread-only).
-    std::vector<QueryState*> _granted_queries;
+    std::vector<QueryStatePtr> _destroy_candidates;
 
     // Inbox.
     std::mutex _inbox_mutex;
