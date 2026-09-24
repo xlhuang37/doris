@@ -29,7 +29,6 @@
 #include <vector>
 
 #include "common/status.h"
-#include "exec/pipeline/closed_slot_table.h"
 #include "exec/pipeline/pipeline.h"
 #include "exec/pipeline/pipeline_task.h"
 
@@ -54,6 +53,7 @@ struct SerialPipelineInfo {
 
 struct SerialFragmentInfo {
     TUniqueId query_id;
+    int64_t arrival_ns = 0;
     int fragment_id = 0;
     // downstream -> upstreams (same as PipelineFragmentContext::_dag)
     std::map<PipelineId, std::vector<PipelineId>> dag;
@@ -86,38 +86,16 @@ struct PipelineKey {
 
 // Policy object: which (query, pipeline) may run. Independent of PipelineTask so it can
 // be unit-tested with fake ids.
-//
-// Workers are cut into slots by `ClosedSlotTable`; each slot serves one query, admitted
-// in registration order, and queries beyond the slot count wait for a slot to free up.
-// Inside a slot the query runs one pipeline at a time and every worker of the slot takes
-// tasks only from that pipeline. Each query keeps its own current pipeline, so queries in
-// different slots advance independently.
 class SerialDispatchState {
 public:
-    explicit SerialDispatchState(int worker_count = 1) : _slot_table(worker_count) {}
-
-    // Slot count applied on the next admission event (registration or query finish).
-    void set_requested_slots(int slots) { _requested_slots = slots; }
-
     void register_fragment(const SerialFragmentInfo& info);
     void on_pipeline_finished(const PipelineKey& key);
     void on_query_finished(const TUniqueId& query_id);
-    // For every query holding a slot: keep its current pipeline while it is unfinished,
-    // otherwise pick its next ready one.
+    // If there is no current pipeline, or the current one is finished, pick the next.
     void advance();
-    // Current pipeline of the query served by `worker_id`'s slot.
-    std::optional<PipelineKey> current_for_worker(int worker_id) const;
-    std::optional<PipelineKey> current_of_query(const TUniqueId& query_id) const;
-    // Current pipeline of slot 0; equals the single dispatch target when there is one slot.
-    std::optional<PipelineKey> current() const;
+    std::optional<PipelineKey> current() const { return _current; }
     void close();
     bool closed() const { return _closed; }
-
-    int slot_count() const { return _slot_table.slot_count(); }
-    int slot_of_worker(int worker_id) const { return _slot_table.slot_of_worker(worker_id); }
-    // -1 while the query waits for a slot, or once it has finished.
-    int slot_of_query(const TUniqueId& query_id) const { return _slot_table.slot_of(query_id); }
-    int workers_of_slot(int slot) const { return _slot_table.workers_of_slot(slot); }
 
     // First take() of this pipeline records start; 0 if never started.
     int64_t wallclock_start_ns(const PipelineKey& key) const;
@@ -136,14 +114,11 @@ private:
     };
 
     struct QueryState {
+        int64_t arrival_ns = 0;
         bool query_finished = false;
         std::map<std::pair<int, PipelineId>, PipelineState> pipelines;
-        // Survives losing the slot to a shrink, so the query resumes where it was.
-        std::optional<PipelineKey> current;
     };
 
-    void _rebind();
-    void _advance_query(const TUniqueId& query_id, QueryState& qs);
     bool _is_eligible(const TUniqueId& query_id, const std::pair<int, PipelineId>& pip_key,
                       const QueryState& qs) const;
     // True if a local unfinished exchange sink sends to this recvr (dest_node_id match).
@@ -153,16 +128,15 @@ private:
     QueryState* _find_query(const TUniqueId& query_id);
     const QueryState* _find_query(const TUniqueId& query_id) const;
 
+    std::vector<TUniqueId> _fcfs;
     std::map<TUniqueId, QueryState, TUniqueIdLess> _queries;
-    ClosedSlotTable<TUniqueId> _slot_table;
-    int _requested_slots = 1;
+    std::optional<TUniqueId> _active_query;
+    std::optional<PipelineKey> _current;
     bool _closed = false;
 };
 
 class SerialTaskQueue {
 public:
-    explicit SerialTaskQueue(int worker_count = 1);
-
     Status register_fragment(const SerialFragmentInfo& info);
     Status push_back(PipelineTaskSPtr task);
     Status push_back(PipelineTaskSPtr task, int /*core_id*/);
@@ -170,8 +144,6 @@ public:
     void on_pipeline_finished(const PipelineKey& key);
     void on_query_finished(const TUniqueId& query_id);
     int64_t wallclock_start_ns(const PipelineKey& key);
-    // Slot serving `query_id` (-1 if none) and how many workers that slot has.
-    std::pair<int, int> slot_of_query(const TUniqueId& query_id);
     void close();
     void update_statistics(PipelineTask* task, int64_t time_spent);
 
@@ -180,13 +152,9 @@ public:
 
 private:
     PipelineKey _key_of(const PipelineTaskSPtr& task) const;
-    std::condition_variable& _cv_of_worker(int worker_id);
-    void _notify_all_slots();
 
     std::mutex _lock;
-    // One per possible slot (sized to the worker count), so a push wakes only workers
-    // that may run the task. All of them wait on `_lock`.
-    std::vector<std::condition_variable> _slot_cvs;
+    std::condition_variable _cv;
     SerialDispatchState _dispatch;
     std::map<PipelineKey, std::deque<PipelineTaskSPtr>> _runnable;
     static constexpr auto WAIT_TIMEOUT_MS = 100;

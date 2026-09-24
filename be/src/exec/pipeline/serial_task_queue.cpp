@@ -19,9 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <string>
 
-#include "common/config.h"
 #include "common/logging.h"
 #include "exec/pipeline/pipeline_fragment_context.h"
 #include "util/time.h"
@@ -32,10 +30,8 @@ namespace doris {
 
 void SerialDispatchState::close() {
     _closed = true;
-    for (auto& [qid, qs] : _queries) {
-        (void)qid;
-        qs.current.reset();
-    }
+    _current.reset();
+    _active_query.reset();
 }
 
 SerialDispatchState::QueryState* SerialDispatchState::_find_query(const TUniqueId& query_id) {
@@ -49,19 +45,6 @@ const SerialDispatchState::QueryState* SerialDispatchState::_find_query(
     return it == _queries.end() ? nullptr : &it->second;
 }
 
-void SerialDispatchState::_rebind() {
-    std::vector<int> changed;
-    _slot_table.rebind(_requested_slots, &changed);
-    std::sort(changed.begin(), changed.end());
-    changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
-    for (int slot : changed) {
-        const auto& owner = _slot_table.owner_of(slot);
-        LOG(INFO) << "serial closed-system slot " << slot << " ("
-                  << _slot_table.workers_of_slot(slot) << " workers) now serves "
-                  << (owner.has_value() ? print_id(*owner) : std::string("nothing"));
-    }
-}
-
 void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
     if (_closed) {
         return;
@@ -69,10 +52,19 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
     auto [qit, inserted] = _queries.try_emplace(info.query_id);
     QueryState& qs = qit->second;
     if (inserted) {
-        _slot_table.add(info.query_id);
+        qs.arrival_ns = info.arrival_ns;
+        _fcfs.push_back(info.query_id);
+        std::stable_sort(_fcfs.begin(), _fcfs.end(), [&](const TUniqueId& a, const TUniqueId& b) {
+            const auto& qa = _queries.at(a);
+            const auto& qb = _queries.at(b);
+            if (qa.arrival_ns != qb.arrival_ns) {
+                return qa.arrival_ns < qb.arrival_ns;
+            }
+            return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
+        });
     }
 
-    bool added_sink = false;
+    bool added_matching_sink = false;
     for (const auto& pinfo : info.pipelines) {
         auto pip_key = std::make_pair(info.fragment_id, pinfo.pipeline_id);
         auto [pit, pip_inserted] = qs.pipelines.try_emplace(pip_key);
@@ -81,8 +73,9 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
         ps.is_exchange_sink = pinfo.is_exchange_sink;
         ps.exchange_node_id = pinfo.exchange_node_id;
         ps.dest_node_id = pinfo.dest_node_id;
-        if (pip_inserted && pinfo.is_exchange_sink) {
-            added_sink = true;
+        if (pip_inserted && pinfo.is_exchange_sink && _current.has_value() &&
+            _current->query_id == info.query_id) {
+            added_matching_sink = true;
         }
     }
 
@@ -105,9 +98,8 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
     }
     // Consumer may have become current before a local producer that sends to it arrived.
     // Yield only if a newly registered sink actually targets the current source's recvr.
-    if (added_sink && qs.current.has_value()) {
-        auto cur_it =
-                qs.pipelines.find(std::make_pair(qs.current->fragment_id, qs.current->pipeline_id));
+    if (added_matching_sink && _current.has_value() && _current->query_id == info.query_id) {
+        auto cur_it = qs.pipelines.find(std::make_pair(_current->fragment_id, _current->pipeline_id));
         if (cur_it != qs.pipelines.end() && cur_it->second.is_exchange_source &&
             cur_it->second.exchange_node_id >= 0) {
             const int recvr = cur_it->second.exchange_node_id;
@@ -117,13 +109,12 @@ void SerialDispatchState::register_fragment(const SerialFragmentInfo& info) {
                     // current with no producer registered. Drop it so the next take()
                     // after the sink finishes records the real start.
                     cur_it->second.wallclock_start_ns = 0;
-                    qs.current.reset();
+                    _current.reset();
                     break;
                 }
             }
         }
     }
-    _rebind();
     advance();
 }
 
@@ -152,8 +143,8 @@ void SerialDispatchState::on_pipeline_finished(const PipelineKey& key) {
             sit->second.indegree--;
         }
     }
-    if (qs->current.has_value() && *qs->current == key) {
-        qs->current.reset();
+    if (_current.has_value() && *_current == key) {
+        _current.reset();
     }
     advance();
 }
@@ -164,10 +155,13 @@ void SerialDispatchState::on_query_finished(const TUniqueId& query_id) {
         return;
     }
     qs->query_finished = true;
-    qs->current.reset();
-    _slot_table.remove(query_id);
-    // Hand the freed slot to the query that has been waiting longest.
-    _rebind();
+    if (_current.has_value() && _current->query_id == query_id) {
+        _current.reset();
+    }
+    if (_active_query.has_value() && *_active_query == query_id) {
+        _active_query.reset();
+    }
+    _fcfs.erase(std::remove(_fcfs.begin(), _fcfs.end(), query_id), _fcfs.end());
     advance();
 }
 
@@ -203,8 +197,7 @@ bool SerialDispatchState::_has_unfinished_sink_to(const QueryState& qs, int exch
     return false;
 }
 
-std::optional<PipelineKey> SerialDispatchState::_pick_ready_in_query(
-        const TUniqueId& query_id) const {
+std::optional<PipelineKey> SerialDispatchState::_pick_ready_in_query(const TUniqueId& query_id) const {
     const auto* qs = _find_query(query_id);
     if (qs == nullptr || qs->query_finished) {
         return std::nullopt;
@@ -224,56 +217,40 @@ std::optional<PipelineKey> SerialDispatchState::_pick_ready_in_query(
     return best;
 }
 
-void SerialDispatchState::_advance_query(const TUniqueId& query_id, QueryState& qs) {
-    if (qs.current.has_value()) {
-        auto it =
-                qs.pipelines.find(std::make_pair(qs.current->fragment_id, qs.current->pipeline_id));
-        if (it != qs.pipelines.end() && !it->second.finished) {
-            return;
-        }
-        qs.current.reset();
-    }
-    qs.current = _pick_ready_in_query(query_id);
-}
-
 void SerialDispatchState::advance() {
     if (_closed) {
+        _current.reset();
+        _active_query.reset();
         return;
     }
-    for (int slot = 0; slot < _slot_table.slot_count(); ++slot) {
-        const auto& owner = _slot_table.owner_of(slot);
-        if (!owner.has_value()) {
-            continue;
+    if (_current.has_value()) {
+        auto* qs = _find_query(_current->query_id);
+        if (qs != nullptr && !qs->query_finished) {
+            auto it = qs->pipelines.find(
+                    std::make_pair(_current->fragment_id, _current->pipeline_id));
+            if (it != qs->pipelines.end() && !it->second.finished) {
+                return;
+            }
         }
-        auto* qs = _find_query(*owner);
+        _current.reset();
+    }
+    if (_active_query.has_value()) {
+        auto* qs = _find_query(*_active_query);
+        if (qs != nullptr && !qs->query_finished) {
+            _current = _pick_ready_in_query(*_active_query);
+            return;
+        }
+        _active_query.reset();
+    }
+    for (const auto& qid : _fcfs) {
+        const auto* qs = _find_query(qid);
         if (qs == nullptr || qs->query_finished) {
             continue;
         }
-        _advance_query(*owner, *qs);
+        _active_query = qid;
+        _current = _pick_ready_in_query(qid);
+        return;
     }
-}
-
-std::optional<PipelineKey> SerialDispatchState::current_of_query(const TUniqueId& query_id) const {
-    const auto* qs = _find_query(query_id);
-    if (qs == nullptr || qs->query_finished) {
-        return std::nullopt;
-    }
-    return qs->current;
-}
-
-std::optional<PipelineKey> SerialDispatchState::current_for_worker(int worker_id) const {
-    if (_closed) {
-        return std::nullopt;
-    }
-    const auto& owner = _slot_table.owner_of(_slot_table.slot_of_worker(worker_id));
-    if (!owner.has_value()) {
-        return std::nullopt;
-    }
-    return current_of_query(*owner);
-}
-
-std::optional<PipelineKey> SerialDispatchState::current() const {
-    return current_for_worker(0);
 }
 
 int64_t SerialDispatchState::wallclock_start_ns(const PipelineKey& key) const {
@@ -302,13 +279,6 @@ void SerialDispatchState::mark_wallclock_start(const PipelineKey& key, int64_t n
     }
 }
 
-SerialTaskQueue::SerialTaskQueue(int worker_count)
-        : _slot_cvs(static_cast<size_t>(std::max(worker_count, 1))),
-          _dispatch(std::max(worker_count, 1)) {
-    std::lock_guard<std::mutex> l(_lock);
-    _dispatch.set_requested_slots(config::pipeline_closed_system_slots);
-}
-
 PipelineKey SerialTaskQueue::_key_of(const PipelineTaskSPtr& task) const {
     PipelineKey key;
     key.query_id = task->query_id();
@@ -319,25 +289,13 @@ PipelineKey SerialTaskQueue::_key_of(const PipelineTaskSPtr& task) const {
     return key;
 }
 
-std::condition_variable& SerialTaskQueue::_cv_of_worker(int worker_id) {
-    const int slot = _dispatch.slot_of_worker(worker_id);
-    return _slot_cvs[static_cast<size_t>(std::max(slot, 0))];
-}
-
-void SerialTaskQueue::_notify_all_slots() {
-    for (auto& cv : _slot_cvs) {
-        cv.notify_all();
-    }
-}
-
 Status SerialTaskQueue::register_fragment(const SerialFragmentInfo& info) {
     std::lock_guard<std::mutex> l(_lock);
     if (_dispatch.closed()) {
         return Status::InternalError("SerialTaskQueue closed");
     }
-    _dispatch.set_requested_slots(config::pipeline_closed_system_slots);
     _dispatch.register_fragment(info);
-    _notify_all_slots();
+    _cv.notify_all();
     return Status::OK();
 }
 
@@ -354,18 +312,15 @@ Status SerialTaskQueue::push_back(PipelineTaskSPtr task, int /*core_id*/) {
     auto key = _key_of(task);
     _runnable[key].push_back(std::move(task));
     _dispatch.advance();
-    const int slot = _dispatch.slot_of_query(key.query_id);
-    if (slot >= 0) {
-        _slot_cvs[static_cast<size_t>(slot)].notify_one();
-    }
+    _cv.notify_all();
     return Status::OK();
 }
 
-PipelineTaskSPtr SerialTaskQueue::take(int core_id) {
+PipelineTaskSPtr SerialTaskQueue::take(int /*core_id*/) {
     std::unique_lock<std::mutex> l(_lock);
     while (!_dispatch.closed()) {
         _dispatch.advance();
-        auto current = _dispatch.current_for_worker(core_id);
+        auto current = _dispatch.current();
         if (current.has_value()) {
             auto& dq = _runnable[*current];
             if (!dq.empty()) {
@@ -376,7 +331,7 @@ PipelineTaskSPtr SerialTaskQueue::take(int core_id) {
                 return task;
             }
         }
-        _cv_of_worker(core_id).wait_for(l, std::chrono::milliseconds(WAIT_TIMEOUT_MS));
+        _cv.wait_for(l, std::chrono::milliseconds(WAIT_TIMEOUT_MS));
     }
     return nullptr;
 }
@@ -385,12 +340,11 @@ void SerialTaskQueue::on_pipeline_finished(const PipelineKey& key) {
     std::lock_guard<std::mutex> l(_lock);
     _dispatch.on_pipeline_finished(key);
     _runnable.erase(key);
-    _notify_all_slots();
+    _cv.notify_all();
 }
 
 void SerialTaskQueue::on_query_finished(const TUniqueId& query_id) {
     std::lock_guard<std::mutex> l(_lock);
-    _dispatch.set_requested_slots(config::pipeline_closed_system_slots);
     _dispatch.on_query_finished(query_id);
     for (auto it = _runnable.begin(); it != _runnable.end();) {
         if (it->first.query_id == query_id) {
@@ -399,7 +353,7 @@ void SerialTaskQueue::on_query_finished(const TUniqueId& query_id) {
             ++it;
         }
     }
-    _notify_all_slots();
+    _cv.notify_all();
 }
 
 int64_t SerialTaskQueue::wallclock_start_ns(const PipelineKey& key) {
@@ -407,17 +361,11 @@ int64_t SerialTaskQueue::wallclock_start_ns(const PipelineKey& key) {
     return _dispatch.wallclock_start_ns(key);
 }
 
-std::pair<int, int> SerialTaskQueue::slot_of_query(const TUniqueId& query_id) {
-    std::lock_guard<std::mutex> l(_lock);
-    const int slot = _dispatch.slot_of_query(query_id);
-    return {slot, _dispatch.workers_of_slot(slot)};
-}
-
 void SerialTaskQueue::close() {
     std::lock_guard<std::mutex> l(_lock);
     _dispatch.close();
     _runnable.clear();
-    _notify_all_slots();
+    _cv.notify_all();
 }
 
 void SerialTaskQueue::update_statistics(PipelineTask* task, int64_t time_spent) {
