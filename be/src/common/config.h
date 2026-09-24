@@ -1716,6 +1716,11 @@ DECLARE_mBool(enable_pipeline_task_leakage_detect);
 
 // Profiling-only: FCFS one query, one pipeline at a time, all workers on that pipeline.
 DECLARE_mBool(enable_serial_pipeline_scheduler);
+// Closed-system profiling on top of the serial scheduler: the pipeline workers are split
+// evenly into this many slots (worker i serves slot i * slots / workers), each slot runs
+// one query at a time with the serial algorithm, and queries beyond the slot count wait
+// in arrival order. Clamped to [1, worker count]; read when the scheduler is created.
+DECLARE_Int32(pipeline_closed_system_slots);
 
 DECLARE_mInt32(check_score_rounds_num);
 
