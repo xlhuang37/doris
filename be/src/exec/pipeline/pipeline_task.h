@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <gen_cpp/Types_types.h>
+
 #include "common/status.h"
 #include "core/block/block.h"
 #include "exec/operator/operator.h"
@@ -40,7 +42,6 @@ class PipelineFragmentContext;
 namespace doris {
 
 class MultiCoreTaskQueue;
-class PriorityTaskQueue;
 class Dependency;
 
 class PipelineTask : public std::enable_shared_from_this<PipelineTask> {
@@ -133,15 +134,56 @@ public:
     // Execution phase should be terminated. This is called if this task is canceled or waken up early.
     void terminate();
 
-    // 1 used for update priority queue
-    // note(wb) an ugly implementation, need refactor later
-    // 1.1 pipeline task
-    void inc_runtime_ns(uint64_t delta_time) { this->_runtime += delta_time; }
-    uint64_t get_runtime_ns() const { return this->_runtime; }
+    // Used by attained-service ranking in the pipeline task scheduler. The
+    // scheduler charges executed CPU time to the owning query's global counter
+    // (shared across all of the query's fragments, instances and pipeline tasks),
+    // and reads it back so least-attained queries are staffed first.
+    void add_query_runtime_ns(uint64_t delta_time) {
+        if (_query_runtime_ptr != nullptr) {
+            _query_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
+        }
+    }
+    MOCK_FUNCTION uint64_t query_runtime_ns() const {
+        return _query_runtime_ptr != nullptr
+                       ? _query_runtime_ptr->load(std::memory_order_relaxed)
+                       : 0;
+    }
+    // Tasks of the owning query that currently want a core, across all of its fragments
+    // and instances: submitted and not yet finished, minus those parked on a dependency.
+    // The pipeline scheduler uses it to size how many cores the query can actually use,
+    // which sub-queue depth understates for a query whose runnable tasks are spread over
+    // the workers. Zero for tasks with no QueryContext (e.g. RevokableTask).
+    MOCK_FUNCTION int active_task_num() const {
+        return _active_tasks_ptr != nullptr ? _active_tasks_ptr->load(std::memory_order_relaxed)
+                                            : 0;
+    }
+    // Per-query ceiling on concurrently assigned pipeline workers, from the owning
+    // query's `pipeline_query_worker_cap` session variable. -1 means "no per-query
+    // override, use the BE config"; 0 means unbounded; > 0 is the cap. Tasks with no
+    // QueryContext (e.g. RevokableTask) report -1. Read by producers and workers, who
+    // mirror it into the scheduler's per-query state (the scheduler thread must never
+    // dereference a QueryContext).
+    MOCK_FUNCTION int query_worker_cap() const { return _query_worker_cap; }
 
-    // 1.2 priority queue's queue level
-    void update_queue_level(int queue_level) { this->_queue_level = queue_level; }
-    int get_queue_level() const { return this->_queue_level; }
+    // Opaque key identifying the owning query, used by the query-granular task queue
+    // to bucket this task. The query context outlives its tasks; the pointer is only
+    // ever compared/used as a map key, never dereferenced by the queue.
+    MOCK_FUNCTION QueryContext* query_ctx_raw() const { return _query_ctx_raw; }
+
+    // Registry key for the query-granular task queue. Default (all-zero) is the
+    // sentinel bucket for tasks with no QueryContext (e.g. RevokableTask).
+    MOCK_FUNCTION TUniqueId query_id() const { return _query_id; }
+
+    // A task is inelastic when its pipeline has exactly one task: it can only run
+    // sequentially, so extra workers cannot speed it up but any queueing delay
+    // lengthens the query's critical path. The pipeline task scheduler gives such
+    // tasks top dequeue priority ("inelastic first"). `_pipeline` is null for wrapper
+    // tasks built through the protected default constructor (e.g. RevokableTask);
+    // those are never inelastic (and being blockable they are routed to the blocking
+    // pool, which has no priority machinery anyway).
+    MOCK_FUNCTION bool is_inelastic() const {
+        return _pipeline != nullptr && _pipeline->num_tasks() == 1;
+    }
 
     void put_in_runnable_queue() {
         _schedule_time++;
@@ -213,15 +255,25 @@ private:
 
     std::weak_ptr<PipelineFragmentContext> _fragment_context;
 
-    // used for priority queue
-    // it may be visited by different thread but there is no race condition
-    // so no need to add lock
-    uint64_t _runtime = 0;
-    // it's visited in one thread, so no need to thread synchronization
-    // 1 get task, (set _queue_level/_core_id)
-    // 2 exe task
-    // 3 update task statistics(update _queue_level/_core_id)
-    int _queue_level = 0;
+    // Cached pointer to the owning query's global runtime counter (owned by
+    // QueryContext). The query context strictly outlives its fragments and tasks,
+    // so this raw pointer is safe and lets the scheduler avoid locking
+    // `_fragment_context` (a weak_ptr) on the hot push/dequeue path.
+    std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
+
+    // Cached pointer to the owning query's active task count (same lifetime argument
+    // as `_query_runtime_ptr`). This task holds a slot in it for as long as its state
+    // counts as active; see _counts_as_active().
+    std::atomic<int>* _active_tasks_ptr = nullptr;
+
+    // Cached owning QueryContext pointer (bucket key for the query-granular queue).
+    // Null for tasks not tied to a query (e.g. RevokableTask), which bucket together.
+    QueryContext* _query_ctx_raw = nullptr;
+
+    // Snapshot of the owning query's worker cap session variable, taken once at
+    // construction because query options are immutable for the life of a query.
+    // Caching it keeps the scheduler's mirror refresh off the QueryContext cacheline.
+    int _query_worker_cap = -1;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;
@@ -311,6 +363,14 @@ private:
         default:
             __builtin_unreachable();
         }
+    }
+
+    // Whether a task in `state` is asking for a core: it has been submitted and is not
+    // waiting on a dependency, so it either occupies a worker or wants one. The
+    // query-global active task count tracks exactly these tasks, and _state_transition()
+    // adjusts it on every crossing of this boundary.
+    static bool _counts_as_active(State state) {
+        return state == State::INITED || state == State::RUNNABLE;
     }
 
     Status _state_transition(State new_state);

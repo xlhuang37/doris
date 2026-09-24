@@ -768,6 +768,8 @@ public class SessionVariable implements Serializable, Writable {
 
     public static final String QUERY_SLOT_COUNT = "query_slot_count";
 
+    public static final String PIPELINE_QUERY_WORKER_CAP = "pipeline_query_worker_cap";
+
     public static final String MAX_COLUMN_READER_NUM = "max_column_reader_num";
 
     public static final String USE_MAX_LENGTH_OF_VARCHAR_IN_CTAS = "use_max_length_of_varchar_in_ctas";
@@ -1174,6 +1176,23 @@ public class SessionVariable implements Serializable, Writable {
         Long slotCount = Long.valueOf(slotCnt);
         if (slotCount < 1 || slotCount > 1025) {
             throw new InvalidParameterException("query_slot_count should be between 1 and 1024)");
+        }
+    }
+
+    @VariableMgr.VarAttr(name = PIPELINE_QUERY_WORKER_CAP, needForward = true,
+            checker = "checkPipelineQueryWorkerCap", description = {
+                "单个查询在每个 BE 的 pipeline 调度器上最多可以同时占用的 worker 数量。"
+                        + "-1 表示沿用 BE 配置 pipeline_query_worker_cap，0 表示不限制",
+                "Maximum number of pipeline workers a single query may be assigned concurrently "
+                        + "on each BE. -1 means inherit the BE config pipeline_query_worker_cap, "
+                        + "0 means unbounded"})
+    public int pipelineQueryWorkerCap = -1;
+
+    public void checkPipelineQueryWorkerCap(String cap) {
+        long workerCap = Long.parseLong(cap);
+        if (workerCap < -1) {
+            throw new InvalidParameterException(
+                    "pipeline_query_worker_cap should be -1 (inherit BE config), 0 (unbounded) or positive");
         }
     }
 
@@ -5449,6 +5468,7 @@ public class SessionVariable implements Serializable, Writable {
         tResult.setHiveOrcUseColumnNames(hiveOrcUseColumnNames);
         tResult.setHiveParquetUseColumnNames(hiveParquetUseColumnNames);
         tResult.setQuerySlotCount(wgQuerySlotCount);
+        tResult.setPipelineQueryWorkerCap(pipelineQueryWorkerCap);
 
         tResult.setKeepCarriageReturn(keepCarriageReturn);
 

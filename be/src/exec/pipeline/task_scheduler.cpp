@@ -75,6 +75,10 @@ Status TaskScheduler::submit(PipelineTaskSPtr task) {
     return _task_queue.push_back(task);
 }
 
+void TaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _task_queue.notify_query_terminated(query_id);
+}
+
 // after close_task, task maybe destructed.
 void close_task(PipelineTask* task, Status exec_status, PipelineFragmentContext* ctx) {
     // Has to attach memory tracker here, because the close task will also release some memory.
@@ -137,6 +141,10 @@ void TaskScheduler::_do_work(int index) {
         // set_running return the old value
         if (task->set_running(true)) {
             release_reason = WorkerReleaseReason::PUT_BACK;
+            // This worker will not execute the task, so release the worker slot it
+            // took in take() before re-queueing it (the holding worker will release
+            // its own slot when it finishes).
+            _task_queue.release_task(task.get());
             static_cast<void>(_task_queue.push_back(task, index));
             continue;
         }
@@ -247,6 +255,11 @@ Status HybridTaskScheduler::start() {
 void HybridTaskScheduler::stop() {
     _blocking_scheduler.stop();
     _simple_scheduler.stop();
+}
+
+void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _blocking_scheduler.notify_query_terminated(query_id);
+    _simple_scheduler.notify_query_terminated(query_id);
 }
 
 } // namespace doris

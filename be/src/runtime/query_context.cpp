@@ -35,6 +35,7 @@
 #include "exec/operator/rec_cte_scan_operator.h"
 #include "exec/pipeline/dependency.h"
 #include "exec/pipeline/pipeline_fragment_context.h"
+#include "exec/pipeline/task_scheduler.h"
 #include "exec/runtime_filter/runtime_filter_definitions.h"
 #include "exec/spill/spill_file_manager.h"
 #include "runtime/exec_env.h"
@@ -223,6 +224,11 @@ QueryContext::~QueryContext() {
     [[maybe_unused]] uint64_t group_id = 0;
     if (workload_group()) {
         group_id = workload_group()->id(); // before remove
+    }
+
+    // Async: destructor can run on a pipeline worker. Do not wait for detach ACKs.
+    if (_task_scheduler) {
+        _task_scheduler->notify_query_terminated(_query_id);
     }
 
     _resource_ctx->task_controller()->finish();
