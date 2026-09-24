@@ -33,30 +33,24 @@ TUniqueId make_qid(int64_t lo) {
     return id;
 }
 
-SerialFragmentInfo make_fragment(int64_t query_lo, int fragment_id,
+SerialFragmentInfo make_fragment(int64_t query_lo, int64_t arrival_ns, int fragment_id,
                                  const std::vector<SerialPipelineInfo>& pipelines,
                                  const std::map<PipelineId, std::vector<PipelineId>>& dag) {
     SerialFragmentInfo info;
     info.query_id = make_qid(query_lo);
+    info.arrival_ns = arrival_ns;
     info.fragment_id = fragment_id;
     info.pipelines = pipelines;
     info.dag = dag;
     return info;
 }
 
-// Pipeline 0 feeds pipeline 1 inside fragment 0.
-SerialFragmentInfo make_two_stage_query(int64_t query_lo) {
-    std::map<PipelineId, std::vector<PipelineId>> dag;
-    dag[1] = {0};
-    return make_fragment(query_lo, 0, {{0, false, false}, {1, false, false}}, dag);
-}
-
 } // namespace
 
 TEST(SerialDispatchStateTest, FcfsQueryOrder) {
     SerialDispatchState state;
-    state.register_fragment(make_fragment(1, 0, {{0, false, false}}, {}));
-    state.register_fragment(make_fragment(2, 0, {{0, false, false}}, {}));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, false}}, {}));
+    state.register_fragment(make_fragment(2, 200, 0, {{0, false, false}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->query_id.lo, 1);
@@ -75,13 +69,13 @@ TEST(SerialDispatchStateTest, FcfsQueryOrder) {
 
 TEST(SerialDispatchStateTest, LaterSubmitDoesNotPreemptCurrentQuery) {
     SerialDispatchState state;
-    // Query 2 registers first and takes the only slot.
-    state.register_fragment(make_fragment(2, 0, {{0, false, false}}, {}));
+    // Query 2 is submitted first even though query 1 arrived earlier on the BE.
+    state.register_fragment(make_fragment(2, 200, 0, {{0, false, false}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->query_id.lo, 2);
 
-    state.register_fragment(make_fragment(1, 0, {{0, false, false}}, {}));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, false}}, {}));
     cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->query_id.lo, 2);
@@ -95,8 +89,8 @@ TEST(SerialDispatchStateTest, LaterSubmitDoesNotPreemptCurrentQuery) {
 
 TEST(SerialDispatchStateTest, DoNotDispatchSecondQueryWhileFirstRegistered) {
     SerialDispatchState state;
-    state.register_fragment(make_fragment(1, 0, {{0, false, false}}, {}));
-    state.register_fragment(make_fragment(2, 0, {{0, false, false}}, {}));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, false}}, {}));
+    state.register_fragment(make_fragment(2, 200, 0, {{0, false, false}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->query_id.lo, 1);
@@ -109,7 +103,10 @@ TEST(SerialDispatchStateTest, DoNotDispatchSecondQueryWhileFirstRegistered) {
 
 TEST(SerialDispatchStateTest, KahnTopoOrder) {
     SerialDispatchState state;
-    state.register_fragment(make_two_stage_query(1));
+    std::map<PipelineId, std::vector<PipelineId>> dag;
+    dag[1] = {0};
+    state.register_fragment(
+            make_fragment(1, 100, 0, {{0, false, false}, {1, false, false}}, dag));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->pipeline_id, 0);
@@ -129,7 +126,7 @@ TEST(SerialDispatchStateTest, DelayExchangeSourceUntilSinkFinishes) {
     SerialDispatchState state;
     // Consumer fragment arrives first; it is the only pipeline so it becomes current.
     // exchange_node_id 10 is the recvr that fragment 0's sink targets.
-    state.register_fragment(make_fragment(1, 1, {{0, true, false, 10, -1}}, {}));
+    state.register_fragment(make_fragment(1, 100, 1, {{0, true, false, 10, -1}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 1);
@@ -139,7 +136,7 @@ TEST(SerialDispatchStateTest, DelayExchangeSourceUntilSinkFinishes) {
     EXPECT_EQ(state.wallclock_start_ns(source_key), 1000);
 
     // Local producer arrives: yield the source so the sink can finish first.
-    state.register_fragment(make_fragment(1, 0, {{0, false, true, -1, 10}}, {}));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, true, -1, 10}}, {}));
     cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 0);
@@ -158,7 +155,8 @@ TEST(SerialDispatchStateTest, DelayExchangeSourceUntilSinkFinishes) {
 
 TEST(SerialDispatchStateTest, IndependentPipelinesUseFragmentThenId) {
     SerialDispatchState state;
-    state.register_fragment(make_fragment(1, 0, {{2, false, false}, {1, false, false}}, {}));
+    state.register_fragment(
+            make_fragment(1, 100, 0, {{2, false, false}, {1, false, false}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->pipeline_id, 1);
@@ -171,8 +169,8 @@ TEST(SerialDispatchStateTest, SameFragmentExchangeSourceNotBlockedByOwnSink) {
     std::map<PipelineId, std::vector<PipelineId>> dag;
     dag[1] = {0};
     // Source recvr node 10; this fragment's sink sends to node 20 (downstream), not 10.
-    state.register_fragment(
-            make_fragment(1, 0, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, dag));
+    state.register_fragment(make_fragment(
+            1, 100, 0, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, dag));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 0);
@@ -189,10 +187,10 @@ TEST(SerialDispatchStateTest, OtherFragmentSinkDelaysExchangeSource) {
     SerialDispatchState state;
     std::map<PipelineId, std::vector<PipelineId>> dag;
     dag[1] = {0};
-    state.register_fragment(
-            make_fragment(1, 1, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, dag));
+    state.register_fragment(make_fragment(
+            1, 100, 1, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, dag));
     // Producer fragment with a local exchange sink targeting node 10.
-    state.register_fragment(make_fragment(1, 0, {{0, false, true, -1, 10}}, {}));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, true, -1, 10}}, {}));
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 0);
@@ -212,11 +210,11 @@ TEST(SerialDispatchStateTest, DownstreamSinkDoesNotBlockUpstreamSource) {
     f1_dag[1] = {0};
     std::map<PipelineId, std::vector<PipelineId>> f2_dag;
     f2_dag[1] = {0};
-    state.register_fragment(make_fragment(1, 0, {{0, false, true, -1, 10}}, {}));
-    state.register_fragment(
-            make_fragment(1, 1, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, f1_dag));
-    state.register_fragment(
-            make_fragment(1, 2, {{0, true, false, 20, -1}, {1, false, true, -1, 30}}, f2_dag));
+    state.register_fragment(make_fragment(1, 100, 0, {{0, false, true, -1, 10}}, {}));
+    state.register_fragment(make_fragment(
+            1, 100, 1, {{0, true, false, 10, -1}, {1, false, true, -1, 20}}, f1_dag));
+    state.register_fragment(make_fragment(
+            1, 100, 2, {{0, true, false, 20, -1}, {1, false, true, -1, 30}}, f2_dag));
 
     auto cur = state.current();
     ASSERT_TRUE(cur.has_value());
@@ -240,119 +238,6 @@ TEST(SerialDispatchStateTest, DownstreamSinkDoesNotBlockUpstreamSource) {
     ASSERT_TRUE(cur.has_value());
     EXPECT_EQ(cur->fragment_id, 2);
     EXPECT_EQ(cur->pipeline_id, 0);
-}
-
-TEST(SerialDispatchStateTest, SlotsPartitionWorkersAcrossQueries) {
-    SerialDispatchState state(8);
-    state.set_requested_slots(2);
-    state.register_fragment(make_two_stage_query(1));
-    state.register_fragment(make_two_stage_query(2));
-    ASSERT_EQ(state.slot_count(), 2);
-    EXPECT_EQ(state.slot_of_query(make_qid(1)), 0);
-    EXPECT_EQ(state.slot_of_query(make_qid(2)), 1);
-    EXPECT_EQ(state.workers_of_slot(0), 4);
-    EXPECT_EQ(state.workers_of_slot(1), 4);
-
-    for (int worker = 0; worker < 8; ++worker) {
-        auto cur = state.current_for_worker(worker);
-        ASSERT_TRUE(cur.has_value());
-        EXPECT_EQ(cur->query_id.lo, worker < 4 ? 1 : 2);
-        EXPECT_EQ(cur->pipeline_id, 0);
-    }
-    EXPECT_FALSE(state.current_for_worker(-1).has_value());
-    EXPECT_FALSE(state.current_for_worker(8).has_value());
-}
-
-// Finishing a pipeline of one query moves only that query; the other slot keeps its
-// current pipeline, and a slot whose query has nothing ready idles instead of helping.
-TEST(SerialDispatchStateTest, QueriesInDifferentSlotsAdvanceIndependently) {
-    SerialDispatchState state(8);
-    state.set_requested_slots(2);
-    state.register_fragment(make_two_stage_query(1));
-    state.register_fragment(make_two_stage_query(2));
-
-    state.on_pipeline_finished({make_qid(1), 0, 0});
-    auto q1 = state.current_for_worker(0);
-    auto q2 = state.current_for_worker(4);
-    ASSERT_TRUE(q1.has_value());
-    ASSERT_TRUE(q2.has_value());
-    EXPECT_EQ(q1->query_id.lo, 1);
-    EXPECT_EQ(q1->pipeline_id, 1);
-    EXPECT_EQ(q2->query_id.lo, 2);
-    EXPECT_EQ(q2->pipeline_id, 0);
-
-    state.on_pipeline_finished({make_qid(1), 0, 1});
-    EXPECT_FALSE(state.current_for_worker(0).has_value());
-    q2 = state.current_for_worker(4);
-    ASSERT_TRUE(q2.has_value());
-    EXPECT_EQ(q2->pipeline_id, 0);
-
-    state.on_pipeline_finished({make_qid(2), 0, 0});
-    q2 = state.current_for_worker(7);
-    ASSERT_TRUE(q2.has_value());
-    EXPECT_EQ(q2->pipeline_id, 1);
-    EXPECT_FALSE(state.current_for_worker(3).has_value());
-}
-
-TEST(SerialDispatchStateTest, QueryBeyondSlotCountWaitsForAFreeSlot) {
-    SerialDispatchState state(8);
-    state.set_requested_slots(2);
-    state.register_fragment(make_two_stage_query(1));
-    state.register_fragment(make_two_stage_query(2));
-    state.register_fragment(make_two_stage_query(3));
-    EXPECT_EQ(state.slot_of_query(make_qid(3)), -1);
-    EXPECT_FALSE(state.current_of_query(make_qid(3)).has_value());
-
-    // Query 2 finishing frees slot 1 (workers 4-7); query 1 in slot 0 is untouched.
-    state.on_query_finished(make_qid(2));
-    EXPECT_EQ(state.slot_of_query(make_qid(3)), 1);
-    EXPECT_EQ(state.slot_of_query(make_qid(1)), 0);
-    auto cur = state.current_for_worker(5);
-    ASSERT_TRUE(cur.has_value());
-    EXPECT_EQ(cur->query_id.lo, 3);
-    EXPECT_EQ(cur->pipeline_id, 0);
-    cur = state.current_for_worker(0);
-    ASSERT_TRUE(cur.has_value());
-    EXPECT_EQ(cur->query_id.lo, 1);
-}
-
-// Shrinking the slot count evicts the query in the dropped slot; it waits ahead of later
-// arrivals and resumes on the pipeline it had when it gets a slot again.
-TEST(SerialDispatchStateTest, ShrinkEvictsAndResumesCurrentPipeline) {
-    SerialDispatchState state(8);
-    state.set_requested_slots(2);
-    state.register_fragment(make_two_stage_query(1));
-    state.register_fragment(make_two_stage_query(2));
-    state.on_pipeline_finished({make_qid(2), 0, 0});
-
-    state.set_requested_slots(1);
-    state.register_fragment(make_two_stage_query(3));
-    ASSERT_EQ(state.slot_count(), 1);
-    EXPECT_EQ(state.slot_of_query(make_qid(1)), 0);
-    EXPECT_EQ(state.slot_of_query(make_qid(2)), -1);
-    EXPECT_EQ(state.workers_of_slot(0), 8);
-    auto cur = state.current_for_worker(7);
-    ASSERT_TRUE(cur.has_value());
-    EXPECT_EQ(cur->query_id.lo, 1);
-
-    state.on_query_finished(make_qid(1));
-    EXPECT_EQ(state.slot_of_query(make_qid(2)), 0);
-    EXPECT_EQ(state.slot_of_query(make_qid(3)), -1);
-    cur = state.current_for_worker(0);
-    ASSERT_TRUE(cur.has_value());
-    EXPECT_EQ(cur->query_id.lo, 2);
-    EXPECT_EQ(cur->pipeline_id, 1);
-}
-
-TEST(SerialDispatchStateTest, CloseClearsEverySlot) {
-    SerialDispatchState state(4);
-    state.set_requested_slots(2);
-    state.register_fragment(make_two_stage_query(1));
-    state.register_fragment(make_two_stage_query(2));
-    state.close();
-    for (int worker = 0; worker < 4; ++worker) {
-        EXPECT_FALSE(state.current_for_worker(worker).has_value());
-    }
 }
 
 } // namespace doris

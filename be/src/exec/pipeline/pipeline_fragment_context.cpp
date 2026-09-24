@@ -1820,6 +1820,8 @@ Status PipelineFragmentContext::submit() {
     {
         SerialFragmentInfo info;
         info.query_id = _query_id;
+        const auto ts = _query_ctx->get_query_arrival_timestamp();
+        info.arrival_ns = static_cast<int64_t>(ts.tv_sec) * NANOS_PER_SEC + ts.tv_nsec;
         info.fragment_id = _fragment_id;
         info.dag = _dag;
         info.pipelines.reserve(_pipelines.size());
