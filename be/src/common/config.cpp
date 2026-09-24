@@ -307,13 +307,6 @@ DEFINE_Int32(be_service_threads, "64");
 DEFINE_mInt32(pipeline_status_report_interval, "10");
 DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 
-// Closed-system profiling: number of query slots the pipeline workers are split into.
-// Worker i serves slot i * slots / workers and only that slot's query; queries beyond
-// the slot count wait in arrival order. 32 workers with slots=4 gives 4 queries x 8
-// workers. Clamped to [1, worker count]. Read on every admission event, so a change
-// takes effect as queries arrive and finish.
-DEFINE_mInt32(pipeline_closed_system_slots, "1");
-
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task
