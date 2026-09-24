@@ -28,8 +28,10 @@ namespace doris {
 
 class SerialTaskScheduler final : public TaskScheduler {
 public:
-    SerialTaskScheduler(int thread_num, std::string name, std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
-            : TaskScheduler(thread_num, std::move(name), std::move(cgroup_cpu_ctl)) {}
+    SerialTaskScheduler(int thread_num, std::string name,
+                        std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
+            : TaskScheduler(thread_num, std::move(name), std::move(cgroup_cpu_ctl)),
+              _serial_queue(thread_num) {}
 
     Status register_fragment(const SerialFragmentInfo& info) override {
         return _serial_queue.register_fragment(info);
