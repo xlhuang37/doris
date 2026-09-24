@@ -1954,7 +1954,8 @@ bool PipelineFragmentContext::_close_fragment_instance() {
 }
 
 void PipelineFragmentContext::record_pipeline_wallclock(PipelineId pipeline_id, int64_t start_ns,
-                                                        int64_t end_ns, int64_t elapsed_ns) {
+                                                        int64_t end_ns, int64_t elapsed_ns,
+                                                        int slot_workers) {
     if (!_runtime_state) {
         return;
     }
@@ -1971,6 +1972,7 @@ void PipelineFragmentContext::record_pipeline_wallclock(PipelineId pipeline_id, 
         COUNTER_SET(counter, elapsed_ns);
         profile->add_info_string("WallClockStartNs", std::to_string(start_ns));
         profile->add_info_string("WallClockEndNs", std::to_string(end_ns));
+        profile->add_info_string("SlotWorkers", std::to_string(slot_workers));
         break;
     }
 }

@@ -32,12 +32,14 @@ void SerialTaskScheduler::notify_pipeline_finished(const TUniqueId& query_id, in
     int64_t start_ns = _serial_queue.wallclock_start_ns(key);
     int64_t end_ns = MonotonicNanos();
     int64_t elapsed = start_ns > 0 && end_ns >= start_ns ? end_ns - start_ns : 0;
+    const auto [slot, slot_workers] = _serial_queue.slot_of_query(query_id);
 
     if (ctx != nullptr) {
-        ctx->record_pipeline_wallclock(pipeline_id, start_ns, end_ns, elapsed);
+        ctx->record_pipeline_wallclock(pipeline_id, start_ns, end_ns, elapsed, slot_workers);
     }
     LOG(INFO) << "serial pipeline wallclock query_id=" << print_id(query_id)
               << " fragment_id=" << fragment_id << " pipeline_id=" << pipeline_id
+              << " slot=" << slot << " slot_workers=" << slot_workers
               << " wall_clock_ns=" << elapsed;
 
     _serial_queue.on_pipeline_finished(key);
