@@ -30,6 +30,7 @@
 #include "common/config.h"
 #include "common/logging.h"
 #include "exec/pipeline/serial_task_scheduler.h"
+#include "exec/pipeline/slotted_serial_task_scheduler.h"
 #include "exec/pipeline/task_queue.h"
 #include "exec/pipeline/task_scheduler.h"
 #include "exec/scan/scanner_scheduler.h"
@@ -547,7 +548,12 @@ Status WorkloadGroup::upsert_thread_pool_no_lock(WorkloadGroupInfo* wg_info,
     // 1 create thread pool
     if (_task_sched == nullptr) {
         std::unique_ptr<TaskScheduler> pipeline_task_scheduler;
-        if (config::enable_serial_pipeline_scheduler) {
+        if (config::enable_serial_pipeline_scheduler && config::pipeline_closed_system_slots > 1) {
+            pipeline_task_scheduler = std::make_unique<SlottedSerialTaskScheduler>(
+                    pipeline_exec_thread_num, "p_" + wg_name, cg_cpu_ctl_ptr);
+            LOG(INFO) << "[upsert wg thread pool] using SlottedSerialTaskScheduler, slots="
+                      << config::pipeline_closed_system_slots << ", gid=" << wg_id;
+        } else if (config::enable_serial_pipeline_scheduler) {
             pipeline_task_scheduler = std::make_unique<SerialTaskScheduler>(
                     pipeline_exec_thread_num, "p_" + wg_name, cg_cpu_ctl_ptr);
             LOG(INFO) << "[upsert wg thread pool] using SerialTaskScheduler, gid=" << wg_id;
