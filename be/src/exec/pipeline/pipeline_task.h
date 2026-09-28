@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -138,6 +139,13 @@ public:
     // 1.1 pipeline task
     void inc_runtime_ns(uint64_t delta_time) { this->_runtime += delta_time; }
     uint64_t get_runtime_ns() const { return this->_runtime; }
+    // Query-global counter owned by QueryContext; no-op for tasks without one
+    // (e.g. RevokableTask).
+    void add_query_runtime_ns(uint64_t delta_time) {
+        if (_query_runtime_ptr != nullptr) {
+            _query_runtime_ptr->fetch_add(delta_time, std::memory_order_relaxed);
+        }
+    }
 
     // 1.2 priority queue's queue level
     void update_queue_level(int queue_level) { this->_queue_level = queue_level; }
@@ -217,6 +225,8 @@ private:
     // it may be visited by different thread but there is no race condition
     // so no need to add lock
     uint64_t _runtime = 0;
+    // Points into QueryContext, which outlives this task through PipelineFragmentContext.
+    std::atomic<uint64_t>* _query_runtime_ptr = nullptr;
     // it's visited in one thread, so no need to thread synchronization
     // 1 get task, (set _queue_level/_core_id)
     // 2 exe task
