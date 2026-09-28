@@ -19,6 +19,7 @@
 
 #include <gen_cpp/Types_types.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -27,10 +28,11 @@ namespace doris {
 // Per pipeline worker timeline log. Every worker thread appends to its own file
 // `<worker_timeline_log_dir()>/<scheduler>_<index>.log`, one line per event:
 //
-//   <unix timestamp in microseconds> <query id> START|END
+//   <unix timestamp in microseconds> <query id> START|END <query runtime ns>
 //
 // START is written when the worker begins working on a pipeline task of the query and
-// END when it releases that task.
+// END when it releases that task. <query runtime ns> is QueryContext::query_runtime_counter()
+// read at that moment, so on END it already includes the time charged for the finished run.
 
 // `${LOG_DIR}/worker_timeline/<process startup time, YYYYMMDD-HHMMSS>`, fixed on first call.
 const std::filesystem::path& worker_timeline_log_dir();
@@ -40,6 +42,6 @@ void init_worker_timeline_log_dir();
 
 // Must only be called from the pipeline worker thread identified by `scheduler` and `index`.
 void worker_timeline_record(const std::string& scheduler, int index, const TUniqueId& query_id,
-                            bool start);
+                            bool start, uint64_t query_runtime_ns);
 
 } // namespace doris
