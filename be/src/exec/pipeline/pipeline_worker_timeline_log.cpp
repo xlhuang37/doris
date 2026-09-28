@@ -80,13 +80,14 @@ public:
         }
     }
 
-    void record(const std::string& scheduler, int index, const TUniqueId& query_id, bool start) {
+    void record(const std::string& scheduler, int index, const TUniqueId& query_id, bool start,
+                uint64_t query_runtime_ns) {
         if (_file == nullptr && !_open(scheduler, index)) {
             return;
         }
         fmt::memory_buffer line;
-        fmt::format_to(std::back_inserter(line), "{} {} {}\n", UnixMicros(), print_id(query_id),
-                       start ? "START" : "END");
+        fmt::format_to(std::back_inserter(line), "{} {} {} {}\n", UnixMicros(), print_id(query_id),
+                       start ? "START" : "END", query_runtime_ns);
         std::fwrite(line.data(), 1, line.size(), _file);
 
         const int64_t now_ms = MonotonicMillis();
@@ -145,12 +146,12 @@ void init_worker_timeline_log_dir() {
 }
 
 void worker_timeline_record(const std::string& scheduler, int index, const TUniqueId& query_id,
-                            bool start) {
+                            bool start, uint64_t query_runtime_ns) {
     if (!config::enable_pipeline_worker_timeline_log) {
         return;
     }
     thread_local WorkerTimelineLogger logger;
-    logger.record(scheduler, index, query_id, start);
+    logger.record(scheduler, index, query_id, start, query_runtime_ns);
 }
 
 #include "common/compile_check_end.h"
