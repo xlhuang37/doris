@@ -102,6 +102,11 @@ public:
 
     ExecEnv* exec_env() const { return _exec_env; }
 
+    // Query-global pipeline task CPU/exec runtime, shared by every PipelineFragmentContext
+    // of this query and charged with the same time spent that MultiCoreTaskQueue feeds into
+    // its scheduling statistics.
+    std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
+
     bool is_timeout(timespec now) const {
         if (_timeout_second <= 0) {
             return false;
@@ -337,6 +342,9 @@ private:
     TUniqueId _query_id;
     ExecEnv* _exec_env = nullptr;
     MonotonicStopWatch _query_watcher;
+
+    // Query-global runtime counter; see query_runtime_counter().
+    std::atomic<uint64_t> _query_runtime_ns {0};
     bool _is_nereids = false;
 
     std::shared_ptr<ResourceContext> _resource_ctx;

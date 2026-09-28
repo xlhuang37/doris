@@ -209,6 +209,7 @@ void MultiCoreTaskQueue::update_statistics(PipelineTask* task, int64_t time_spen
     // should not do update_statistics
     if (auto core_id = task->get_thread_id(_core_size); core_id >= 0) {
         task->inc_runtime_ns(time_spent);
+        task->add_query_runtime_ns(time_spent);
         _prio_task_queues[core_id].inc_sub_queue_runtime(task->get_queue_level(), time_spent);
     }
 }
