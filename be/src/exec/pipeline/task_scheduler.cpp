@@ -135,9 +135,14 @@ void TaskScheduler::_do_work(int index) {
 
         // Declared before task_running_defer so that END is written after the task is released.
         const TUniqueId timeline_query_id = fragment_context->get_query_id();
-        worker_timeline_record(_name, index, timeline_query_id, true);
-        Defer worker_timeline_defer {
-                [&]() { worker_timeline_record(_name, index, timeline_query_id, false); }};
+        std::atomic<uint64_t>* timeline_query_runtime =
+                fragment_context->get_query_ctx()->query_runtime_counter();
+        worker_timeline_record(_name, index, timeline_query_id, true,
+                               timeline_query_runtime->load(std::memory_order_relaxed));
+        Defer worker_timeline_defer {[&]() {
+            worker_timeline_record(_name, index, timeline_query_id, false,
+                                   timeline_query_runtime->load(std::memory_order_relaxed));
+        }};
 
         bool done = false;
         auto status = Status::OK();
