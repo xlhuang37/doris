@@ -369,6 +369,9 @@ DECLARE_Int32(be_service_threads);
 DECLARE_mInt32(pipeline_status_report_interval);
 // Time slice for pipeline task execution (ms)
 DECLARE_mInt32(pipeline_task_exec_time_slice);
+// Default soft per-query worker cap for attained-service pipeline scheduling
+// (0 = unbounded); overridden per query by the session variable of the same name
+DECLARE_mInt32(pipeline_query_worker_cap);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
@@ -1713,6 +1716,11 @@ DECLARE_mInt32(snappy_compression_block_size);
 DECLARE_mInt32(lz4_compression_block_size);
 
 DECLARE_mBool(enable_pipeline_task_leakage_detect);
+
+// Write a per pipeline worker timeline (START/END of every pipeline task a worker runs, with
+// UNIX timestamp, query id and the query's global runtime counter) to
+// ${LOG_DIR}/worker_timeline/<BE startup time>/.
+DECLARE_mBool(enable_pipeline_worker_timeline_log);
 
 DECLARE_mInt32(check_score_rounds_num);
 

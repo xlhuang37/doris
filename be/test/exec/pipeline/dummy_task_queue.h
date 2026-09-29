@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <gen_cpp/Types_types.h>
+
 #include "exec/pipeline/task_queue.h"
 #include "exec/pipeline/task_scheduler.h"
 
@@ -23,30 +25,8 @@ namespace doris {
 class DummyTaskQueue final : public MultiCoreTaskQueue {
     explicit DummyTaskQueue(int core_size) : MultiCoreTaskQueue(core_size) {}
     ~DummyTaskQueue() override = default;
-    std::shared_ptr<PipelineTask> take(int core_id) override {
-        std::shared_ptr<PipelineTask> task = nullptr;
-        do {
-            DCHECK(_prio_task_queues.size() > core_id)
-                    << " list size: " << _prio_task_queues.size() << " core_id: " << core_id
-                    << " _core_size: " << _core_size << " _next_core: " << _next_core.load();
-            task = _prio_task_queues[core_id].try_take(false);
-            if (task) {
-                break;
-            }
-            task = _steal_take(core_id);
-            if (task) {
-                break;
-            }
-            task = _prio_task_queues[core_id].take(1);
-            if (task) {
-                break;
-            }
-        } while (false);
-        if (task) {
-            task->pop_out_runnable_queue();
-        }
-        return task;
-    }
+    // Use a short wait so unit tests don't block when the queue is empty.
+    std::shared_ptr<PipelineTask> take(int core_id) override { return _take(core_id, 1); }
 };
 
 class MockTaskScheduler : public TaskScheduler {
@@ -58,6 +38,10 @@ public:
     Status start() override { return Status::OK(); }
 
     void stop() override {}
+
+    void notify_query_terminated(const TUniqueId& query_id) override {
+        _task_queue->notify_query_terminated(query_id);
+    }
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
         return {};
