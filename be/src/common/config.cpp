@@ -320,7 +320,7 @@ DEFINE_mInt32(pipeline_query_worker_cap, "8");
 DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
 // Number of 1-second slots in that histogram; final CPU times past the last slot are
 // clamped into it. Read when a pipeline scheduler is created.
-DEFINE_Int32(pipeline_gittins_histogram_slots, "64");
+DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
 // How often each pipeline scheduler's background thread rebuilds the Gittins index
 // table from newly recorded samples. Rounds with no new samples skip the rebuild.
 DEFINE_mInt32(pipeline_gittins_rebuild_interval_ms, "1000");
