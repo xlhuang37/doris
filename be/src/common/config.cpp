@@ -315,15 +315,14 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // on every rebalance pass, so either can be retuned without a restart.
 DEFINE_mInt32(pipeline_query_worker_cap, "8");
 
-// Rank queries in the pipeline scheduler by Gittins index (derived from a per-pool
-// histogram of final query CPU times) instead of plain least attained service.
+// Rank queries in the pipeline scheduler by Gittins index (derived from the
+// pre-installed final query CPU time distribution) instead of plain least attained
+// service.
 DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
-// Number of 1-second slots in that histogram; final CPU times past the last slot are
-// clamped into it. Read when a pipeline scheduler is created.
-DEFINE_Int32(pipeline_gittins_histogram_slots, "64");
-// How often each pipeline scheduler's background thread rebuilds the Gittins index
-// table from newly recorded samples. Rounds with no new samples skip the rebuild.
-DEFINE_mInt32(pipeline_gittins_rebuild_interval_ms, "1000");
+// Number of 1-second slots in the Gittins index table; final CPU times past the last
+// slot are clamped into it. Read when a pipeline scheduler is created. The default
+// covers the longest pre-installed sample (~411s).
+DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");

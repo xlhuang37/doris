@@ -21,13 +21,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <thread>
 
 #include "common/config.h"
 #include "exec/pipeline/gittins_histogram.h"
+#include "exec/pipeline/gittins_preset_distribution.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/defer_op.h"
 
@@ -118,10 +117,24 @@ PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runti
 }
 } // namespace
 
+// The least-attained-service tests below predate Gittins ranking and assume it is
+// off; the pre-installed distribution would otherwise reorder queries by index.
+class PushBasedTaskQueueTest : public testing::Test {
+protected:
+    void SetUp() override {
+        _old_enable_gittins = config::enable_pipeline_gittins_scheduling;
+        config::enable_pipeline_gittins_scheduling = false;
+    }
+    void TearDown() override { config::enable_pipeline_gittins_scheduling = _old_enable_gittins; }
+
+private:
+    bool _old_enable_gittins = true;
+};
+
 // A lower-attained query is staffed before a higher-attained query, regardless of
 // push order: the scheduler assigns the single worker to the 0-runtime query, and
 // the 5s query is only reached through the work-conserving fallback afterwards.
-TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
+TEST_F(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA); // runtime 0
     auto* qb = qkey(0xB); // runtime 5s
@@ -146,7 +159,7 @@ TEST(PushBasedTaskQueueTest, AbsolutePriorityAcrossQueries) {
 // At equal attained service, cores are dealt greedily in arrival order: the oldest
 // query takes everything it can use before the next one is considered, so with three
 // two-task queries and three workers the split is 2/1/0 in push order.
-TEST(PushBasedTaskQueueTest, EqualAttainedGreedyFcfs) {
+TEST_F(PushBasedTaskQueueTest, EqualAttainedGreedyFcfs) {
     TestTaskQueue q(3);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -169,7 +182,7 @@ TEST(PushBasedTaskQueueTest, EqualAttainedGreedyFcfs) {
 // Demand is the query's active task count, not its sub-queue depth: a query with a
 // single queued task but three live tasks (the rest blocked on dependencies elsewhere)
 // is granted three cores, and the trailing query is left to the fallback.
-TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
+TEST_F(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
     TestTaskQueue q(4);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -188,7 +201,7 @@ TEST(PushBasedTaskQueueTest, DemandComesFromActiveTaskCount) {
 
 // Arrival order decides who gets the cores: the same three queries pushed in the
 // opposite order produce the mirrored allocation.
-TEST(PushBasedTaskQueueTest, AllocationAtEqualAttainedIsFifo) {
+TEST_F(PushBasedTaskQueueTest, AllocationAtEqualAttainedIsFifo) {
     auto allocation = [](const std::array<uintptr_t, 3>& push_order) {
         TestTaskQueue q(3);
         for (uintptr_t id : push_order) {
@@ -211,7 +224,7 @@ TEST(PushBasedTaskQueueTest, AllocationAtEqualAttainedIsFifo) {
 
 // Least attained is satisfied to its full demand first; leftover cores spill to
 // higher-attained queries, and equal attained among those keeps arrival order.
-TEST(PushBasedTaskQueueTest, AllocationSpillsToHigherAttained) {
+TEST_F(PushBasedTaskQueueTest, AllocationSpillsToHigherAttained) {
     TestTaskQueue q(3);
     auto* qa = qkey(0xA); // runtime 0
     auto* qb = qkey(0xB); // runtime 5s, first of the two higher-attained queries
@@ -233,7 +246,7 @@ TEST(PushBasedTaskQueueTest, AllocationSpillsToHigherAttained) {
 
 // Once settled, repeated scheduler passes with no state change leave the allocation
 // exactly where it was.
-TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
+TEST_F(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
     TestTaskQueue q(2);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -260,7 +273,7 @@ TEST(PushBasedTaskQueueTest, SteadyStateKeepsAllocation) {
 
 // A worker keeps serving its assigned query across takes while that query has demand
 // (locality: steady state generates no reassignments).
-TEST(PushBasedTaskQueueTest, QueryLocality) {
+TEST_F(PushBasedTaskQueueTest, QueryLocality) {
     TestTaskQueue q(2);
     auto* qa = qkey(0xA); // attained 0
     auto* qb = qkey(0xB); // attained 5s
@@ -287,7 +300,7 @@ TEST(PushBasedTaskQueueTest, QueryLocality) {
 // A newly arrived lower-attained query pulls the worker off its current
 // higher-attained query: the scheduler overwrites the assignment slot and the
 // worker obeys it on its next take (push-based preemption).
-TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
+TEST_F(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA); // attained 5s
     auto* qc = qkey(0xC); // attained 0
@@ -313,7 +326,7 @@ TEST(PushBasedTaskQueueTest, PreemptionByHigherPriorityQuery) {
 
 // After a running query accumulates more attained service, a fresh zero-attained
 // query is staffed first on the next settled rebalance.
-TEST(PushBasedTaskQueueTest, HigherAttainedYieldsToFresherQuery) {
+TEST_F(PushBasedTaskQueueTest, HigherAttainedYieldsToFresherQuery) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -348,7 +361,7 @@ TEST(PushBasedTaskQueueTest, HigherAttainedYieldsToFresherQuery) {
 
 // A and B start at equal attained service (A arrives first and holds the worker).
 // After A accumulates service, the next settled pass moves the worker to B.
-TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
+TEST_F(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -380,7 +393,7 @@ TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
 
 // pipeline_query_worker_cap bounds a single query even when its demand and the
 // pool are larger; leftover cores spill to the next query.
-TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
+TEST_F(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
     const int32_t old_cap = config::pipeline_query_worker_cap;
     config::pipeline_query_worker_cap = 8;
     Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
@@ -401,7 +414,7 @@ TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
 // A query carrying its own pipeline_query_worker_cap session variable is bounded by
 // that value instead of the BE config, and only that query is affected: the query
 // without an override still gets the config's 8.
-TEST(PushBasedTaskQueueTest, SessionWorkerCapOverridesConfig) {
+TEST_F(PushBasedTaskQueueTest, SessionWorkerCapOverridesConfig) {
     const int32_t old_cap = config::pipeline_query_worker_cap;
     config::pipeline_query_worker_cap = 8;
     Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
@@ -420,7 +433,7 @@ TEST(PushBasedTaskQueueTest, SessionWorkerCapOverridesConfig) {
 }
 
 // A session cap of 0 means unbounded, so it can also lift a restrictive BE config.
-TEST(PushBasedTaskQueueTest, SessionWorkerCapZeroIsUnbounded) {
+TEST_F(PushBasedTaskQueueTest, SessionWorkerCapZeroIsUnbounded) {
     const int32_t old_cap = config::pipeline_query_worker_cap;
     config::pipeline_query_worker_cap = 4;
     Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
@@ -437,7 +450,7 @@ TEST(PushBasedTaskQueueTest, SessionWorkerCapZeroIsUnbounded) {
 
 // The cap is re-read on every rebalance pass, so raising it after the query is already
 // running widens the grant without any restart or re-push.
-TEST(PushBasedTaskQueueTest, WorkerCapChangeTakesEffectAtRuntime) {
+TEST_F(PushBasedTaskQueueTest, WorkerCapChangeTakesEffectAtRuntime) {
     const int32_t old_cap = config::pipeline_query_worker_cap;
     config::pipeline_query_worker_cap = 2;
     Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
@@ -472,7 +485,7 @@ TEST(PushBasedTaskQueueTest, WorkerCapChangeTakesEffectAtRuntime) {
 
 // Idle + detach does not reclaim a live query. Only terminate + workers_attached==0
 // frees the QueryState. A later push after reclaim recreates it.
-TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
+TEST_F(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -490,7 +503,7 @@ TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA), 0);
+    q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -508,7 +521,7 @@ TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
 
 // Terminate while a worker is still attached: the scheduler writes a null
 // assignment; after the worker acks, the state is reclaimed.
-TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
+TEST_F(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -519,7 +532,7 @@ TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
     ASSERT_NE(t, nullptr);
     q.update_statistics(t.get(), 1000);
 
-    q.notify_query_terminated(qid(0xA), 0);
+    q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
@@ -530,7 +543,7 @@ TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
 
 // Work returning after a temporary drain keeps the same QueryState; idle never
 // starts reclaim for a real query.
-TEST(PushBasedTaskQueueTest, IdleDoesNotTeardownWhileQueryAlive) {
+TEST_F(PushBasedTaskQueueTest, IdleDoesNotTeardownWhileQueryAlive) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -557,7 +570,7 @@ TEST(PushBasedTaskQueueTest, IdleDoesNotTeardownWhileQueryAlive) {
 
 // release_task (the "task already running elsewhere" re-queue dance) releases the
 // in-flight slot without charging runtime, and the re-queued task is still served.
-TEST(PushBasedTaskQueueTest, ReleaseAndRequeue) {
+TEST_F(PushBasedTaskQueueTest, ReleaseAndRequeue) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -579,7 +592,7 @@ TEST(PushBasedTaskQueueTest, ReleaseAndRequeue) {
 
 // Degenerate mode (blocking pool): plain shared queue, no scheduler thread, no
 // per-query state; produce/consume and accounting calls are safe.
-TEST(PushBasedTaskQueueTest, GeneralOnlyMode) {
+TEST_F(PushBasedTaskQueueTest, GeneralOnlyMode) {
     TestTaskQueue q(1, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -603,7 +616,7 @@ TEST(PushBasedTaskQueueTest, GeneralOnlyMode) {
 // from another query, including the worker's own assignment. Even though the worker
 // was assigned to query A (the only query known to the scheduler when it settled),
 // the inelastic task from query B is served first.
-TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
+TEST_F(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA); // elastic backlog
     auto* qb = qkey(0xB); // inelastic, higher attained — still served first
@@ -634,7 +647,7 @@ TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
 
 // Inelastic tasks keep full per-query accounting; idle does not reclaim, terminate
 // after detach does. A later inelastic push recreates the state.
-TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
+TEST_F(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -652,7 +665,7 @@ TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA), 0);
+    q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -668,7 +681,7 @@ TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
 
 // One query mixing both kinds: the inelastic task is served first even if pushed
 // last, everything drains, and the counters reconcile so teardown still happens.
-TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
+TEST_F(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
 
@@ -694,7 +707,7 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA), 0);
+    q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -703,7 +716,7 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
 
 // Tasks with no QueryContext share one sentinel bucket. Idle does not reclaim it
 // (no QUERY_TERMINATED will ever arrive); the state lives until queue close.
-TEST(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
+TEST_F(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
     TestTaskQueue q(1);
     ASSERT_TRUE(q.push_back(make_task(nullptr, 0)).ok());
     q.wait_scheduler_settled_for_test();
@@ -722,7 +735,7 @@ TEST(PushBasedTaskQueueTest, SentinelSurvivesIdle) {
 
 // Degenerate mode ignores the inelastic flag: everything goes through the one shared
 // queue in FIFO order.
-TEST(PushBasedTaskQueueTest, GeneralOnlyModeIgnoresInelastic) {
+TEST_F(PushBasedTaskQueueTest, GeneralOnlyModeIgnoresInelastic) {
     TestTaskQueue q(1, MultiCoreTaskQueue::Mode::GENERAL_ONLY);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
@@ -745,7 +758,7 @@ TEST(PushBasedTaskQueueTest, GeneralOnlyModeIgnoresInelastic) {
 }
 
 // close() rejects further pushes and unblocks takers.
-TEST(PushBasedTaskQueueTest, CloseRejectsWork) {
+TEST_F(PushBasedTaskQueueTest, CloseRejectsWork) {
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
@@ -828,36 +841,38 @@ TEST(GittinsHistogramTest, BuildIsSnapshot) {
     EXPECT_DOUBLE_EQ(after->index_of_slot(2), 1.0);
 }
 
-namespace {
-// Ten past queries that each finished in [2s, 3s).
-void seed_gittins_history(TestTaskQueue& q) {
-    for (uintptr_t i = 0; i < 10; ++i) {
-        // These ids never enqueued anything, so termination only records the sample.
-        q.notify_query_terminated(qid(0x100 + i), 2 * kSecondNs + kSecondNs / 2);
-    }
+// The pre-installed distribution's longest query took ~410.6s, so slot 410 has one
+// survivor that finishes within the next second, and nothing survives past it.
+TEST(GittinsPresetTest, TableMatchesPreset) {
+    auto table = build_preset_gittins_table(512);
+    EXPECT_EQ(table->total_samples(), kGittinsPresetCpuTimeMs.size());
+    EXPECT_DOUBLE_EQ(table->index(410 * kSecondNs + kSecondNs / 2), 1.0);
+    EXPECT_DOUBLE_EQ(table->index(411 * kSecondNs), 0.0);
+    EXPECT_DOUBLE_EQ(table->index(450 * kSecondNs), 0.0);
+    // Many short queries finish in [1s, 2s), so a query that has used 1.5s is more
+    // likely to finish soon than a fresh one.
+    EXPECT_GT(table->index(kSecondNs + kSecondNs / 2), table->index(0));
 }
-} // namespace
 
-// With history saying queries finish in [2s, 3s), a query at 2.2s of attained service
-// is about to finish and outranks a fresh one - the reverse of least-attained-service.
-// Turning the policy off restores least-attained-service on the next pass.
-TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
+// With the preset, a query at 1.5s of attained service outranks a fresh one - the
+// reverse of least-attained-service. Turning the policy off restores
+// least-attained-service on the next pass.
+TEST(GittinsTaskQueueTest, PresetOutranksLeastAttained) {
     const bool old_enable = config::enable_pipeline_gittins_scheduling;
     config::enable_pipeline_gittins_scheduling = true;
     Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
     TestTaskQueue q(1);
     auto* qa = qkey(0xA); // fresh
-    auto* qb = qkey(0xB); // 2.2s attained
+    auto* qb = qkey(0xB); // 1.5s attained
+    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
 
-    seed_gittins_history(q);
-    q.rebuild_gittins_table_for_test();
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
     q.wait_scheduler_settled_for_test();
 
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
-    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
     auto t1 = q.take(0);
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qb);
@@ -873,62 +888,24 @@ TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
     q.close();
 }
 
-// The scheduler ranks with the last published table, never the live histogram:
-// samples recorded since the last rebuild do not change priority until the next one.
-TEST(PushBasedTaskQueueTest, GittinsUsesPublishedTableOnly) {
+// Finishing queries do not change the preset ranking.
+TEST(GittinsTaskQueueTest, TerminationDoesNotChangeRanking) {
     const bool old_enable = config::enable_pipeline_gittins_scheduling;
-    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
     config::enable_pipeline_gittins_scheduling = true;
-    config::pipeline_gittins_rebuild_interval_ms = 3600 * 1000; // keep the thread asleep
-    Defer restore {[&]() {
-        config::enable_pipeline_gittins_scheduling = old_enable;
-        config::pipeline_gittins_rebuild_interval_ms = old_interval;
-    }};
+    Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
     TestTaskQueue q(1);
     auto* qa = qkey(0xA);
     auto* qb = qkey(0xB);
+    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
 
-    seed_gittins_history(q);
+    for (uintptr_t i = 0; i < 50; ++i) {
+        q.notify_query_terminated(qid(0x100 + i));
+    }
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
-    q.wait_scheduler_settled_for_test();
-    // Published table is still the empty one: plain least-attained-service.
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
-
-    q.rebuild_gittins_table_for_test();
+    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
-
-    q.close();
-}
-
-// The background thread picks up new samples on its own.
-TEST(PushBasedTaskQueueTest, GittinsRebuildThreadPublishes) {
-    const bool old_enable = config::enable_pipeline_gittins_scheduling;
-    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
-    config::enable_pipeline_gittins_scheduling = true;
-    config::pipeline_gittins_rebuild_interval_ms = 10;
-    Defer restore {[&]() {
-        config::enable_pipeline_gittins_scheduling = old_enable;
-        config::pipeline_gittins_rebuild_interval_ms = old_interval;
-    }};
-    TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
-    seed_gittins_history(q);
-
-    bool flipped = false;
-    for (int i = 0; i < 200 && !flipped; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        q.wait_scheduler_settled_for_test();
-        flipped = q.assigned_workers_for_test(qid(0xB)) == 1;
-    }
-    EXPECT_TRUE(flipped);
 
     q.close();
 }
