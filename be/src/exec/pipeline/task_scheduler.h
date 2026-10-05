@@ -54,8 +54,9 @@ public:
     virtual void stop();
 
     // QueryContext is going away: post an async terminate so each pool can reclaim
-    // its QueryState once no worker is still attached. Must not block.
-    virtual void notify_query_terminated(const TUniqueId& query_id);
+    // its QueryState once no worker is still attached, and record the query's final
+    // attained service into its Gittins histogram. Must not block.
+    virtual void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns);
 
     virtual std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() {
         return {{_name, _fix_thread_pool->debug_info()}};
@@ -104,7 +105,7 @@ public:
 
     void stop() override;
 
-    void notify_query_terminated(const TUniqueId& query_id) override;
+    void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns) override;
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
         return {_blocking_scheduler.thread_debug_info()[0],

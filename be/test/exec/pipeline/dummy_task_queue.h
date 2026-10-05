@@ -39,8 +39,8 @@ public:
 
     void stop() override {}
 
-    void notify_query_terminated(const TUniqueId& query_id) override {
-        _task_queue->notify_query_terminated(query_id);
+    void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns) override {
+        _task_queue->notify_query_terminated(query_id, final_runtime_ns);
     }
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
