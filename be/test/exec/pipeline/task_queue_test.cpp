@@ -25,6 +25,7 @@
 #include <memory>
 
 #include "common/config.h"
+#include "exec/pipeline/gittins_histogram.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/defer_op.h"
 
@@ -487,7 +488,7 @@ TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -516,7 +517,7 @@ TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
     ASSERT_NE(t, nullptr);
     q.update_statistics(t.get(), 1000);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
@@ -649,7 +650,7 @@ TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -691,7 +692,7 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -749,6 +750,98 @@ TEST(PushBasedTaskQueueTest, CloseRejectsWork) {
     q.close();
     EXPECT_FALSE(q.push_back(make_task(qa, 0)).ok());
     EXPECT_EQ(q.take(0), nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Gittins index
+// ---------------------------------------------------------------------------
+
+TEST(GittinsHistogramTest, EmptyHistoryIsZeroEverywhere) {
+    GittinsHistogram h(8);
+    EXPECT_EQ(h.total_samples(), 0);
+    for (size_t slot = 0; slot < h.num_slots(); ++slot) {
+        EXPECT_EQ(h.index_of_slot(slot), 0.0) << "slot " << slot;
+    }
+    EXPECT_EQ(h.index(100 * kSecondNs), 0.0);
+}
+
+// Every query finishes in [2s, 3s). The index peaks right before the completion
+// mass, decays with the lookahead needed to reach it, and is 0 past it.
+TEST(GittinsHistogramTest, IndexPeaksBeforeCompletionMass) {
+    GittinsHistogram h(8);
+    for (int i = 0; i < 10; ++i) {
+        h.record(2 * kSecondNs + kSecondNs / 2);
+    }
+    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.25); // reached at d = 4
+    EXPECT_DOUBLE_EQ(h.index_of_slot(1), 0.5);  // reached at d = 2
+    EXPECT_DOUBLE_EQ(h.index_of_slot(2), 1.0);  // reached at d = 1
+    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 0.0);  // no survivors
+    // Lookup floors attained service into its slot.
+    EXPECT_DOUBLE_EQ(h.index(kSecondNs + kSecondNs / 2), 0.5);
+}
+
+// The probability is conditional on having survived to the current slot, so queries
+// that already outlived the short half of a bimodal distribution are compared only
+// against the long half.
+TEST(GittinsHistogramTest, ConditionsOnSurvivors) {
+    GittinsHistogram h(8);
+    for (int i = 0; i < 5; ++i) {
+        h.record(kSecondNs / 2);     // slot 0
+        h.record(4 * kSecondNs + 1); // slot 4
+    }
+    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.5);  // 5 of 10 finish within d = 1
+    EXPECT_DOUBLE_EQ(h.index_of_slot(1), 0.25); // 5 of 5 finish within d = 4
+    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 0.5);  // 5 of 5 finish within d = 2
+    EXPECT_DOUBLE_EQ(h.index_of_slot(4), 1.0);
+    EXPECT_DOUBLE_EQ(h.index_of_slot(5), 0.0);
+}
+
+// Final times past the array land in the last slot, and attained service past the
+// array is looked up there too.
+TEST(GittinsHistogramTest, ClampsIntoLastSlot) {
+    GittinsHistogram h(4);
+    h.record(100 * kSecondNs);
+    EXPECT_EQ(h.total_samples(), 1);
+    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 1.0);
+    EXPECT_DOUBLE_EQ(h.index(1000 * kSecondNs), 1.0);
+    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.25); // reached at d = 4 = whole array
+}
+
+// With history saying queries finish in [2s, 3s), a query at 2.2s of attained service
+// is about to finish and outranks a fresh one - the reverse of least-attained-service.
+// Turning the policy off restores least-attained-service on the next pass.
+TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    config::enable_pipeline_gittins_scheduling = true;
+    Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA); // fresh
+    auto* qb = qkey(0xB); // 2.2s attained
+
+    // Seed the history. These ids never enqueued anything, so termination only records.
+    for (uintptr_t i = 0; i < 10; ++i) {
+        q.notify_query_terminated(qid(0x100 + i), 2 * kSecondNs + kSecondNs / 2);
+    }
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qb);
+
+    config::enable_pipeline_gittins_scheduling = false;
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+    auto t2 = q.take(0); // preempts to A despite B still having a runnable task
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qa);
+
+    q.close();
 }
 
 } // namespace doris
