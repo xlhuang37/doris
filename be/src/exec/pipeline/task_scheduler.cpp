@@ -74,8 +74,8 @@ Status TaskScheduler::submit(PipelineTaskSPtr task) {
     return _task_queue.push_back(task);
 }
 
-void TaskScheduler::notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns) {
-    _task_queue.notify_query_terminated(query_id, final_runtime_ns);
+void TaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _task_queue.notify_query_terminated(query_id);
 }
 
 // after close_task, task maybe destructed.
@@ -233,10 +233,9 @@ void HybridTaskScheduler::stop() {
     _simple_scheduler.stop();
 }
 
-void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id,
-                                                  uint64_t final_runtime_ns) {
-    _blocking_scheduler.notify_query_terminated(query_id, final_runtime_ns);
-    _simple_scheduler.notify_query_terminated(query_id, final_runtime_ns);
+void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
+    _blocking_scheduler.notify_query_terminated(query_id);
+    _simple_scheduler.notify_query_terminated(query_id);
 }
 
 } // namespace doris

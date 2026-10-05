@@ -36,15 +36,15 @@ namespace doris {
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
         : _core_size(core_size),
           _mode(mode),
-          _gittins(mode == Mode::FULL ? config::pipeline_gittins_histogram_slots : 1),
-          _gittins_table(_gittins.build()) {
+          _gittins_table(mode == Mode::FULL ? build_preset_gittins_table(
+                                                      config::pipeline_gittins_histogram_slots)
+                                            : nullptr) {
     if (_mode == Mode::FULL) {
         auto worker_count = static_cast<size_t>(std::max(core_size, 1));
         _worker_slots = std::vector<WorkerSlot>(worker_count);
         _worker_local = std::vector<WorkerLocal>(worker_count);
         _worker_sched = std::vector<WorkerSched>(worker_count);
         _scheduler_thread = std::thread([this]() { _scheduler_loop(); });
-        _gittins_thread = std::thread([this]() { _gittins_rebuild_loop(); });
     }
 }
 
@@ -355,12 +355,10 @@ void MultiCoreTaskQueue::_post_message(SchedulerMessage msg) {
     _inbox_cv.notify_one();
 }
 
-void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id,
-                                                 uint64_t final_runtime_ns) {
+void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id) {
     if (_mode != Mode::FULL || _is_sentinel(query_id)) {
         return;
     }
-    _gittins.record(final_runtime_ns);
     SchedulerMessage msg;
     msg.type = SchedulerMessage::Type::QUERY_TERMINATED;
     msg.query_id = query_id;
@@ -571,15 +569,12 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     _queries.resize(live);
 
     // Priority: highest Gittins index first, then least attained service, then arrival
-    // order. With the policy off (or no history yet) every index is 0, which reduces
-    // to plain least-attained-service.
-    std::shared_ptr<const GittinsIndexTable> gittins;
-    if (config::enable_pipeline_gittins_scheduling) {
-        gittins = _load_gittins_table();
-    }
+    // order. With the policy off every index is 0, which reduces to plain
+    // least-attained-service.
+    const bool use_gittins = config::enable_pipeline_gittins_scheduling;
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
-        qs->rr_index = gittins ? gittins->index(qs->rr_attained) : 0.0;
+        qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
     }
     std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
         if (a->rr_index != b->rr_index) {
@@ -674,52 +669,6 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
-// Gittins rebuild thread
-// ---------------------------------------------------------------------------
-
-void MultiCoreTaskQueue::_gittins_rebuild_loop() {
-    Thread::set_self_name("pipe_gittins");
-    std::unique_lock<std::mutex> lk(_gittins_rebuild_mutex);
-    while (true) {
-        // Re-read every round so the interval can be retuned at runtime.
-        const int interval_ms = std::max(config::pipeline_gittins_rebuild_interval_ms, 1);
-        if (_gittins_rebuild_cv.wait_for(lk, std::chrono::milliseconds(interval_ms),
-                                         [this]() { return _closed.load(); })) {
-            break;
-        }
-        _rebuild_gittins_table_locked();
-    }
-}
-
-void MultiCoreTaskQueue::_rebuild_gittins_table_locked() {
-    // Read the version before snapshotting: a sample racing with build() bumps it
-    // again, so the next round rebuilds rather than missing it.
-    const uint64_t version = _gittins.version();
-    if (version == _gittins_built_version) {
-        return;
-    }
-    auto table = _gittins.build();
-    {
-        std::lock_guard<std::mutex> lk(_gittins_table_mutex);
-        _gittins_table = std::move(table);
-    }
-    _gittins_built_version = version;
-}
-
-std::shared_ptr<const GittinsIndexTable> MultiCoreTaskQueue::_load_gittins_table() const {
-    std::lock_guard<std::mutex> lk(_gittins_table_mutex);
-    return _gittins_table;
-}
-
-void MultiCoreTaskQueue::rebuild_gittins_table_for_test() {
-    if (_mode != Mode::FULL) {
-        return;
-    }
-    std::lock_guard<std::mutex> lk(_gittins_rebuild_mutex);
-    _rebuild_gittins_table_locked();
-}
-
-// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -736,15 +685,6 @@ void MultiCoreTaskQueue::close() {
     _inbox_cv.notify_all();
     if (_scheduler_thread.joinable()) {
         _scheduler_thread.join();
-    }
-    {
-        // Same lost-wakeup guard as the inbox: the rebuild thread checks `_closed`
-        // under this mutex before waiting.
-        std::lock_guard<std::mutex> lk(_gittins_rebuild_mutex);
-    }
-    _gittins_rebuild_cv.notify_all();
-    if (_gittins_thread.joinable()) {
-        _gittins_thread.join();
     }
     // Fulfill any test-sync promises that raced with shutdown so waiters can't hang.
     {
