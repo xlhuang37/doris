@@ -20,18 +20,15 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <vector>
 
 namespace doris {
 #include "common/compile_check_begin.h"
 
-// Empirical distribution of final query CPU times, used to rank running queries by
-// (an approximation of) their Gittins index.
-//
-// Slot i covers final CPU times in [i, i + 1) slot widths; times past the last slot
-// are clamped into it, so tail mass still counts as "survives at least this long".
-// Counts are kept as prefix sums so the completions in any slot range are an O(1)
-// difference.
+// Immutable per-slot Gittins index table, built from a GittinsHistogram snapshot.
+// Safe to read from any thread once published.
 //
 // The index of a query whose attained service lands in slot `a` is
 //     max over d in {1, 2, 4, ...}, a + d <= N, of
@@ -39,59 +36,87 @@ namespace doris {
 // i.e. the best "probability of finishing per unit of further service" over
 // exponentially growing lookaheads. It is 0 when no recorded query got as far as
 // slot `a`, or when no lookahead fits in the array.
-//
-// Not thread-safe: owned and used by a single (scheduler) thread.
-class GittinsHistogram {
+class GittinsIndexTable {
 public:
-    explicit GittinsHistogram(int num_slots, uint64_t slot_width_ns = 1'000'000'000ULL)
-            : _num_slots(static_cast<size_t>(std::max(num_slots, 1))),
-              _slot_width_ns(std::max<uint64_t>(slot_width_ns, 1)),
-              _prefix(_num_slots + 1, 0),
-              _index_by_slot(_num_slots, 0.0) {}
-
-    void record(uint64_t final_ns) {
-        const size_t slot = _slot_of(final_ns);
-        for (size_t i = slot + 1; i <= _num_slots; ++i) {
-            ++_prefix[i];
-        }
-        _rebuild_index();
-    }
-
-    double index(uint64_t attained_ns) const { return _index_by_slot[_slot_of(attained_ns)]; }
-
-    double index_of_slot(size_t slot) const { return _index_by_slot[slot]; }
-
-    uint64_t total_samples() const { return _prefix[_num_slots]; }
-
-    size_t num_slots() const { return _num_slots; }
-
-private:
-    size_t _slot_of(uint64_t ns) const {
-        return static_cast<size_t>(std::min<uint64_t>(ns / _slot_width_ns, _num_slots - 1));
-    }
-
-    void _rebuild_index() {
-        const uint64_t total = _prefix[_num_slots];
-        for (size_t a = 0; a < _num_slots; ++a) {
-            const uint64_t survivors = total - _prefix[a];
+    // `prefix[i]` = number of samples whose final time falls in slots [0, i); size N+1.
+    GittinsIndexTable(const std::vector<uint64_t>& prefix, uint64_t slot_width_ns)
+            : _slot_width_ns(std::max<uint64_t>(slot_width_ns, 1)),
+              _total_samples(prefix.back()),
+              _index_by_slot(prefix.size() - 1, 0.0) {
+        const size_t num_slots = _index_by_slot.size();
+        for (size_t a = 0; a < num_slots; ++a) {
+            const uint64_t survivors = _total_samples - prefix[a];
+            if (survivors == 0) {
+                continue;
+            }
             double best = 0.0;
-            if (survivors > 0) {
-                for (size_t d = 1; a + d <= _num_slots; d <<= 1) {
-                    const uint64_t finished = _prefix[a + d] - _prefix[a];
-                    const double idx = static_cast<double>(finished) /
-                                       static_cast<double>(survivors) / static_cast<double>(d);
-                    best = std::max(best, idx);
-                }
+            for (size_t d = 1; a + d <= num_slots; d <<= 1) {
+                const uint64_t finished = prefix[a + d] - prefix[a];
+                const double idx = static_cast<double>(finished) /
+                                   static_cast<double>(survivors) / static_cast<double>(d);
+                best = std::max(best, idx);
             }
             _index_by_slot[a] = best;
         }
     }
 
-    const size_t _num_slots;
+    double index(uint64_t attained_ns) const {
+        const auto slot = static_cast<size_t>(
+                std::min<uint64_t>(attained_ns / _slot_width_ns, _index_by_slot.size() - 1));
+        return _index_by_slot[slot];
+    }
+
+    double index_of_slot(size_t slot) const { return _index_by_slot[slot]; }
+
+    uint64_t total_samples() const { return _total_samples; }
+
+    size_t num_slots() const { return _index_by_slot.size(); }
+
+private:
     const uint64_t _slot_width_ns;
-    // _prefix[i] = number of recorded queries whose final time falls in slots [0, i).
-    std::vector<uint64_t> _prefix;
+    const uint64_t _total_samples;
     std::vector<double> _index_by_slot;
+};
+
+// Empirical distribution of final query CPU times, used to rank running queries by
+// (an approximation of) their Gittins index.
+//
+// Slot i covers final CPU times in [i, i + 1) slot widths; times past the last slot
+// are clamped into it, so tail mass still counts as "survives at least this long".
+//
+// record() may be called from any thread. build() takes a relaxed snapshot of the
+// counts; a sample racing with it lands in either this build or the next, and the
+// snapshot is always self-consistent because the total is derived from it.
+class GittinsHistogram {
+public:
+    explicit GittinsHistogram(int num_slots, uint64_t slot_width_ns = 1'000'000'000ULL)
+            : _slot_width_ns(std::max<uint64_t>(slot_width_ns, 1)),
+              _counts(static_cast<size_t>(std::max(num_slots, 1))) {}
+
+    void record(uint64_t final_ns) {
+        const auto slot = static_cast<size_t>(
+                std::min<uint64_t>(final_ns / _slot_width_ns, _counts.size() - 1));
+        _counts[slot].fetch_add(1, std::memory_order_relaxed);
+        _version.fetch_add(1, std::memory_order_release);
+    }
+
+    // Bumped by every record(); lets a rebuilder skip work when nothing changed.
+    uint64_t version() const { return _version.load(std::memory_order_acquire); }
+
+    std::shared_ptr<const GittinsIndexTable> build() const {
+        std::vector<uint64_t> prefix(_counts.size() + 1, 0);
+        for (size_t i = 0; i < _counts.size(); ++i) {
+            prefix[i + 1] = prefix[i] + _counts[i].load(std::memory_order_relaxed);
+        }
+        return std::make_shared<const GittinsIndexTable>(prefix, _slot_width_ns);
+    }
+
+    size_t num_slots() const { return _counts.size(); }
+
+private:
+    const uint64_t _slot_width_ns;
+    std::vector<std::atomic<uint64_t>> _counts;
+    std::atomic<uint64_t> _version {0};
 };
 
 #include "common/compile_check_end.h"

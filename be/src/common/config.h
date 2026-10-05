@@ -376,6 +376,8 @@ DECLARE_mInt32(pipeline_query_worker_cap);
 DECLARE_mBool(enable_pipeline_gittins_scheduling);
 // Number of 1-second slots in the Gittins final-CPU-time histogram
 DECLARE_Int32(pipeline_gittins_histogram_slots);
+// Interval of the background Gittins index table rebuild
+DECLARE_mInt32(pipeline_gittins_rebuild_interval_ms);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
