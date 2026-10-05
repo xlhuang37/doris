@@ -21,8 +21,10 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <thread>
 
 #include "common/config.h"
 #include "exec/pipeline/gittins_histogram.h"
@@ -758,11 +760,12 @@ TEST(PushBasedTaskQueueTest, CloseRejectsWork) {
 
 TEST(GittinsHistogramTest, EmptyHistoryIsZeroEverywhere) {
     GittinsHistogram h(8);
-    EXPECT_EQ(h.total_samples(), 0);
-    for (size_t slot = 0; slot < h.num_slots(); ++slot) {
-        EXPECT_EQ(h.index_of_slot(slot), 0.0) << "slot " << slot;
+    auto table = h.build();
+    EXPECT_EQ(table->total_samples(), 0);
+    for (size_t slot = 0; slot < table->num_slots(); ++slot) {
+        EXPECT_EQ(table->index_of_slot(slot), 0.0) << "slot " << slot;
     }
-    EXPECT_EQ(h.index(100 * kSecondNs), 0.0);
+    EXPECT_EQ(table->index(100 * kSecondNs), 0.0);
 }
 
 // Every query finishes in [2s, 3s). The index peaks right before the completion
@@ -772,12 +775,13 @@ TEST(GittinsHistogramTest, IndexPeaksBeforeCompletionMass) {
     for (int i = 0; i < 10; ++i) {
         h.record(2 * kSecondNs + kSecondNs / 2);
     }
-    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.25); // reached at d = 4
-    EXPECT_DOUBLE_EQ(h.index_of_slot(1), 0.5);  // reached at d = 2
-    EXPECT_DOUBLE_EQ(h.index_of_slot(2), 1.0);  // reached at d = 1
-    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 0.0);  // no survivors
+    auto table = h.build();
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.25); // reached at d = 4
+    EXPECT_DOUBLE_EQ(table->index_of_slot(1), 0.5);  // reached at d = 2
+    EXPECT_DOUBLE_EQ(table->index_of_slot(2), 1.0);  // reached at d = 1
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 0.0);  // no survivors
     // Lookup floors attained service into its slot.
-    EXPECT_DOUBLE_EQ(h.index(kSecondNs + kSecondNs / 2), 0.5);
+    EXPECT_DOUBLE_EQ(table->index(kSecondNs + kSecondNs / 2), 0.5);
 }
 
 // The probability is conditional on having survived to the current slot, so queries
@@ -789,11 +793,12 @@ TEST(GittinsHistogramTest, ConditionsOnSurvivors) {
         h.record(kSecondNs / 2);     // slot 0
         h.record(4 * kSecondNs + 1); // slot 4
     }
-    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.5);  // 5 of 10 finish within d = 1
-    EXPECT_DOUBLE_EQ(h.index_of_slot(1), 0.25); // 5 of 5 finish within d = 4
-    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 0.5);  // 5 of 5 finish within d = 2
-    EXPECT_DOUBLE_EQ(h.index_of_slot(4), 1.0);
-    EXPECT_DOUBLE_EQ(h.index_of_slot(5), 0.0);
+    auto table = h.build();
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.5);  // 5 of 10 finish within d = 1
+    EXPECT_DOUBLE_EQ(table->index_of_slot(1), 0.25); // 5 of 5 finish within d = 4
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 0.5);  // 5 of 5 finish within d = 2
+    EXPECT_DOUBLE_EQ(table->index_of_slot(4), 1.0);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(5), 0.0);
 }
 
 // Final times past the array land in the last slot, and attained service past the
@@ -801,11 +806,37 @@ TEST(GittinsHistogramTest, ConditionsOnSurvivors) {
 TEST(GittinsHistogramTest, ClampsIntoLastSlot) {
     GittinsHistogram h(4);
     h.record(100 * kSecondNs);
-    EXPECT_EQ(h.total_samples(), 1);
-    EXPECT_DOUBLE_EQ(h.index_of_slot(3), 1.0);
-    EXPECT_DOUBLE_EQ(h.index(1000 * kSecondNs), 1.0);
-    EXPECT_DOUBLE_EQ(h.index_of_slot(0), 0.25); // reached at d = 4 = whole array
+    auto table = h.build();
+    EXPECT_EQ(table->total_samples(), 1);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 1.0);
+    EXPECT_DOUBLE_EQ(table->index(1000 * kSecondNs), 1.0);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.25); // reached at d = 4 = whole array
 }
+
+// A built table is a snapshot: later samples only show up in the next build, and
+// the version tells a rebuilder whether there is anything new.
+TEST(GittinsHistogramTest, BuildIsSnapshot) {
+    GittinsHistogram h(8);
+    const uint64_t v0 = h.version();
+    auto before = h.build();
+    h.record(2 * kSecondNs);
+    EXPECT_NE(h.version(), v0);
+    EXPECT_EQ(before->total_samples(), 0);
+    EXPECT_DOUBLE_EQ(before->index_of_slot(2), 0.0);
+    auto after = h.build();
+    EXPECT_EQ(after->total_samples(), 1);
+    EXPECT_DOUBLE_EQ(after->index_of_slot(2), 1.0);
+}
+
+namespace {
+// Ten past queries that each finished in [2s, 3s).
+void seed_gittins_history(TestTaskQueue& q) {
+    for (uintptr_t i = 0; i < 10; ++i) {
+        // These ids never enqueued anything, so termination only records the sample.
+        q.notify_query_terminated(qid(0x100 + i), 2 * kSecondNs + kSecondNs / 2);
+    }
+}
+} // namespace
 
 // With history saying queries finish in [2s, 3s), a query at 2.2s of attained service
 // is about to finish and outranks a fresh one - the reverse of least-attained-service.
@@ -818,10 +849,8 @@ TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
     auto* qa = qkey(0xA); // fresh
     auto* qb = qkey(0xB); // 2.2s attained
 
-    // Seed the history. These ids never enqueued anything, so termination only records.
-    for (uintptr_t i = 0; i < 10; ++i) {
-        q.notify_query_terminated(qid(0x100 + i), 2 * kSecondNs + kSecondNs / 2);
-    }
+    seed_gittins_history(q);
+    q.rebuild_gittins_table_for_test();
     ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
     ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
     q.wait_scheduler_settled_for_test();
@@ -840,6 +869,66 @@ TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
     auto t2 = q.take(0); // preempts to A despite B still having a runnable task
     ASSERT_NE(t2, nullptr);
     EXPECT_EQ(t2->query_ctx_raw(), qa);
+
+    q.close();
+}
+
+// The scheduler ranks with the last published table, never the live histogram:
+// samples recorded since the last rebuild do not change priority until the next one.
+TEST(PushBasedTaskQueueTest, GittinsUsesPublishedTableOnly) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
+    config::enable_pipeline_gittins_scheduling = true;
+    config::pipeline_gittins_rebuild_interval_ms = 3600 * 1000; // keep the thread asleep
+    Defer restore {[&]() {
+        config::enable_pipeline_gittins_scheduling = old_enable;
+        config::pipeline_gittins_rebuild_interval_ms = old_interval;
+    }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    seed_gittins_history(q);
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    q.wait_scheduler_settled_for_test();
+    // Published table is still the empty one: plain least-attained-service.
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    q.rebuild_gittins_table_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+// The background thread picks up new samples on its own.
+TEST(PushBasedTaskQueueTest, GittinsRebuildThreadPublishes) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
+    config::enable_pipeline_gittins_scheduling = true;
+    config::pipeline_gittins_rebuild_interval_ms = 10;
+    Defer restore {[&]() {
+        config::enable_pipeline_gittins_scheduling = old_enable;
+        config::pipeline_gittins_rebuild_interval_ms = old_interval;
+    }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    seed_gittins_history(q);
+
+    bool flipped = false;
+    for (int i = 0; i < 200 && !flipped; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        q.wait_scheduler_settled_for_test();
+        flipped = q.assigned_workers_for_test(qid(0xB)) == 1;
+    }
+    EXPECT_TRUE(flipped);
 
     q.close();
 }
