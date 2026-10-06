@@ -491,6 +491,10 @@ struct TQueryOptions {
   // Default 8MB. Sent by FE session variable preferred_block_size_bytes.
   218: optional i64 preferred_block_size_bytes = 8388608
 
+  // Client-declared expected service of the query in ms, for the pipeline scheduler.
+  // -1 means not set. Sent by FE session variable expected_service.
+  219: optional i64 expected_service_ms = -1
+
   // For cloud, to control if the content would be written into file cache
   // In write path, to control if the content would be written into file cache.
   // In read path, read from file cache or remote storage when execute query.

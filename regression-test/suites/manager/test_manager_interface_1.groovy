@@ -545,6 +545,7 @@ suite('test_manager_interface_1',"p0") {
         assertTrue(result[0][1].contains("`is_query` tinyint NULL,"))
         assertTrue(result[0][1].contains("`frontend_ip` varchar(1024) NULL,"))
         assertTrue(result[0][1].contains("`cpu_time_ms` bigint NULL,"))
+        assertTrue(result[0][1].contains("`attained_service_ms` bigint NULL,"))
         assertTrue(result[0][1].contains("`sql_hash` varchar(128) NULL,"))
         assertTrue(result[0][1].contains("`sql_digest` varchar(128) NULL,"))
         assertTrue(result[0][1].contains("`peak_memory_bytes` bigint NULL,"))

@@ -48,6 +48,18 @@ public class AuditLogBuilderTest {
     }
 
     @Test
+    public void testAttainedServiceOutput() {
+        AuditLogBuilder auditLogBuilder = new AuditLogBuilder();
+        AuditEvent auditEvent = new AuditEvent.AuditEventBuilder()
+                .setCpuTimeMs(1234L)
+                .setAttainedServiceMs(5678L)
+                .build();
+        String result = Deencapsulation.invoke(auditLogBuilder, "getAuditLogString", auditEvent);
+        Assert.assertTrue(result.contains("CpuTimeMS=1234"));
+        Assert.assertTrue(result.contains("AttainedServiceMS=5678"));
+    }
+
+    @Test
     public void testHandleStmtTruncationForNonInsertStmt() {
         // Save original values
         int originalMaxSqlLength = GlobalVariable.auditPluginMaxSqlLength;

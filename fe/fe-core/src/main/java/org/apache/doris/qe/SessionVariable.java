@@ -163,6 +163,7 @@ public class SessionVariable implements Serializable, Writable {
     public static final String BATCH_SIZE = "batch_size";
     public static final String BROKER_LOAD_BATCH_SIZE = "broker_load_batch_size";
     public static final String PREFERRED_BLOCK_SIZE_BYTES = "preferred_block_size_bytes";
+    public static final String EXPECTED_SERVICE = "expected_service";
     public static final String DISABLE_STREAMING_PREAGGREGATIONS = "disable_streaming_preaggregations";
     public static final String ENABLE_DISTINCT_STREAMING_AGGREGATION = "enable_distinct_streaming_aggregation";
     public static final String ENABLE_STREAMING_AGG_HASH_JOIN_FORCE_PASSTHROUGH =
@@ -1295,6 +1296,13 @@ public class SessionVariable implements Serializable, Writable {
                 "Target output block size in bytes for adaptive batch size. "
                     + "Range [1MB, 512MB]. Default 8MB."})
     public long preferredBlockSizeBytes = 8388608L; // 8MB
+
+    @VariableMgr.VarAttr(name = EXPECTED_SERVICE, needForward = true,
+            checker = "checkExpectedService",
+            description = {"查询的预期服务时间（毫秒），传递给 BE 的 pipeline 调度器使用。-1 表示未设置。",
+                "Expected service of the query in milliseconds, passed to the BE pipeline "
+                    + "scheduler. -1 means not set."})
+    public long expectedService = -1L;
 
     @VariableMgr.VarAttr(name = EMBED_MAX_BATCH_SIZE, needForward = true,
             checker = "checkEmbedMaxBatchSize",
@@ -5307,6 +5315,7 @@ public class SessionVariable implements Serializable, Writable {
 
         tResult.setBatchSize(batchSize);
         tResult.setPreferredBlockSizeBytes(preferredBlockSizeBytes);
+        tResult.setExpectedServiceMs(expectedService);
         tResult.setEmbedMaxBatchSize(embedMaxBatchSize);
         tResult.setAiContextWindowSize(aiContextWindowSize);
         tResult.setDisableStreamPreaggregations(disableStreamPreaggregations);
@@ -5995,6 +6004,14 @@ public class SessionVariable implements Serializable, Writable {
                     "preferred_block_size_bytes should be between 1MB ("
                     + PREFERRED_BLOCK_SIZE_BYTES_MIN + ") and 512MB ("
                     + PREFERRED_BLOCK_SIZE_BYTES_MAX + "), got " + v);
+        }
+    }
+
+    public void checkExpectedService(String value) {
+        long v = Long.parseLong(value);
+        if (v < -1) {
+            throw new InvalidParameterException(
+                    EXPECTED_SERVICE + " should be -1 (not set) or a non-negative number of ms, got " + v);
         }
     }
 

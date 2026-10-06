@@ -127,7 +127,6 @@ void TaskScheduler::_do_work(int index) {
         bool done = false;
         auto status = Status::OK();
         int64_t exec_ns = 0;
-        SCOPED_RAW_TIMER(&exec_ns);
         Defer task_running_defer {[&]() {
             // If fragment is finished, fragment context will be de-constructed with all tasks in it.
             if (done || !status.ok()) {
@@ -138,8 +137,15 @@ void TaskScheduler::_do_work(int index) {
             } else {
                 task->set_running(false);
             }
+            fragment_context->get_query_ctx()
+                    ->resource_ctx()
+                    ->cpu_context()
+                    ->update_attained_service_ns(exec_ns);
             _task_queue.update_statistics(task.get(), exec_ns);
         }};
+        // Must be declared after task_running_defer: the timer only writes exec_ns in its
+        // destructor, which has to run before task_running_defer reads it.
+        SCOPED_RAW_TIMER(&exec_ns);
         bool canceled = fragment_context->is_canceled();
 
         // Close task if canceled

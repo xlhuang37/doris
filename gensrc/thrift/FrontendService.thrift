@@ -214,6 +214,8 @@ struct TQueryStatistics {
     15: optional i64 process_rows
     16: optional i32 finished_tasks_num
     17: optional i32 total_tasks_num
+    // Wall-clock time the query's pipeline tasks spent executing on scheduler workers
+    18: optional i64 attained_service_ms
 }
 
 struct TQueryStatisticsResult {

@@ -86,6 +86,8 @@ public class AuditEvent {
     public long queryTime = -1;
     @AuditField(value = "CpuTimeMS", colName = "cpu_time_ms")
     public long cpuTimeMs = -1;
+    @AuditField(value = "AttainedServiceMS", colName = "attained_service_ms")
+    public long attainedServiceMs = -1;
     @AuditField(value = "PeakMemoryBytes", colName = "peak_memory_bytes")
     public long peakMemoryBytes = -1;
     @AuditField(value = "ScanBytes", colName = "scan_bytes")
@@ -238,6 +240,11 @@ public class AuditEvent {
 
         public AuditEventBuilder setCpuTimeMs(long cpuTimeMs) {
             auditEvent.cpuTimeMs = cpuTimeMs;
+            return this;
+        }
+
+        public AuditEventBuilder setAttainedServiceMs(long attainedServiceMs) {
+            auditEvent.attainedServiceMs = attainedServiceMs;
             return this;
         }
 

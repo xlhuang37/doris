@@ -237,4 +237,31 @@ public class VariableMgrTest {
                         new StringLiteral("0"))));
         Assert.assertTrue(blockSizeException.getMessage().contains("preferred_block_size_bytes"));
     }
+
+    @Test
+    public void testExpectedServiceDefaultsToUnset() {
+        SessionVariable var = new SessionVariable();
+        TQueryOptions options = var.toThrift();
+        Assert.assertEquals(-1L, var.expectedService);
+        Assert.assertEquals(-1L, options.getExpectedServiceMs());
+    }
+
+    @Test
+    public void testExpectedServiceForwardedToThrift() throws Exception {
+        SessionVariable var = new SessionVariable();
+        VariableMgr.setVar(var, new SetVar(SetType.SESSION, SessionVariable.EXPECTED_SERVICE,
+                new StringLiteral("5000")));
+        TQueryOptions options = var.toThrift();
+        Assert.assertEquals(5000L, var.expectedService);
+        Assert.assertTrue(options.isSetExpectedServiceMs());
+        Assert.assertEquals(5000L, options.getExpectedServiceMs());
+    }
+
+    @Test
+    public void testExpectedServiceRejectsNegative() {
+        SessionVariable var = new SessionVariable();
+        DdlException exception = Assert.assertThrows(DdlException.class, () -> VariableMgr.setVar(var,
+                new SetVar(SetType.SESSION, SessionVariable.EXPECTED_SERVICE, new StringLiteral("-2"))));
+        Assert.assertTrue(exception.getMessage().contains("expected_service"));
+    }
 }

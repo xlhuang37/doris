@@ -1237,6 +1237,25 @@ TEST_F(PipelineTest, QueryTaskProgressThriftSerialization) {
     EXPECT_EQ(tqs.finished_tasks_num, 4);
 }
 
+TEST_F(PipelineTest, AttainedServiceThriftSerialization) {
+    auto* cpu_ctx = _query_ctx->resource_ctx()->cpu_context();
+    EXPECT_EQ(_query_ctx->attained_service_ns(), 0);
+
+    cpu_ctx->update_attained_service_ns(1'500'000);
+    cpu_ctx->update_attained_service_ns(2'000'000);
+    EXPECT_EQ(cpu_ctx->attained_service_ns(), 3'500'000);
+    EXPECT_EQ(_query_ctx->attained_service_ns(), 3'500'000);
+
+    TQueryStatistics tqs;
+    _query_ctx->resource_ctx()->to_thrift_query_statistics(&tqs);
+    EXPECT_TRUE(tqs.__isset.attained_service_ms);
+    EXPECT_EQ(tqs.attained_service_ms, 3);
+}
+
+TEST_F(PipelineTest, ExpectedServiceDefaultsToUnset) {
+    EXPECT_EQ(_query_ctx->expected_service_ms(), -1);
+}
+
 TEST_F(PipelineTest, QueryTaskProgressBoundaryZeroTotal) {
     // Verify behavior when no tasks have been registered (total = 0).
     auto* ctrl = dynamic_cast<QueryTaskController*>(_query_ctx->resource_ctx()->task_controller());
