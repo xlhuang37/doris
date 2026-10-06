@@ -189,6 +189,20 @@ public:
     bool enable_force_spill() const {
         return _query_options.__isset.enable_force_spill && _query_options.enable_force_spill;
     }
+
+    // Client-declared expected service of this query in ms (session variable
+    // expected_service), for the pipeline scheduler. -1 when not set.
+    int64_t expected_service_ms() const {
+        return _query_options.__isset.expected_service_ms ? _query_options.expected_service_ms
+                                                          : -1;
+    }
+
+    // Service this query has attained so far on this BE; see
+    // CPUContext::attained_service_ns().
+    int64_t attained_service_ns() const {
+        return _resource_ctx->cpu_context()->attained_service_ns();
+    }
+
     const TQueryOptions& query_options() const { return _query_options; }
     bool should_be_shuffled_agg(int node_id) const {
         return _query_options.__isset.shuffled_agg_ids &&

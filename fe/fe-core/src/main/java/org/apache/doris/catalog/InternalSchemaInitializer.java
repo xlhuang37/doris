@@ -355,6 +355,7 @@ public class InternalSchemaInitializer extends Thread {
          *   `error_message` text NULL COMMENT "",
          *   `query_time` bigint NULL COMMENT "",
          *   `cpu_time_ms` bigint NULL COMMENT "",
+         *   `attained_service_ms` bigint NULL COMMENT "",
          *   `peak_memory_bytes` bigint NULL COMMENT "",
          *   `scan_bytes` bigint NULL COMMENT "",
          *   `scan_rows` bigint NULL COMMENT "",

@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/factory_creator.h"
 #include "runtime/runtime_profile.h"
 #include "runtime/workload_group/workload_group.h"
@@ -58,6 +60,16 @@ public:
 
     void update_cpu_cost_ms(int64_t delta) const;
 
+    // Attained service: wall-clock time this query's pipeline tasks have spent executing
+    // on pipeline scheduler workers. Unlike cpu_cost_ms it is not thread CPU time and
+    // excludes scanner and async-writer threads. Reported as attained_service_ms.
+    int64_t attained_service_ns() const {
+        return _attained_service_ns.load(std::memory_order_relaxed);
+    }
+    void update_attained_service_ns(int64_t delta) {
+        _attained_service_ns.fetch_add(delta, std::memory_order_relaxed);
+    }
+
     // Bind current thread to cgroup, only some load thread should do this.
     void bind_workload_group() {
         // TODO: Call workload group method to bind current thread to cgroup
@@ -70,6 +82,7 @@ protected:
 
     Stats stats_;
     ResourceContext* resource_ctx_ {nullptr};
+    std::atomic<int64_t> _attained_service_ns {0};
 };
 
 #include "common/compile_check_end.h"

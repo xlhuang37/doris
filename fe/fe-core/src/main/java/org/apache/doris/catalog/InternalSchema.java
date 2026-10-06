@@ -154,6 +154,8 @@ public class InternalSchema {
                 TypeDef.create(PrimitiveType.BIGINT), ColumnNullableType.NULLABLE));
         AUDIT_SCHEMA.add(new ColumnDef("cpu_time_ms",
                 TypeDef.create(PrimitiveType.BIGINT), ColumnNullableType.NULLABLE));
+        AUDIT_SCHEMA.add(new ColumnDef("attained_service_ms",
+                TypeDef.create(PrimitiveType.BIGINT), ColumnNullableType.NULLABLE));
         AUDIT_SCHEMA.add(new ColumnDef("peak_memory_bytes",
                 TypeDef.create(PrimitiveType.BIGINT), ColumnNullableType.NULLABLE));
         AUDIT_SCHEMA.add(new ColumnDef("scan_bytes",

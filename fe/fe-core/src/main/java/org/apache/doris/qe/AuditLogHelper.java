@@ -215,6 +215,9 @@ public class AuditLogHelper {
                         ctx.getState().getErrorMessage().replace("\n", " ").replace("\t", " ")))
                 .setQueryTime(elapseMs)
                 .setCpuTimeMs(statistics == null ? 0 : statistics.getCpuMs())
+                // Only reported through the BE runtime query statistics, which
+                // WorkloadRuntimeStatusMgr fills in before the event is logged.
+                .setAttainedServiceMs(0)
                 .setPeakMemoryBytes(statistics == null ? 0 : statistics.getMaxPeakMemoryBytes())
                 .setScanBytes(statistics == null ? 0 : statistics.getScanBytes())
                 .setScanRows(statistics == null ? 0 : statistics.getScanRows())

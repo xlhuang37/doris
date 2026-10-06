@@ -95,6 +95,7 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
                     auditEvent.scanBytesFromRemoteStorage = queryStats.scan_bytes_from_remote_storage;
                     auditEvent.peakMemoryBytes = queryStats.max_peak_memory_bytes;
                     auditEvent.cpuTimeMs = queryStats.cpu_ms;
+                    auditEvent.attainedServiceMs = queryStats.attained_service_ms;
                     auditEvent.shuffleSendBytes = queryStats.shuffle_send_bytes;
                     auditEvent.shuffleSendRows = queryStats.shuffle_send_rows;
                     auditEvent.spillWriteBytesToLocalStorage = queryStats.spill_write_bytes_to_local_storage;
@@ -306,6 +307,7 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
         dst.setScanBytesFromRemoteStorage(dst.scan_bytes_from_remote_storage
                 + srcStats.scan_bytes_from_remote_storage);
         dst.setCpuMs(dst.cpu_ms + srcStats.cpu_ms);
+        dst.setAttainedServiceMs(dst.attained_service_ms + srcStats.attained_service_ms);
         dst.setShuffleSendBytes(dst.shuffle_send_bytes + srcStats.shuffle_send_bytes);
         dst.setShuffleSendRows(dst.shuffle_send_rows + srcStats.shuffle_send_rows);
         dst.setProcessRows(dst.process_rows + srcStats.process_rows);
