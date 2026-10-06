@@ -308,14 +308,6 @@ void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTas
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
     auto charged_ns = static_cast<uint64_t>(std::max<int64_t>(time_spent, 0));
-    if (charge) {
-        // Charge the executed CPU time to the owning query's global counter. This
-        // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers, and is the attained
-        // service that priority ranking is keyed on. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op and they stay at attained 0.
-        task->add_query_runtime_ns(charged_ns);
-    }
     if (_mode != Mode::FULL) {
         return;
     }
@@ -331,6 +323,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     _refresh_query_mirror(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
+        // Attained service is not charged here: execute() already added this run's
+        // thread CPU time to the query's CPUContext (as do scanners, spill and async
+        // writers), so the snapshot just picks up the current value. Tasks without a
+        // query CPUContext (e.g. RevokableTask) stay at attained 0.
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
