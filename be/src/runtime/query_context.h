@@ -102,11 +102,13 @@ public:
 
     ExecEnv* exec_env() const { return _exec_env; }
 
-    // Query-global CPU/exec runtime counter shared by every PipelineFragmentContext
-    // of this query. It is the attained-service key for the pipeline task scheduler
-    // (and is still charged by the scan time-sharing scheduler), so all fragments of
-    // a small query share one low "attained service" value and win priority together.
-    std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
+    // Attained service of this query on this BE, in ns: the thread CPU time charged to
+    // CPUContext by pipeline tasks, spill, scanners and async writers. It is the same
+    // counter this BE reports as the audit log's CpuTimeMS, and the key the pipeline
+    // task scheduler ranks queries by.
+    uint64_t attained_service_ns() const {
+        return static_cast<uint64_t>(_resource_ctx->cpu_context()->cpu_cost_ms());
+    }
 
     // Tasks of this query that currently want a core, across all fragments and
     // instances: submitted and not yet finished, minus those parked on a dependency.
@@ -359,8 +361,6 @@ private:
     ExecEnv* _exec_env = nullptr;
     MonotonicStopWatch _query_watcher;
 
-    // Query-global runtime counter; see query_runtime_counter().
-    std::atomic<uint64_t> _query_runtime_ns {0};
     // Query-global runnable task count; see active_task_counter().
     std::atomic<int> _active_task_num {0};
     bool _is_nereids = false;
