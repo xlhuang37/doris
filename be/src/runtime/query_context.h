@@ -104,10 +104,10 @@ public:
 
     // Attained service of this query on this BE, in ns: the thread CPU time charged to
     // CPUContext by pipeline tasks, spill, scanners and async writers. It is the same
-    // counter this BE reports as the audit log's CpuTimeMS, and the key the pipeline
-    // task scheduler ranks queries by.
+    // counter this BE reports as the audit log's CpuTimeMS (and AttainedServiceMS), and
+    // the key the pipeline task scheduler ranks queries by.
     uint64_t attained_service_ns() const {
-        return static_cast<uint64_t>(_resource_ctx->cpu_context()->cpu_cost_ms());
+        return static_cast<uint64_t>(_resource_ctx->cpu_context()->attained_service_ns());
     }
 
     // Tasks of this query that currently want a core, across all fragments and
@@ -219,13 +219,6 @@ public:
         return _query_options.__isset.expected_service_ms ? _query_options.expected_service_ms
                                                           : -1;
     }
-
-    // Service this query has attained so far on this BE; see
-    // CPUContext::attained_service_ns().
-    int64_t attained_service_ns() const {
-        return _resource_ctx->cpu_context()->attained_service_ns();
-    }
-
     const TQueryOptions& query_options() const { return _query_options; }
     bool should_be_shuffled_agg(int node_id) const {
         return _query_options.__isset.shuffled_agg_ids &&
