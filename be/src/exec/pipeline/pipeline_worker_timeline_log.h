@@ -31,8 +31,9 @@ namespace doris {
 //   <unix timestamp in microseconds> <query id> START|END <query runtime ns>
 //
 // START is written when the worker begins working on a pipeline task of the query and
-// END when it releases that task. <query runtime ns> is QueryContext::query_runtime_counter()
-// read at that moment, so on END it already includes the time charged for the finished run.
+// END when it releases that task. <query runtime ns> is QueryContext::attained_service_ns()
+// (the query's CPUContext CPU time on this BE) read at that moment, so on END it already
+// includes the CPU time PipelineTask::execute() charged for the finished run.
 
 // `${LOG_DIR}/worker_timeline/<process startup time, YYYYMMDD-HHMMSS>`, fixed on first call.
 const std::filesystem::path& worker_timeline_log_dir();
