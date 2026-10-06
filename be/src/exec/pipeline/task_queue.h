@@ -55,8 +55,9 @@ namespace doris {
 //     push-assigns workers by writing per-worker, cache-aligned assignment slots.
 //     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
 //     a single append-only vector, re-sorted on every rebalance. The index is looked
-//     up, keyed by each query's attained service (the query-global CPU runtime
-//     counter, mirrored onto each QueryState), in a table that a dedicated rebuild
+//     up, keyed by each query's attained service (the query's CPUContext CPU time,
+//     the same counter reported as audit CpuTimeMS, mirrored onto each
+//     QueryState), in a table that a dedicated rebuild
 //     thread periodically recomputes from a histogram of this pool's past final
 //     query CPU times (see GittinsHistogram); higher index first. Equal
 //     indexes fall back to least attained service, then arrival order (stable_sort),
@@ -126,8 +127,9 @@ public:
     Status push_back(PipelineTaskSPtr task);
     Status push_back(PipelineTaskSPtr task, int core_id);
 
-    // Charge executed CPU time to the owning query's global counter (drives
-    // attained-service ranking), then release the in-flight slot the task held.
+    // Add the run's wall-clock time to the per-pool statistic, refresh the query's
+    // attained-service snapshot from its CPUContext, then release the in-flight slot
+    // the task held.
     void update_statistics(PipelineTask* task, int64_t time_spent);
 
     // Release the in-flight slot a task held without charging runtime. Used when a
@@ -207,8 +209,8 @@ private:
         double rr_index = 0.0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
-        // CPU time executed in this pool (per-pool statistic; the authoritative
-        // ranking counter is the query-global one behind add_query_runtime_ns()).
+        // Wall-clock time this query's tasks ran on this pool's workers (per-pool
+        // statistic; ranking uses the query's CPUContext time, see attained_ns).
         alignas(64) std::atomic<uint64_t> cpu_time_ns {0};
         // Snapshot of query-global attained service, refreshed whenever a task is
         // in hand (enqueue / charge). The scheduler derives each query's Gittins

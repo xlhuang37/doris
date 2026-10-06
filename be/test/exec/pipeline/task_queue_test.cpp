@@ -378,6 +378,39 @@ TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
     q.close();
 }
 
+// Attained service is the query's CPUContext CPU time (query_runtime_ns()), not the
+// wall-clock time the scheduler measures: a long update_statistics() slice leaves the
+// ranking alone, while CPU charged outside the pipeline workers (e.g. by scanners) is
+// picked up the next time one of the query's tasks is enqueued.
+TEST(PushBasedTaskQueueTest, AttainedFollowsQueryCpuNotSchedulerTime) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qa);
+    // 5s of wall-clock in the scheduler, but no CPU charged to A's CPUContext.
+    q.update_statistics(t1.get(), static_cast<int64_t>(5 * kSecondNs));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    // A's scanners charged 5s of CPU; its next enqueued task carries that value.
+    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
 // pipeline_query_worker_cap bounds a single query even when its demand and the
 // pool are larger; leftover cores spill to the next query.
 TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
