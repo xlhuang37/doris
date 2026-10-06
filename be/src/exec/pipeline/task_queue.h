@@ -35,6 +35,7 @@
 #include <gen_cpp/Types_types.h>
 
 #include "common/status.h"
+#include "exec/pipeline/gittins_histogram.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/hash_util.hpp"
 
@@ -50,12 +51,18 @@ namespace doris {
 //     once, through its owning query's token (enqueue serialized by a per-query mutex,
 //     since explicit producers are single-producer). Sub-queues are drained lock-free
 //     via try_dequeue_from_producer.
-//   - A central scheduler thread ranks live queries by attained service (the
-//     query-global CPU runtime counter, mirrored onto each QueryState) and
+//   - A central scheduler thread ranks live queries by their Gittins index and
 //     push-assigns workers by writing per-worker, cache-aligned assignment slots.
 //     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
-//     a single append-only vector, re-sorted on every rebalance; equal attained
-//     service keeps arrival order (stable_sort).
+//     a single append-only vector, re-sorted on every rebalance. The index is looked
+//     up, keyed by each query's attained service (the query's CPUContext CPU time,
+//     the same counter reported as audit CpuTimeMS, mirrored onto each
+//     QueryState), in a table that a dedicated rebuild
+//     thread periodically recomputes from a histogram of this pool's past final
+//     query CPU times (see GittinsHistogram); higher index first. Equal
+//     indexes fall back to least attained service, then arrival order (stable_sort),
+//     so with no history - or with `enable_pipeline_gittins_scheduling` off - the
+//     ranking is plain least-attained-service.
 //   - Core allocation is greedy first-come-first-served in that order: each query
 //     takes as many of the pool's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
@@ -74,7 +81,7 @@ namespace doris {
 //     critical path. Such tasks keep full per-query bookkeeping (pending/in-flight
 //     counters, idle detection, teardown) but bypass the per-query sub-queue and go
 //     into a dedicated shared queue that every worker drains before anything else,
-//     ahead of its assignment and of attained-service ranking entirely.
+//     ahead of its assignment and of priority ranking entirely.
 //   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
 //     new queries, query termination); the scheduler sleeps on a condition variable
 //     with a timer tick and rebalances every pass so accumulated CPU is visible
@@ -120,8 +127,9 @@ public:
     Status push_back(PipelineTaskSPtr task);
     Status push_back(PipelineTaskSPtr task, int core_id);
 
-    // Charge executed CPU time to the owning query's global counter (drives
-    // attained-service ranking), then release the in-flight slot the task held.
+    // Add the run's wall-clock time to the per-pool statistic, refresh the query's
+    // attained-service snapshot from its CPUContext, then release the in-flight slot
+    // the task held.
     void update_statistics(PipelineTask* task, int64_t time_spent);
 
     // Release the in-flight slot a task held without charging runtime. Used when a
@@ -129,9 +137,11 @@ public:
     // re-queued without being executed.
     void release_task(PipelineTask* task);
 
-    // QueryContext is being destroyed. Posts QUERY_TERMINATED; the scheduler reclaims
-    // the QueryState once workers_attached == 0. No-op in degenerate mode.
-    void notify_query_terminated(const TUniqueId& query_id);
+    // QueryContext is being destroyed. Records `final_runtime_ns` (the query's final
+    // attained service) into the Gittins histogram, which the rebuild thread picks up
+    // on its next pass, and posts QUERY_TERMINATED; the scheduler reclaims the
+    // QueryState once workers_attached == 0. No-op in degenerate mode.
+    void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns);
 
     int cores() const { return _core_size; }
 
@@ -146,6 +156,10 @@ public:
     // Test hook: how many worker slots currently point at `query_id`, i.e. how many
     // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
     int assigned_workers_for_test(const TUniqueId& query_id) const;
+
+    // Test hook: rebuild and publish the Gittins index table now instead of waiting
+    // for the rebuild thread. No-op in degenerate mode.
+    void rebuild_gittins_table_for_test();
 
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
@@ -189,13 +203,18 @@ private:
         // Rebalance scratch (valid only within one rebalance pass).
         int rr_grant = 0;
         int rr_demand = 0;
+        // Sort keys, snapshotted once per pass: `attained_ns` keeps moving under the
+        // workers, and the comparator must see one consistent value.
+        uint64_t rr_attained = 0;
+        double rr_index = 0.0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
-        // CPU time executed in this pool (per-pool statistic; the authoritative
-        // ranking counter is the query-global one behind add_query_runtime_ns()).
+        // Wall-clock time this query's tasks ran on this pool's workers (per-pool
+        // statistic; ranking uses the query's CPUContext time, see attained_ns).
         alignas(64) std::atomic<uint64_t> cpu_time_ns {0};
         // Snapshot of query-global attained service, refreshed whenever a task is
-        // in hand (enqueue / charge). The scheduler sorts `_queries` by this.
+        // in hand (enqueue / charge). The scheduler derives each query's Gittins
+        // index from this and uses it as the tie-break.
         std::atomic<uint64_t> attained_ns {0};
         // Tasks of this query currently between dequeue and release in this pool.
         // Ordering contract with `pending_approx` (both seq_cst): a dequeuing worker
@@ -312,6 +331,13 @@ private:
     void _rebalance_and_dispatch();
     void _write_assignment(int worker_id, QueryState* value);
 
+    // ---- Gittins rebuild thread ----
+    void _gittins_rebuild_loop();
+    // Caller holds `_gittins_rebuild_mutex`. No-op if nothing was recorded since the
+    // last rebuild.
+    void _rebuild_gittins_table_locked();
+    std::shared_ptr<const GittinsIndexTable> _load_gittins_table() const;
+
     bool _worker_in_range(int worker_id) const {
         return worker_id >= 0 && worker_id < static_cast<int>(_worker_slots.size());
     }
@@ -349,9 +375,22 @@ private:
     std::vector<QueryState*> _queries;
     // Queries pending destroy after QUERY_TERMINATED (scheduler-thread-only).
     std::vector<QueryState*> _destroy_candidates;
-    // Queries that received a grant in the current rebalance pass, in attained-service
-    // order. Reused across passes to avoid reallocating (scheduler-thread-only).
+    // Queries that received a grant in the current rebalance pass, in priority order.
+    // Reused across passes to avoid reallocating (scheduler-thread-only).
     std::vector<QueryState*> _granted_queries;
+    // Gittins index (full mode). Terminating queries record their final CPU time
+    // into `_gittins` from whatever thread destroys the QueryContext; the rebuild
+    // thread periodically turns the histogram into an immutable index table and
+    // publishes it; the scheduler grabs the latest table once per rebalance pass.
+    // The table is never null, so the scheduler never waits on a rebuild.
+    GittinsHistogram _gittins;
+    mutable std::mutex _gittins_table_mutex;
+    std::shared_ptr<const GittinsIndexTable> _gittins_table; // guarded by the mutex above
+    // Serializes rebuilds (rebuild thread vs test hook) and parks the rebuild thread.
+    std::mutex _gittins_rebuild_mutex;
+    std::condition_variable _gittins_rebuild_cv;
+    uint64_t _gittins_built_version = 0; // guarded by _gittins_rebuild_mutex
+    std::thread _gittins_thread;
 
     // Inbox.
     std::mutex _inbox_mutex;

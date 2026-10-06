@@ -21,10 +21,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <thread>
 
 #include "common/config.h"
+#include "exec/pipeline/gittins_histogram.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/defer_op.h"
 
@@ -375,6 +378,39 @@ TEST(PushBasedTaskQueueTest, RebalanceMovesWorkerToLeastAttained) {
     q.close();
 }
 
+// Attained service is the query's CPUContext CPU time (query_runtime_ns()), not the
+// wall-clock time the scheduler measures: a long update_statistics() slice leaves the
+// ranking alone, while CPU charged outside the pipeline workers (e.g. by scanners) is
+// picked up the next time one of the query's tasks is enqueued.
+TEST(PushBasedTaskQueueTest, AttainedFollowsQueryCpuNotSchedulerTime) {
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 0)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qa);
+    // 5s of wall-clock in the scheduler, but no CPU charged to A's CPUContext.
+    q.update_statistics(t1.get(), static_cast<int64_t>(5 * kSecondNs));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    // A's scanners charged 5s of CPU; its next enqueued task carries that value.
+    ASSERT_TRUE(q.push_back(make_task(qa, 5 * kSecondNs)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
 // pipeline_query_worker_cap bounds a single query even when its demand and the
 // pool are larger; leftover cores spill to the next query.
 TEST(PushBasedTaskQueueTest, WorkerCapLimitsGrant) {
@@ -487,7 +523,7 @@ TEST(PushBasedTaskQueueTest, TerminateReclaimsAfterDetach) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -516,7 +552,7 @@ TEST(PushBasedTaskQueueTest, TerminateUnassignsAttachedWorker) {
     ASSERT_NE(t, nullptr);
     q.update_statistics(t.get(), 1000);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.take(0), nullptr);
     q.wait_scheduler_settled_for_test();
@@ -649,7 +685,7 @@ TEST(PushBasedTaskQueueTest, InelasticAccountingAndTeardown) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -691,7 +727,7 @@ TEST(PushBasedTaskQueueTest, InelasticMixedWithElasticSameQuery) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 1);
 
-    q.notify_query_terminated(qid(0xA));
+    q.notify_query_terminated(qid(0xA), 0);
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.registry_size_for_test(), 0);
 
@@ -749,6 +785,185 @@ TEST(PushBasedTaskQueueTest, CloseRejectsWork) {
     q.close();
     EXPECT_FALSE(q.push_back(make_task(qa, 0)).ok());
     EXPECT_EQ(q.take(0), nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Gittins index
+// ---------------------------------------------------------------------------
+
+TEST(GittinsHistogramTest, EmptyHistoryIsZeroEverywhere) {
+    GittinsHistogram h(8);
+    auto table = h.build();
+    EXPECT_EQ(table->total_samples(), 0);
+    for (size_t slot = 0; slot < table->num_slots(); ++slot) {
+        EXPECT_EQ(table->index_of_slot(slot), 0.0) << "slot " << slot;
+    }
+    EXPECT_EQ(table->index(100 * kSecondNs), 0.0);
+}
+
+// Every query finishes in [2s, 3s). The index peaks right before the completion
+// mass, decays with the lookahead needed to reach it, and is 0 past it.
+TEST(GittinsHistogramTest, IndexPeaksBeforeCompletionMass) {
+    GittinsHistogram h(8);
+    for (int i = 0; i < 10; ++i) {
+        h.record(2 * kSecondNs + kSecondNs / 2);
+    }
+    auto table = h.build();
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.25); // reached at d = 4
+    EXPECT_DOUBLE_EQ(table->index_of_slot(1), 0.5);  // reached at d = 2
+    EXPECT_DOUBLE_EQ(table->index_of_slot(2), 1.0);  // reached at d = 1
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 0.0);  // no survivors
+    // Lookup floors attained service into its slot.
+    EXPECT_DOUBLE_EQ(table->index(kSecondNs + kSecondNs / 2), 0.5);
+}
+
+// The probability is conditional on having survived to the current slot, so queries
+// that already outlived the short half of a bimodal distribution are compared only
+// against the long half.
+TEST(GittinsHistogramTest, ConditionsOnSurvivors) {
+    GittinsHistogram h(8);
+    for (int i = 0; i < 5; ++i) {
+        h.record(kSecondNs / 2);     // slot 0
+        h.record(4 * kSecondNs + 1); // slot 4
+    }
+    auto table = h.build();
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.5);  // 5 of 10 finish within d = 1
+    EXPECT_DOUBLE_EQ(table->index_of_slot(1), 0.25); // 5 of 5 finish within d = 4
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 0.5);  // 5 of 5 finish within d = 2
+    EXPECT_DOUBLE_EQ(table->index_of_slot(4), 1.0);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(5), 0.0);
+}
+
+// Final times past the array land in the last slot, and attained service past the
+// array is looked up there too.
+TEST(GittinsHistogramTest, ClampsIntoLastSlot) {
+    GittinsHistogram h(4);
+    h.record(100 * kSecondNs);
+    auto table = h.build();
+    EXPECT_EQ(table->total_samples(), 1);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(3), 1.0);
+    EXPECT_DOUBLE_EQ(table->index(1000 * kSecondNs), 1.0);
+    EXPECT_DOUBLE_EQ(table->index_of_slot(0), 0.25); // reached at d = 4 = whole array
+}
+
+// A built table is a snapshot: later samples only show up in the next build, and
+// the version tells a rebuilder whether there is anything new.
+TEST(GittinsHistogramTest, BuildIsSnapshot) {
+    GittinsHistogram h(8);
+    const uint64_t v0 = h.version();
+    auto before = h.build();
+    h.record(2 * kSecondNs);
+    EXPECT_NE(h.version(), v0);
+    EXPECT_EQ(before->total_samples(), 0);
+    EXPECT_DOUBLE_EQ(before->index_of_slot(2), 0.0);
+    auto after = h.build();
+    EXPECT_EQ(after->total_samples(), 1);
+    EXPECT_DOUBLE_EQ(after->index_of_slot(2), 1.0);
+}
+
+namespace {
+// Ten past queries that each finished in [2s, 3s).
+void seed_gittins_history(TestTaskQueue& q) {
+    for (uintptr_t i = 0; i < 10; ++i) {
+        // These ids never enqueued anything, so termination only records the sample.
+        q.notify_query_terminated(qid(0x100 + i), 2 * kSecondNs + kSecondNs / 2);
+    }
+}
+} // namespace
+
+// With history saying queries finish in [2s, 3s), a query at 2.2s of attained service
+// is about to finish and outranks a fresh one - the reverse of least-attained-service.
+// Turning the policy off restores least-attained-service on the next pass.
+TEST(PushBasedTaskQueueTest, GittinsOutranksLeastAttained) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    config::enable_pipeline_gittins_scheduling = true;
+    Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA); // fresh
+    auto* qb = qkey(0xB); // 2.2s attained
+
+    seed_gittins_history(q);
+    q.rebuild_gittins_table_for_test();
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    auto t1 = q.take(0);
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qb);
+
+    config::enable_pipeline_gittins_scheduling = false;
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+    auto t2 = q.take(0); // preempts to A despite B still having a runnable task
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qa);
+
+    q.close();
+}
+
+// The scheduler ranks with the last published table, never the live histogram:
+// samples recorded since the last rebuild do not change priority until the next one.
+TEST(PushBasedTaskQueueTest, GittinsUsesPublishedTableOnly) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
+    config::enable_pipeline_gittins_scheduling = true;
+    config::pipeline_gittins_rebuild_interval_ms = 3600 * 1000; // keep the thread asleep
+    Defer restore {[&]() {
+        config::enable_pipeline_gittins_scheduling = old_enable;
+        config::pipeline_gittins_rebuild_interval_ms = old_interval;
+    }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    seed_gittins_history(q);
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    q.wait_scheduler_settled_for_test();
+    // Published table is still the empty one: plain least-attained-service.
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    q.rebuild_gittins_table_for_test();
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+// The background thread picks up new samples on its own.
+TEST(PushBasedTaskQueueTest, GittinsRebuildThreadPublishes) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    const int32_t old_interval = config::pipeline_gittins_rebuild_interval_ms;
+    config::enable_pipeline_gittins_scheduling = true;
+    config::pipeline_gittins_rebuild_interval_ms = 10;
+    Defer restore {[&]() {
+        config::enable_pipeline_gittins_scheduling = old_enable;
+        config::pipeline_gittins_rebuild_interval_ms = old_interval;
+    }};
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA);
+    auto* qb = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task(qb, 2 * kSecondNs + kSecondNs / 5)).ok());
+    seed_gittins_history(q);
+
+    bool flipped = false;
+    for (int i = 0; i < 200 && !flipped; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        q.wait_scheduler_settled_for_test();
+        flipped = q.assigned_workers_for_test(qid(0xB)) == 1;
+    }
+    EXPECT_TRUE(flipped);
+
+    q.close();
 }
 
 } // namespace doris

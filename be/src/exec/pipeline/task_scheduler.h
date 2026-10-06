@@ -54,8 +54,9 @@ public:
     virtual void stop();
 
     // QueryContext is going away: post an async terminate so each pool can reclaim
-    // its QueryState once no worker is still attached. Must not block.
-    virtual void notify_query_terminated(const TUniqueId& query_id);
+    // its QueryState once no worker is still attached, and record the query's final
+    // attained service into its Gittins histogram. Must not block.
+    virtual void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns);
 
     virtual std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() {
         return {{_name, _fix_thread_pool->debug_info()}};
@@ -89,8 +90,8 @@ public:
     // remote/AI functions, recursive CTEs) and cannot honor the "re-check the
     // assignment slot every execution slice" invariant that the push-based scheduler
     // relies on, so its queue runs in the degenerate general-only mode (plain shared
-    // lock-free queue, no scheduler thread). Runtime is still charged to the
-    // query-global counter, so attained-service accounting in the simple pool is
+    // lock-free queue, no scheduler thread). Tasks there still charge their CPU time
+    // to the query's CPUContext, so attained-service accounting in the simple pool is
     // unaffected.
     HybridTaskScheduler(int exec_thread_num, int blocking_exec_thread_num, std::string name,
                         std::shared_ptr<CgroupCpuCtl> cgroup_cpu_ctl)
@@ -104,7 +105,7 @@ public:
 
     void stop() override;
 
-    void notify_query_terminated(const TUniqueId& query_id) override;
+    void notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns) override;
 
     std::vector<std::pair<std::string, std::vector<int>>> thread_debug_info() override {
         return {_blocking_scheduler.thread_debug_info()[0],

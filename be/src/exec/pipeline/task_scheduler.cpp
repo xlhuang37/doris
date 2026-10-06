@@ -74,8 +74,8 @@ Status TaskScheduler::submit(PipelineTaskSPtr task) {
     return _task_queue.push_back(task);
 }
 
-void TaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
-    _task_queue.notify_query_terminated(query_id);
+void TaskScheduler::notify_query_terminated(const TUniqueId& query_id, uint64_t final_runtime_ns) {
+    _task_queue.notify_query_terminated(query_id, final_runtime_ns);
 }
 
 // after close_task, task maybe destructed.
@@ -135,13 +135,12 @@ void TaskScheduler::_do_work(int index) {
 
         // Declared before task_running_defer so that END is written after the task is released.
         const TUniqueId timeline_query_id = fragment_context->get_query_id();
-        std::atomic<uint64_t>* timeline_query_runtime =
-                fragment_context->get_query_ctx()->query_runtime_counter();
+        const QueryContext* timeline_query_ctx = fragment_context->get_query_ctx();
         worker_timeline_record(_name, index, timeline_query_id, true,
-                               timeline_query_runtime->load(std::memory_order_relaxed));
+                               timeline_query_ctx->attained_service_ns());
         Defer worker_timeline_defer {[&]() {
             worker_timeline_record(_name, index, timeline_query_id, false,
-                                   timeline_query_runtime->load(std::memory_order_relaxed));
+                                   timeline_query_ctx->attained_service_ns());
         }};
 
         bool done = false;
@@ -229,9 +228,10 @@ void HybridTaskScheduler::stop() {
     _simple_scheduler.stop();
 }
 
-void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id) {
-    _blocking_scheduler.notify_query_terminated(query_id);
-    _simple_scheduler.notify_query_terminated(query_id);
+void HybridTaskScheduler::notify_query_terminated(const TUniqueId& query_id,
+                                                  uint64_t final_runtime_ns) {
+    _blocking_scheduler.notify_query_terminated(query_id, final_runtime_ns);
+    _simple_scheduler.notify_query_terminated(query_id, final_runtime_ns);
 }
 
 } // namespace doris

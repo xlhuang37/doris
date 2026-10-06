@@ -89,11 +89,10 @@ public:
 
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
-    // Query-global CPU runtime counter, owned by QueryContext and shared by every
-    // fragment of the query. It is the attained-service key for the pipeline task
-    // scheduler (and is still charged by the scan time-sharing scheduler).
-    std::atomic<uint64_t>* query_runtime_counter() override {
-        return _query_ctx->query_runtime_counter();
+    // CPU accounting shared by every fragment of the query; see
+    // QueryContext::attained_service_ns().
+    const CPUContext* query_cpu_context() override {
+        return _query_ctx->resource_ctx()->cpu_context();
     }
 
     void decrement_running_task(PipelineId pipeline_id);

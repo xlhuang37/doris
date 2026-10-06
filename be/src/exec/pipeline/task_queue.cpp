@@ -34,13 +34,17 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
-        : _core_size(core_size), _mode(mode) {
+        : _core_size(core_size),
+          _mode(mode),
+          _gittins(mode == Mode::FULL ? config::pipeline_gittins_histogram_slots : 1),
+          _gittins_table(_gittins.build()) {
     if (_mode == Mode::FULL) {
         auto worker_count = static_cast<size_t>(std::max(core_size, 1));
         _worker_slots = std::vector<WorkerSlot>(worker_count);
         _worker_local = std::vector<WorkerLocal>(worker_count);
         _worker_sched = std::vector<WorkerSched>(worker_count);
         _scheduler_thread = std::thread([this]() { _scheduler_loop(); });
+        _gittins_thread = std::thread([this]() { _gittins_rebuild_loop(); });
     }
 }
 
@@ -223,7 +227,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             _check_assignment(worker_id);
         }
         // "Inelastic first": single-task pipelines outrank everything, including the
-        // worker's own assignment and attained-service ranking. Accounting is the
+        // worker's own assignment and priority ranking. Accounting is the
         // same as the tokenless fallback below (the task was never in a per-query
         // sub-queue).
         if (_inelastic_queue.try_dequeue(task)) {
@@ -304,14 +308,6 @@ void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTas
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
     auto charged_ns = static_cast<uint64_t>(std::max<int64_t>(time_spent, 0));
-    if (charge) {
-        // Charge the executed CPU time to the owning query's global counter. This
-        // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers, and drives
-        // attained-service ranking. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op and they stay at attained 0.
-        task->add_query_runtime_ns(charged_ns);
-    }
     if (_mode != Mode::FULL) {
         return;
     }
@@ -327,6 +323,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     _refresh_query_mirror(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
+        // Attained service is not charged here: execute() already added this run's
+        // thread CPU time to the query's CPUContext (as do scanners, spill and async
+        // writers), so the snapshot just picks up the current value. Tasks without a
+        // query CPUContext (e.g. RevokableTask) stay at attained 0.
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
@@ -351,10 +351,12 @@ void MultiCoreTaskQueue::_post_message(SchedulerMessage msg) {
     _inbox_cv.notify_one();
 }
 
-void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id) {
+void MultiCoreTaskQueue::notify_query_terminated(const TUniqueId& query_id,
+                                                 uint64_t final_runtime_ns) {
     if (_mode != Mode::FULL || _is_sentinel(query_id)) {
         return;
     }
+    _gittins.record(final_runtime_ns);
     SchedulerMessage msg;
     msg.type = SchedulerMessage::Type::QUERY_TERMINATED;
     msg.query_id = query_id;
@@ -402,7 +404,7 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             _handle_message(msg, syncs);
         }
         if (!closing) {
-            // Every pass: compact tombstones, re-sort by attained service, dispatch.
+            // Every pass: compact tombstones, re-sort by priority, dispatch.
             // Destroy is only attempted after compact has cleared in_sched.
             _rebalance_and_dispatch();
             _try_teardown();
@@ -564,12 +566,25 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
+    // Priority: highest Gittins index first, then least attained service, then arrival
+    // order. With the policy off (or no history yet) every index is 0, which reduces
+    // to plain least-attained-service.
+    std::shared_ptr<const GittinsIndexTable> gittins;
+    if (config::enable_pipeline_gittins_scheduling) {
+        gittins = _load_gittins_table();
+    }
+    for (QueryState* qs : _queries) {
+        qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
+        qs->rr_index = gittins ? gittins->index(qs->rr_attained) : 0.0;
+    }
     std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
-        return a->attained_ns.load(std::memory_order_relaxed) <
-               b->attained_ns.load(std::memory_order_relaxed);
+        if (a->rr_index != b->rr_index) {
+            return a->rr_index > b->rr_index;
+        }
+        return a->rr_attained < b->rr_attained;
     });
 
-    // Phase 1: desired grants per query - greedy least-attained-first. Each query
+    // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
     // session variable when set, otherwise the BE config, both re-read every pass so a
     // runtime change lands within one tick) before the next is considered. Demand is
@@ -618,7 +633,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
 
     // Phase 3: hand leftover grants to movable workers. `_granted_queries` is already
-    // in attained-service order, so the least-attained query is served first. A worker
+    // in priority order, so the highest-priority query is served first. A worker
     // is movable when its last slot write was acked (never two outstanding writes per
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.
@@ -655,6 +670,52 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Gittins rebuild thread
+// ---------------------------------------------------------------------------
+
+void MultiCoreTaskQueue::_gittins_rebuild_loop() {
+    Thread::set_self_name("pipe_gittins");
+    std::unique_lock<std::mutex> lk(_gittins_rebuild_mutex);
+    while (true) {
+        // Re-read every round so the interval can be retuned at runtime.
+        const int interval_ms = std::max(config::pipeline_gittins_rebuild_interval_ms, 1);
+        if (_gittins_rebuild_cv.wait_for(lk, std::chrono::milliseconds(interval_ms),
+                                         [this]() { return _closed.load(); })) {
+            break;
+        }
+        _rebuild_gittins_table_locked();
+    }
+}
+
+void MultiCoreTaskQueue::_rebuild_gittins_table_locked() {
+    // Read the version before snapshotting: a sample racing with build() bumps it
+    // again, so the next round rebuilds rather than missing it.
+    const uint64_t version = _gittins.version();
+    if (version == _gittins_built_version) {
+        return;
+    }
+    auto table = _gittins.build();
+    {
+        std::lock_guard<std::mutex> lk(_gittins_table_mutex);
+        _gittins_table = std::move(table);
+    }
+    _gittins_built_version = version;
+}
+
+std::shared_ptr<const GittinsIndexTable> MultiCoreTaskQueue::_load_gittins_table() const {
+    std::lock_guard<std::mutex> lk(_gittins_table_mutex);
+    return _gittins_table;
+}
+
+void MultiCoreTaskQueue::rebuild_gittins_table_for_test() {
+    if (_mode != Mode::FULL) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(_gittins_rebuild_mutex);
+    _rebuild_gittins_table_locked();
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -671,6 +732,15 @@ void MultiCoreTaskQueue::close() {
     _inbox_cv.notify_all();
     if (_scheduler_thread.joinable()) {
         _scheduler_thread.join();
+    }
+    {
+        // Same lost-wakeup guard as the inbox: the rebuild thread checks `_closed`
+        // under this mutex before waiting.
+        std::lock_guard<std::mutex> lk(_gittins_rebuild_mutex);
+    }
+    _gittins_rebuild_cv.notify_all();
+    if (_gittins_thread.joinable()) {
+        _gittins_thread.join();
     }
     // Fulfill any test-sync promises that raced with shutdown so waiters can't hang.
     {

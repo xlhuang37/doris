@@ -228,7 +228,7 @@ QueryContext::~QueryContext() {
 
     // Async: destructor can run on a pipeline worker. Do not wait for detach ACKs.
     if (_task_scheduler) {
-        _task_scheduler->notify_query_terminated(_query_id);
+        _task_scheduler->notify_query_terminated(_query_id, attained_service_ns());
     }
 
     _resource_ctx->task_controller()->finish();
