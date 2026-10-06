@@ -491,12 +491,13 @@ struct TQueryOptions {
   // Default 8MB. Sent by FE session variable preferred_block_size_bytes.
   218: optional i64 preferred_block_size_bytes = 8388608
 
-  // Client-declared expected service of the query in ms, for the pipeline scheduler.
+  // Client-declared expected total service in ms. The SRPT pipeline scheduler
+  // subtracts attained service from this value to rank the query.
   // -1 means not set. Sent by FE session variable expected_service.
   219: optional i64 expected_service_ms = -1
 
   // Per-query cap on how many pipeline workers this query may be assigned
-  // concurrently by the attained-service scheduler. -1 means "inherit the BE's
+  // concurrently by the SRPT scheduler. -1 means "inherit the BE's
   // pipeline_query_worker_cap config", 0 means unbounded, > 0 is the cap itself.
   // Sent by FE session variable pipeline_query_worker_cap.
   220: optional i32 pipeline_query_worker_cap = -1

@@ -18,9 +18,11 @@
 #include "exec/pipeline/task_queue.h"
 
 // IWYU pragma: no_include <bits/chrono.h>
+#include <gen_cpp/Types_types.h>
+
 #include <algorithm>
 #include <chrono> // IWYU pragma: keep
-#include <gen_cpp/Types_types.h>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -34,11 +36,7 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
-        : _core_size(core_size),
-          _mode(mode),
-          _gittins_table(mode == Mode::FULL ? build_preset_gittins_table(
-                                                      config::pipeline_gittins_histogram_slots)
-                                            : nullptr) {
+        : _core_size(core_size), _mode(mode) {
     if (_mode == Mode::FULL) {
         auto worker_count = static_cast<size_t>(std::max(core_size, 1));
         _worker_slots = std::vector<WorkerSlot>(worker_count);
@@ -304,6 +302,7 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
 void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTask* task) {
     qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
     qs->worker_cap.store(task->query_worker_cap(), std::memory_order_relaxed);
+    qs->expected_service_ms.store(task->expected_service_ms(), std::memory_order_relaxed);
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -564,20 +563,36 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    // Priority: highest Gittins index first, then least attained service, then arrival
-    // order. With the policy off every index is 0, which reduces to plain
-    // least-attained-service.
-    const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+    // SRPT priority: least expected remaining service first. Expected service is
+    // supplied by the client in milliseconds; attained service is query CPU time.
+    // Unknown-size queries rank after known-size queries and retain the old
+    // least-attained-service behavior among themselves.
+    constexpr uint64_t kNanosecondsPerMillisecond = 1'000'000ULL;
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
-        qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
-    }
-    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
-        if (a->rr_index != b->rr_index) {
-            return a->rr_index > b->rr_index;
+        const int64_t expected_ms = qs->expected_service_ms.load(std::memory_order_relaxed);
+        qs->rr_expected_known = expected_ms >= 0;
+        if (!qs->rr_expected_known) {
+            qs->rr_remaining = std::numeric_limits<uint64_t>::max();
+            continue;
         }
-        return a->rr_attained < b->rr_attained;
-    });
+        const uint64_t expected_ms_unsigned = static_cast<uint64_t>(expected_ms);
+        const uint64_t expected_ns = expected_ms_unsigned > std::numeric_limits<uint64_t>::max() /
+                                                                    kNanosecondsPerMillisecond
+                                             ? std::numeric_limits<uint64_t>::max()
+                                             : expected_ms_unsigned * kNanosecondsPerMillisecond;
+        qs->rr_remaining = expected_ns > qs->rr_attained ? expected_ns - qs->rr_attained : 0;
+    }
+    std::stable_sort(_queries.begin(), _queries.end(),
+                     [](const QueryState* a, const QueryState* b) {
+                         if (a->rr_expected_known != b->rr_expected_known) {
+                             return a->rr_expected_known;
+                         }
+                         if (a->rr_remaining != b->rr_remaining) {
+                             return a->rr_remaining < b->rr_remaining;
+                         }
+                         return a->rr_attained < b->rr_attained;
+                     });
 
     // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
@@ -596,8 +611,8 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     _granted_queries.clear();
     for (QueryState* qs : _queries) {
         qs->rr_grant = 0;
-        qs->rr_demand = std::max(qs->active_tasks.load(),
-                                 qs->pending_approx.load() + qs->in_flight.load());
+        qs->rr_demand =
+                std::max(qs->active_tasks.load(), qs->pending_approx.load() + qs->in_flight.load());
         int want = qs->rr_demand;
         // A negative mirror means the query set no session-level override (and is
         // also what the sentinel bucket reports), so fall back to the BE config.

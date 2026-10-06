@@ -94,6 +94,7 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
         _query_ctx_raw = fragment_context->get_query_ctx();
         _active_tasks_ptr = _query_ctx_raw->active_task_counter();
         _query_worker_cap = _query_ctx_raw->pipeline_query_worker_cap();
+        _expected_service_ms = _query_ctx_raw->expected_service_ms();
         // The task starts out in INITED, which counts as active; _state_transition()
         // takes over the bookkeeping from here.
         _active_tasks_ptr->fetch_add(1, std::memory_order_relaxed);

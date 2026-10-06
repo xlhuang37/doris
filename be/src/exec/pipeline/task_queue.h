@@ -17,6 +17,7 @@
 #pragma once
 
 #include <concurrentqueue.h>
+#include <gen_cpp/Types_types.h>
 #include <glog/logging.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -32,10 +33,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <gen_cpp/Types_types.h>
-
 #include "common/status.h"
-#include "exec/pipeline/gittins_preset_distribution.h"
 #include "exec/pipeline/pipeline_task.h"
 #include "util/hash_util.hpp"
 
@@ -51,17 +49,15 @@ namespace doris {
 //     once, through its owning query's token (enqueue serialized by a per-query mutex,
 //     since explicit producers are single-producer). Sub-queues are drained lock-free
 //     via try_dequeue_from_producer.
-//   - A central scheduler thread ranks live queries by their Gittins index and
+//   - A central scheduler thread ranks live queries by shortest remaining processing
+//     time (SRPT) and
 //     push-assigns workers by writing per-worker, cache-aligned assignment slots.
 //     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
-//     a single append-only vector, re-sorted on every rebalance. The index is looked
-//     up, keyed by each query's attained service (the query's CPUContext CPU time,
-//     the same counter reported as audit CpuTimeMS, mirrored onto each
-//     QueryState), in a table built once at construction from a pre-installed
-//     final-CPU-time distribution (see gittins_preset_distribution.h); higher index
-//     first. Equal indexes fall back to least attained service, then arrival order
-//     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the ranking is
-//     plain least-attained-service.
+//     a single append-only vector, re-sorted on every rebalance. Remaining service is
+//     the client-supplied `expected_service` minus attained service (the query's
+//     CPUContext CPU time, mirrored onto each QueryState), floored at zero. Queries
+//     without an expected service rank after known queries and use least attained
+//     service among themselves.
 //   - Core allocation is greedy first-come-first-served in that order: each query
 //     takes as many of the pool's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
@@ -153,6 +149,7 @@ public:
     // Test hook: how many worker slots currently point at `query_id`, i.e. how many
     // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
     int assigned_workers_for_test(const TUniqueId& query_id) const;
+
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
     // becomes available within `timeout_ms` (or the queue is closed).
@@ -195,19 +192,22 @@ private:
         // Rebalance scratch (valid only within one rebalance pass).
         int rr_grant = 0;
         int rr_demand = 0;
-        // Sort keys, snapshotted once per pass: `attained_ns` keeps moving under the
-        // workers, and the comparator must see one consistent value.
+        // Sort keys, snapshotted once per pass: attained service keeps moving under
+        // the workers, and the comparator must see one consistent value.
         uint64_t rr_attained = 0;
-        double rr_index = 0.0;
+        uint64_t rr_remaining = 0;
+        bool rr_expected_known = false;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // Wall-clock time this query's tasks ran on this pool's workers (per-pool
         // statistic; ranking uses the query's CPUContext time, see attained_ns).
         alignas(64) std::atomic<uint64_t> cpu_time_ns {0};
         // Snapshot of query-global attained service, refreshed whenever a task is
-        // in hand (enqueue / charge). The scheduler derives each query's Gittins
-        // index from this and uses it as the tie-break.
+        // in hand (enqueue / charge). The scheduler derives each query's remaining
+        // service from this value and the expected-service mirror.
         std::atomic<uint64_t> attained_ns {0};
+        // Client-supplied expected total service in milliseconds. -1 means unknown.
+        std::atomic<int64_t> expected_service_ms {-1};
         // Tasks of this query currently between dequeue and release in this pool.
         // Ordering contract with `pending_approx` (both seq_cst): a dequeuing worker
         // increments in_flight BEFORE decrementing pending_approx, so at every instant
@@ -362,11 +362,6 @@ private:
     // Queries that received a grant in the current rebalance pass, in priority order.
     // Reused across passes to avoid reallocating (scheduler-thread-only).
     std::vector<QueryState*> _granted_queries;
-    // Gittins index table (full mode), built once at construction from the
-    // pre-installed distribution and immutable afterwards, so the scheduler reads it
-    // without synchronization. Null in degenerate mode.
-    const std::shared_ptr<const GittinsIndexTable> _gittins_table;
-
     // Inbox.
     std::mutex _inbox_mutex;
     std::condition_variable _inbox_cv;

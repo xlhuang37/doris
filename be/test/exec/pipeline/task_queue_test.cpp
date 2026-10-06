@@ -64,10 +64,12 @@ public:
     // base implementation would go through the QueryContext, which is a fake pointer
     // here and must never be dereferenced.
     int query_worker_cap() const override { return _worker_cap; }
+    int64_t expected_service_ms() const override { return _expected_service_ms; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
     void set_active_task_num(int num) { _active_task_num = num; }
     void set_worker_cap(int cap) { _worker_cap = cap; }
+    void set_expected_service_ms(int64_t service_ms) { _expected_service_ms = service_ms; }
 
 private:
     QueryContext* _key;
@@ -75,6 +77,7 @@ private:
     bool _inelastic;
     int _active_task_num = 0;
     int _worker_cap = -1;
+    int64_t _expected_service_ms = -1;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -113,6 +116,12 @@ PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runti
     auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
     task->set_active_task_num(active);
     task->set_worker_cap(cap);
+    return task;
+}
+PipelineTaskSPtr make_task_with_expected_service(QueryContext* key, uint64_t runtime_ns,
+                                                 int64_t expected_service_ms) {
+    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
+    task->set_expected_service_ms(expected_service_ms);
     return task;
 }
 } // namespace
@@ -887,58 +896,47 @@ TEST(GittinsPresetTest, TableMatchesPreset) {
     EXPECT_GT(table->index(kSecondNs + kSecondNs / 2), table->index(0));
 }
 
-// With the preset, a query at 1.5s of attained service outranks a fresh one - the
-// reverse of least-attained-service. Turning the policy off restores
-// least-attained-service on the next pass.
-TEST(GittinsTaskQueueTest, PresetOutranksLeastAttained) {
-    const bool old_enable = config::enable_pipeline_gittins_scheduling;
-    config::enable_pipeline_gittins_scheduling = true;
-    Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
+// SRPT uses expected total service minus attained service, not expected total alone:
+// A has the larger expected total but only 2s left, so it outranks B's 5s.
+TEST(SrptTaskQueueTest, RanksByExpectedRemainingService) {
     TestTaskQueue q(1);
-    auto* qa = qkey(0xA); // fresh
-    auto* qb = qkey(0xB); // 1.5s attained
-    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
+    auto* qa = qkey(0xA); // expected 10s, attained 8s, remaining 2s
+    auto* qb = qkey(0xB); // expected 5s, attained 0, remaining 5s
 
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(qb, 0, 5'000)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(qa, 8 * kSecondNs, 10'000)).ok());
     q.wait_scheduler_settled_for_test();
 
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
-    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
-    auto t1 = q.take(0);
-    ASSERT_NE(t1, nullptr);
-    EXPECT_EQ(t1->query_ctx_raw(), qb);
-
-    config::enable_pipeline_gittins_scheduling = false;
-    q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
-    auto t2 = q.take(0); // preempts to A despite B still having a runnable task
-    ASSERT_NE(t2, nullptr);
-    EXPECT_EQ(t2->query_ctx_raw(), qa);
+    auto task = q.take(0);
+    ASSERT_NE(task, nullptr);
+    EXPECT_EQ(task->query_ctx_raw(), qa);
 
     q.close();
 }
 
-// Finishing queries do not change the preset ranking.
-TEST(GittinsTaskQueueTest, TerminationDoesNotChangeRanking) {
-    const bool old_enable = config::enable_pipeline_gittins_scheduling;
-    config::enable_pipeline_gittins_scheduling = true;
-    Defer restore {[&]() { config::enable_pipeline_gittins_scheduling = old_enable; }};
+// Queries with a supplied expected service are prioritized ahead of unknown-size
+// queries. Unknown queries still use least-attained-service among themselves.
+TEST(SrptTaskQueueTest, KnownServiceOutranksUnknownService) {
     TestTaskQueue q(1);
-    auto* qa = qkey(0xA);
-    auto* qb = qkey(0xB);
-    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
+    auto* known = qkey(0xA);
+    auto* unknown_high = qkey(0xB);
+    auto* unknown_low = qkey(0xC);
 
-    for (uintptr_t i = 0; i < 50; ++i) {
-        q.notify_query_terminated(qid(0x100 + i));
-    }
-    ASSERT_TRUE(q.push_back(make_task(qa, 0)).ok());
-    ASSERT_TRUE(q.push_back(make_task(qb, b_attained)).ok());
+    ASSERT_TRUE(q.push_back(make_task(unknown_high, 5 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(unknown_low, kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(known, 0, 20'000)).ok());
     q.wait_scheduler_settled_for_test();
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
-    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.notify_query_terminated(qid(0xA));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
 
     q.close();
 }

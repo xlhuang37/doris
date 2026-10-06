@@ -17,12 +17,12 @@
 
 #pragma once
 
+#include <gen_cpp/Types_types.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include <gen_cpp/Types_types.h>
 
 #include "common/status.h"
 #include "core/block/block.h"
@@ -139,8 +139,7 @@ public:
     // ranking; see QueryContext::attained_service_ns(). Not charged by the scheduler:
     // execute(), spill, scanners and async writers charge the query's CPUContext.
     MOCK_FUNCTION uint64_t query_runtime_ns() const {
-        return _query_cpu_ctx != nullptr ? static_cast<uint64_t>(_query_cpu_ctx->cpu_cost_ms())
-                                         : 0;
+        return _query_cpu_ctx != nullptr ? static_cast<uint64_t>(_query_cpu_ctx->cpu_cost_ms()) : 0;
     }
     // Tasks of the owning query that currently want a core, across all of its fragments
     // and instances: submitted and not yet finished, minus those parked on a dependency.
@@ -158,6 +157,10 @@ public:
     // mirror it into the scheduler's per-query state (the scheduler thread must never
     // dereference a QueryContext).
     MOCK_FUNCTION int query_worker_cap() const { return _query_worker_cap; }
+
+    // Client-supplied expected total service in milliseconds. -1 means unknown.
+    // Mirrored into scheduler-owned state alongside attained service and the worker cap.
+    MOCK_FUNCTION int64_t expected_service_ms() const { return _expected_service_ms; }
 
     // Opaque key identifying the owning query, used by the query-granular task queue
     // to bucket this task. The query context outlives its tasks; the pointer is only
@@ -268,6 +271,7 @@ private:
     // construction because query options are immutable for the life of a query.
     // Caching it keeps the scheduler's mirror refresh off the QueryContext cacheline.
     int _query_worker_cap = -1;
+    int64_t _expected_service_ms = -1;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;
