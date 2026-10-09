@@ -24,6 +24,7 @@
 namespace doris {
 
 class RuntimeState;
+class CPUContext;
 
 // Base class for execution contexts (e.g. PipelineFragmentContext).
 //
@@ -33,6 +34,10 @@ class TaskExecutionContext : public std::enable_shared_from_this<TaskExecutionCo
 public:
     TaskExecutionContext();
     virtual ~TaskExecutionContext();
+
+    // CPU accounting of the owning query, whose cpu_cost_ms() counter is the query's
+    // attained service. Non-query contexts return nullptr.
+    virtual const CPUContext* query_cpu_context() { return nullptr; }
 };
 
 using TaskExecutionContextSPtr = std::shared_ptr<TaskExecutionContext>;

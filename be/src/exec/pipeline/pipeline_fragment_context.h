@@ -89,6 +89,12 @@ public:
 
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
+    // CPU accounting shared by every fragment of the query; see
+    // QueryContext::attained_service_ns().
+    const CPUContext* query_cpu_context() override {
+        return _query_ctx->resource_ctx()->cpu_context();
+    }
+
     void decrement_running_task(PipelineId pipeline_id);
 
     uint32_t rec_cte_stage() const { return _rec_cte_stage; }

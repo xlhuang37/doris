@@ -102,6 +102,29 @@ public:
 
     ExecEnv* exec_env() const { return _exec_env; }
 
+    // Attained service of this query on this BE, in ns: the thread CPU time charged to
+    // CPUContext by pipeline tasks, spill, scanners and async writers. It is the same
+    // counter this BE reports as the audit log's CpuTimeMS (and AttainedServiceMS), and
+    // the key the pipeline task scheduler ranks queries by.
+    uint64_t attained_service_ns() const {
+        return static_cast<uint64_t>(_resource_ctx->cpu_context()->attained_service_ns());
+    }
+
+    // Tasks of this query that currently want a core, across all fragments and
+    // instances: submitted and not yet finished, minus those parked on a dependency.
+    // Drives the pipeline scheduler's per-query core demand, which queue depth alone
+    // understates once a query's runnable tasks are spread over the workers.
+    std::atomic<int>* active_task_counter() { return &_active_task_num; }
+
+    // Per-query cap on concurrently assigned pipeline workers, from the session
+    // variable of the same name. -1 (the default) defers to the BE config
+    // `pipeline_query_worker_cap`; 0 means unbounded; > 0 is the cap.
+    int pipeline_query_worker_cap() const {
+        return _query_options.__isset.pipeline_query_worker_cap
+                       ? _query_options.pipeline_query_worker_cap
+                       : -1;
+    }
+
     bool is_timeout(timespec now) const {
         if (_timeout_second <= 0) {
             return false;
@@ -196,13 +219,6 @@ public:
         return _query_options.__isset.expected_service_ms ? _query_options.expected_service_ms
                                                           : -1;
     }
-
-    // Service this query has attained so far on this BE, in ns: its CPUContext CPU time,
-    // reported as both cpu_ms and attained_service_ms; see CPUContext::attained_service_ns().
-    int64_t attained_service_ns() const {
-        return _resource_ctx->cpu_context()->attained_service_ns();
-    }
-
     const TQueryOptions& query_options() const { return _query_options; }
     bool should_be_shuffled_agg(int node_id) const {
         return _query_options.__isset.shuffled_agg_ids &&
@@ -337,6 +353,9 @@ private:
     TUniqueId _query_id;
     ExecEnv* _exec_env = nullptr;
     MonotonicStopWatch _query_watcher;
+
+    // Query-global runnable task count; see active_task_counter().
+    std::atomic<int> _active_task_num {0};
     bool _is_nereids = false;
 
     std::shared_ptr<ResourceContext> _resource_ctx;
