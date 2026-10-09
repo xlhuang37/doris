@@ -36,6 +36,7 @@
 #include <ostream>
 #include <utility>
 
+#include "common/config.h"
 #include "common/status.h"
 #include "exec/exchange/vdata_stream_sender.h"
 #include "exec/operator/exchange_sink_operator.h"
@@ -68,8 +69,9 @@ void BroadcastPBlockHolderMemLimiter::acquire(BroadcastPBlockHolder& holder) {
     auto size = holder._pblock->column_values().size();
     _total_queue_buffer_size += size;
     _total_queue_blocks_count++;
-    if (_total_queue_buffer_size >= _total_queue_buffer_size_limit ||
-        _total_queue_blocks_count >= _total_queue_blocks_count_limit) {
+    if ((_total_queue_buffer_size >= _total_queue_buffer_size_limit ||
+         _total_queue_blocks_count >= _total_queue_blocks_count_limit) &&
+        !config::enable_serial_pipeline_scheduler) {
         _broadcast_dependency->block();
     }
 }
@@ -176,7 +178,7 @@ Status ExchangeSinkBuffer::add_block(Channel* channel, TransmitInfo&& request) {
         }
         instance_data.package_queue[channel].emplace(std::move(request));
         _total_queue_size++;
-        if (_total_queue_size > _queue_capacity) {
+        if (_total_queue_size > _queue_capacity && !config::enable_serial_pipeline_scheduler) {
             for (auto& dep : _queue_deps) {
                 dep->block();
             }

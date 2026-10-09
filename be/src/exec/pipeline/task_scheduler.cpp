@@ -70,7 +70,7 @@ Status TaskScheduler::start() {
 }
 
 Status TaskScheduler::submit(PipelineTaskSPtr task) {
-    return _task_queue.push_back(task);
+    return _push_task(task);
 }
 
 // after close_task, task maybe destructed.
@@ -96,7 +96,7 @@ void close_task(PipelineTask* task, Status exec_status, PipelineFragmentContext*
 
 void TaskScheduler::_do_work(int index) {
     while (!_need_to_stop) {
-        auto task = _task_queue.take(index);
+        auto task = _take_task(index);
         if (!task) {
             continue;
         }
@@ -106,7 +106,7 @@ void TaskScheduler::_do_work(int index) {
         // thread set task->set_running(false)
         // set_running return the old value
         if (task->set_running(true)) {
-            static_cast<void>(_task_queue.push_back(task, index));
+            static_cast<void>(_push_task(task, index));
             continue;
         }
 
@@ -137,7 +137,7 @@ void TaskScheduler::_do_work(int index) {
             } else {
                 task->set_running(false);
             }
-            _task_queue.update_statistics(task.get(), exec_ns);
+            _update_statistics(task.get(), exec_ns);
         }};
         // Must be declared after task_running_defer: the timer only writes exec_ns in its
         // destructor, which has to run before task_running_defer reads it.
@@ -176,7 +176,7 @@ void TaskScheduler::_do_work(int index) {
 
 void TaskScheduler::stop() {
     if (!_shutdown) {
-        _task_queue.close();
+        _close_queue();
         if (_fix_thread_pool) {
             _need_to_stop = true;
             _fix_thread_pool->shutdown();

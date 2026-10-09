@@ -187,7 +187,7 @@ Status MultiCastDataStreamer::_trigger_spill_if_need(RuntimeState* state, bool* 
     SpillFileSPtr spill_file;
     *triggered = false;
     if (_cumulative_mem_size.load() >= config::exchg_node_buffer_size_bytes &&
-        _multi_cast_blocks.size() >= 4) {
+        _multi_cast_blocks.size() >= 4 && !config::enable_serial_pipeline_scheduler) {
         _write_dependency->block();
 
         if (_copying_count.load() != 0) {
