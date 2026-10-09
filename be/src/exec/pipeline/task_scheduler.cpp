@@ -137,10 +137,6 @@ void TaskScheduler::_do_work(int index) {
             } else {
                 task->set_running(false);
             }
-            fragment_context->get_query_ctx()
-                    ->resource_ctx()
-                    ->cpu_context()
-                    ->update_attained_service_ns(exec_ns);
             _task_queue.update_statistics(task.get(), exec_ns);
         }};
         // Must be declared after task_running_defer: the timer only writes exec_ns in its

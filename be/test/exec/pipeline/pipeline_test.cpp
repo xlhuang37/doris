@@ -1241,8 +1241,8 @@ TEST_F(PipelineTest, AttainedServiceThriftSerialization) {
     auto* cpu_ctx = _query_ctx->resource_ctx()->cpu_context();
     EXPECT_EQ(_query_ctx->attained_service_ns(), 0);
 
-    cpu_ctx->update_attained_service_ns(1'500'000);
-    cpu_ctx->update_attained_service_ns(2'000'000);
+    cpu_ctx->update_cpu_cost_ms(1'500'000);
+    cpu_ctx->update_cpu_cost_ms(2'000'000);
     EXPECT_EQ(cpu_ctx->attained_service_ns(), 3'500'000);
     EXPECT_EQ(_query_ctx->attained_service_ns(), 3'500'000);
 
@@ -1250,6 +1250,7 @@ TEST_F(PipelineTest, AttainedServiceThriftSerialization) {
     _query_ctx->resource_ctx()->to_thrift_query_statistics(&tqs);
     EXPECT_TRUE(tqs.__isset.attained_service_ms);
     EXPECT_EQ(tqs.attained_service_ms, 3);
+    EXPECT_EQ(tqs.attained_service_ms, tqs.cpu_ms);
 }
 
 TEST_F(PipelineTest, ExpectedServiceDefaultsToUnset) {

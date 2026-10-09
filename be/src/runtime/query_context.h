@@ -197,8 +197,8 @@ public:
                                                           : -1;
     }
 
-    // Service this query has attained so far on this BE; see
-    // CPUContext::attained_service_ns().
+    // Service this query has attained so far on this BE, in ns: its CPUContext CPU time,
+    // reported as both cpu_ms and attained_service_ms; see CPUContext::attained_service_ns().
     int64_t attained_service_ns() const {
         return _resource_ctx->cpu_context()->attained_service_ns();
     }
