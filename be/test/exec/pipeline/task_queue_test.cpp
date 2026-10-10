@@ -959,13 +959,16 @@ TEST(GittinsMemoryCostTest, PressureIsZeroUpToThreshold) {
 }
 
 TEST(GittinsMemoryCostTest, PressureIsQuadraticAboveThreshold) {
-    EXPECT_NEAR(gittins_memory_pressure(0.9, 0.8), 0.01 / 0.2, 1e-12);
-    // At full capacity the pressure is (1 - t).
-    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.8), 0.2, 1e-12);
-    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.5), 0.5, 1e-12);
-    // Continuous and increasing past the threshold.
+    EXPECT_NEAR(gittins_memory_pressure(0.9, 0.8), 0.25, 1e-12);
+    EXPECT_NEAR(gittins_memory_pressure(0.75, 0.5), 0.25, 1e-12);
+    // At full capacity the pressure is exactly 1, whatever the threshold.
+    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.8), 1.0, 1e-12);
+    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.5), 1.0, 1e-12);
+    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.0), 1.0, 1e-12);
+    // Continuous and increasing past the threshold, and past capacity.
     EXPECT_LT(gittins_memory_pressure(0.81, 0.8), gittins_memory_pressure(0.85, 0.8));
-    EXPECT_LT(gittins_memory_pressure(0.81, 0.8), 1e-3);
+    EXPECT_LT(gittins_memory_pressure(0.805, 0.8), 1e-3);
+    EXPECT_GT(gittins_memory_pressure(1.1, 0.8), 1.0);
 }
 
 TEST(GittinsMemoryCostTest, HoldingCostRoundsToGigabytes) {
@@ -977,6 +980,9 @@ TEST(GittinsMemoryCostTest, HoldingCostRoundsToGigabytes) {
     EXPECT_DOUBLE_EQ(gittins_holding_cost(kGb * 4 / 10, 0.5), 1.0);
     EXPECT_DOUBLE_EQ(gittins_holding_cost(kGb * 16 / 10, 0.5), 2.0);
     EXPECT_DOUBLE_EQ(gittins_holding_cost(8 * kGb, 0.2), 2.6);
+    // At full capacity (pressure 1) the cost is 1 + mem_gb.
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(30 * kGb, 1.0), 31.0);
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(kGb, 1.0), 2.0);
 }
 
 // Two queries at the same attained service share a table index, so without memory

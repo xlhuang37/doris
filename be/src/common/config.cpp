@@ -325,7 +325,7 @@ DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
 DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
 // Generalized Gittins index with a memory holding cost: each query's index is
 // multiplied by 1 + round(query_mem_gb) * pressure, where
-//     pressure = max(0, u - threshold)^2 / (1 - threshold)
+//     pressure = (max(0, u - threshold) / (1 - threshold))^2
 // and u is process memory usage over (capacity_ratio * physical memory). Below the
 // threshold the cost is 1 and ranking is plain Gittins; above it, memory-heavy
 // queries are increasingly favored so they finish and release memory.

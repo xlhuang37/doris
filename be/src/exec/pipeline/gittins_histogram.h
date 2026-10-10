@@ -29,17 +29,18 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 // Memory pressure term of the Gittins holding cost:
-//     max(0, u - t)^2 / (1 - t)
+//     (max(0, u - t) / (1 - t))^2
 // where `usage_ratio` (u) is system memory use over capacity and `threshold` (t) is
-// the fraction of capacity below which memory is free. Zero below the threshold and
-// continuous above it, so the policy shifts gradually rather than at a cliff.
+// the fraction of capacity below which memory is free. Zero up to the threshold,
+// exactly 1 at full capacity, and continuous in between, so the policy shifts
+// gradually rather than at a cliff. Past capacity it keeps growing.
 inline double gittins_memory_pressure(double usage_ratio, double threshold) {
     if (!(usage_ratio > 0.0)) {
         return 0.0;
     }
     const double t = std::clamp(std::isfinite(threshold) ? threshold : 0.0, 0.0, 0.999);
-    const double excess = std::max(0.0, usage_ratio - t);
-    return excess * excess / (1.0 - t);
+    const double normalized = std::max(0.0, usage_ratio - t) / (1.0 - t);
+    return normalized * normalized;
 }
 
 // Holding cost of a query in the generalized Gittins index:

@@ -62,7 +62,7 @@ namespace doris {
 //     first. The table stays fixed; each pass multiplies a query's table index by a
 //     memory holding cost, 1 + round(query_mem_gb) * pressure (see
 //     gittins_holding_cost), where pressure is zero until system memory crosses a
-//     threshold and grows quadratically after, so under memory pressure the ranking
+//     threshold and grows quadratically to 1 at capacity, so under memory pressure the ranking
 //     shifts continuously toward finishing memory-heavy queries. Equal indexes fall back to least attained service, then arrival order
 //     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the ranking is
 //     plain least-attained-service.
