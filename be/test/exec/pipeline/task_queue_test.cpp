@@ -64,8 +64,10 @@ public:
     // base implementation would go through the QueryContext, which is a fake pointer
     // here and must never be dereferenced.
     int query_worker_cap() const override { return _worker_cap; }
+    int64_t query_mem_bytes() const override { return _mem_bytes; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
+    void set_mem_bytes(int64_t bytes) { _mem_bytes = bytes; }
     void set_active_task_num(int num) { _active_task_num = num; }
     void set_worker_cap(int cap) { _worker_cap = cap; }
 
@@ -75,6 +77,7 @@ private:
     bool _inelastic;
     int _active_task_num = 0;
     int _worker_cap = -1;
+    int64_t _mem_bytes = 0;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -113,6 +116,11 @@ PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runti
     auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
     task->set_active_task_num(active);
     task->set_worker_cap(cap);
+    return task;
+}
+PipelineTaskSPtr make_task_with_mem(QueryContext* key, uint64_t runtime_ns, int64_t mem_bytes) {
+    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
+    task->set_mem_bytes(mem_bytes);
     return task;
 }
 } // namespace
@@ -939,6 +947,83 @@ TEST(GittinsTaskQueueTest, TerminationDoesNotChangeRanking) {
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+TEST(GittinsMemoryCostTest, PressureIsZeroUpToThreshold) {
+    EXPECT_DOUBLE_EQ(gittins_memory_pressure(0.0, 0.8), 0.0);
+    EXPECT_DOUBLE_EQ(gittins_memory_pressure(0.5, 0.8), 0.0);
+    EXPECT_DOUBLE_EQ(gittins_memory_pressure(0.8, 0.8), 0.0);
+    EXPECT_DOUBLE_EQ(gittins_memory_pressure(-1.0, 0.8), 0.0);
+}
+
+TEST(GittinsMemoryCostTest, PressureIsQuadraticAboveThreshold) {
+    EXPECT_NEAR(gittins_memory_pressure(0.9, 0.8), 0.01 / 0.2, 1e-12);
+    // At full capacity the pressure is (1 - t).
+    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.8), 0.2, 1e-12);
+    EXPECT_NEAR(gittins_memory_pressure(1.0, 0.5), 0.5, 1e-12);
+    // Continuous and increasing past the threshold.
+    EXPECT_LT(gittins_memory_pressure(0.81, 0.8), gittins_memory_pressure(0.85, 0.8));
+    EXPECT_LT(gittins_memory_pressure(0.81, 0.8), 1e-3);
+}
+
+TEST(GittinsMemoryCostTest, HoldingCostRoundsToGigabytes) {
+    constexpr int64_t kGb = 1024LL * 1024 * 1024;
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(8 * kGb, 0.0), 1.0);
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(0, 0.5), 1.0);
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(-kGb, 0.5), 1.0);
+    // 0.4 GB rounds to 0, 1.6 GB rounds to 2.
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(kGb * 4 / 10, 0.5), 1.0);
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(kGb * 16 / 10, 0.5), 2.0);
+    EXPECT_DOUBLE_EQ(gittins_holding_cost(8 * kGb, 0.2), 2.6);
+}
+
+// Two queries at the same attained service share a table index, so without memory
+// pressure arrival order wins. Above the threshold the 8 GB query's holding cost lifts
+// it ahead; once pressure drops the ranking returns to arrival order.
+TEST(GittinsTaskQueueTest, MemoryPressureFavorsMemoryHeavyQuery) {
+    const bool old_enable = config::enable_pipeline_gittins_scheduling;
+    const bool old_mem_cost = config::enable_pipeline_gittins_memory_cost;
+    const double old_threshold = config::pipeline_gittins_mem_pressure_threshold;
+    config::enable_pipeline_gittins_scheduling = true;
+    config::enable_pipeline_gittins_memory_cost = true;
+    config::pipeline_gittins_mem_pressure_threshold = 0.8;
+    Defer restore {[&]() {
+        config::enable_pipeline_gittins_scheduling = old_enable;
+        config::enable_pipeline_gittins_memory_cost = old_mem_cost;
+        config::pipeline_gittins_mem_pressure_threshold = old_threshold;
+    }};
+    constexpr int64_t kGb = 1024LL * 1024 * 1024;
+    TestTaskQueue q(1);
+    q.set_memory_usage_ratio_for_test(0.5);
+    auto* qa = qkey(0xA); // no memory
+    auto* qb = qkey(0xB); // 8 GB
+
+    ASSERT_TRUE(q.push_back(make_task_with_mem(qa, 0, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_mem(qa, 0, 0)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_mem(qb, 0, 8 * kGb)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_mem(qb, 0, 8 * kGb)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+    auto t1 = q.take(0); // acks the assignment so the worker can be moved
+    ASSERT_NE(t1, nullptr);
+    EXPECT_EQ(t1->query_ctx_raw(), qa);
+
+    q.set_memory_usage_ratio_for_test(1.0);
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+    auto t2 = q.take(0);
+    ASSERT_NE(t2, nullptr);
+    EXPECT_EQ(t2->query_ctx_raw(), qb);
+
+    // Turning the cost off restores arrival order even under pressure.
+    config::enable_pipeline_gittins_memory_cost = false;
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
 
     q.close();
 }

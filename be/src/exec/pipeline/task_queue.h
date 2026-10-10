@@ -59,7 +59,11 @@ namespace doris {
 //     the same counter reported as audit CpuTimeMS, mirrored onto each
 //     QueryState), in a table built once at construction from a pre-installed
 //     final-CPU-time distribution (see gittins_preset_distribution.h); higher index
-//     first. Equal indexes fall back to least attained service, then arrival order
+//     first. The table stays fixed; each pass multiplies a query's table index by a
+//     memory holding cost, 1 + round(query_mem_gb) * pressure (see
+//     gittins_holding_cost), where pressure is zero until system memory crosses a
+//     threshold and grows quadratically after, so under memory pressure the ranking
+//     shifts continuously toward finishing memory-heavy queries. Equal indexes fall back to least attained service, then arrival order
 //     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the ranking is
 //     plain least-attained-service.
 //   - Core allocation is greedy first-come-first-served in that order: each query
@@ -153,6 +157,13 @@ public:
     // Test hook: how many worker slots currently point at `query_id`, i.e. how many
     // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
     int assigned_workers_for_test(const TUniqueId& query_id) const;
+
+    // Test hook: pin the system memory usage ratio (process usage over capacity) the
+    // memory holding cost sees. A negative value restores the real measurement.
+    void set_memory_usage_ratio_for_test(double ratio) {
+        _memory_usage_ratio_override.store(ratio, std::memory_order_relaxed);
+    }
+
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
     // becomes available within `timeout_ms` (or the queue is closed).
@@ -198,6 +209,7 @@ private:
         // Sort keys, snapshotted once per pass: `attained_ns` keeps moving under the
         // workers, and the comparator must see one consistent value.
         uint64_t rr_attained = 0;
+        double rr_cost = 1.0;
         double rr_index = 0.0;
 
         // ---- Hot part: separate cacheline, touched by workers ----
@@ -232,6 +244,9 @@ private:
         // alongside `active_tasks` for the same reason (only producers and workers may
         // touch a QueryContext). Constant for the life of a query in practice.
         std::atomic<int> worker_cap {-1};
+        // Mirror of the owning query's memory consumption in bytes, refreshed alongside
+        // `active_tasks`; feeds the Gittins memory holding cost. 0 for the sentinel.
+        std::atomic<int64_t> mem_bytes {0};
     };
 
     // ------------------------------------------------------------------
@@ -366,6 +381,10 @@ private:
     // pre-installed distribution and immutable afterwards, so the scheduler reads it
     // without synchronization. Null in degenerate mode.
     const std::shared_ptr<const GittinsIndexTable> _gittins_table;
+    // See set_memory_usage_ratio_for_test(); negative means "measure".
+    std::atomic<double> _memory_usage_ratio_override {-1.0};
+    // System memory usage over capacity, for the Gittins memory holding cost.
+    double _memory_usage_ratio() const;
 
     // Inbox.
     std::mutex _inbox_mutex;

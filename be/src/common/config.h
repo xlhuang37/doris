@@ -376,6 +376,12 @@ DECLARE_mInt32(pipeline_query_worker_cap);
 DECLARE_mBool(enable_pipeline_gittins_scheduling);
 // Number of 1-second slots in the Gittins index table
 DECLARE_Int32(pipeline_gittins_histogram_slots);
+// Scale the Gittins index by a memory holding cost (1 + mem_gb * pressure)
+DECLARE_mBool(enable_pipeline_gittins_memory_cost);
+// Fraction of physical memory treated as system capacity by the memory cost
+DECLARE_mDouble(pipeline_gittins_mem_capacity_ratio);
+// Fraction of capacity above which the memory cost starts to apply
+DECLARE_mDouble(pipeline_gittins_mem_pressure_threshold);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

@@ -323,6 +323,15 @@ DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
 // slot are clamped into it. Read when a pipeline scheduler is created. The default
 // covers the longest pre-installed sample (~411s).
 DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
+// Generalized Gittins index with a memory holding cost: each query's index is
+// multiplied by 1 + round(query_mem_gb) * pressure, where
+//     pressure = max(0, u - threshold)^2 / (1 - threshold)
+// and u is process memory usage over (capacity_ratio * physical memory). Below the
+// threshold the cost is 1 and ranking is plain Gittins; above it, memory-heavy
+// queries are increasingly favored so they finish and release memory.
+DEFINE_mBool(enable_pipeline_gittins_memory_cost, "true");
+DEFINE_mDouble(pipeline_gittins_mem_capacity_ratio, "0.9");
+DEFINE_mDouble(pipeline_gittins_mem_pressure_threshold, "0.8");
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");

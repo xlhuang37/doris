@@ -28,6 +28,8 @@
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "exec/pipeline/pipeline_task.h"
+#include "runtime/memory/global_memory_arbitrator.h"
+#include "util/mem_info.h"
 #include "util/thread.h"
 
 namespace doris {
@@ -304,6 +306,20 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
 void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTask* task) {
     qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
     qs->worker_cap.store(task->query_worker_cap(), std::memory_order_relaxed);
+    qs->mem_bytes.store(task->query_mem_bytes(), std::memory_order_relaxed);
+}
+
+double MultiCoreTaskQueue::_memory_usage_ratio() const {
+    const double override_ratio = _memory_usage_ratio_override.load(std::memory_order_relaxed);
+    if (override_ratio >= 0.0) {
+        return override_ratio;
+    }
+    const double capacity = static_cast<double>(MemInfo::physical_mem()) *
+                            config::pipeline_gittins_mem_capacity_ratio;
+    if (!(capacity > 0.0)) {
+        return 0.0;
+    }
+    return static_cast<double>(GlobalMemoryArbitrator::process_memory_usage()) / capacity;
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -564,13 +580,19 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    // Priority: highest Gittins index first, then least attained service, then arrival
-    // order. With the policy off every index is 0, which reduces to plain
-    // least-attained-service.
+    // Priority: highest generalized Gittins index (memory holding cost times the table
+    // index) first, then least attained service, then arrival order. With the policy
+    // off every index is 0, which reduces to plain least-attained-service.
     const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+    const double pressure =
+            use_gittins && config::enable_pipeline_gittins_memory_cost
+                    ? gittins_memory_pressure(_memory_usage_ratio(),
+                                              config::pipeline_gittins_mem_pressure_threshold)
+                    : 0.0;
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
-        qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
+        qs->rr_cost = gittins_holding_cost(qs->mem_bytes.load(std::memory_order_relaxed), pressure);
+        qs->rr_index = use_gittins ? qs->rr_cost * _gittins_table->index(qs->rr_attained) : 0.0;
     }
     std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
         if (a->rr_index != b->rr_index) {
