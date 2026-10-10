@@ -223,7 +223,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             _check_assignment(worker_id);
         }
         // "Inelastic first": single-task pipelines outrank everything, including the
-        // worker's own assignment and attained-service ranking. Accounting is the
+        // worker's own assignment and arrival-order ranking. Accounting is the
         // same as the tokenless fallback below (the task was never in a per-query
         // sub-queue).
         if (_inelastic_queue.try_dequeue(task)) {
@@ -307,9 +307,9 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     if (charge) {
         // Charge the executed CPU time to the owning query's global counter. This
         // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers, and drives
-        // attained-service ranking. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op and they stay at attained 0.
+        // and cores) and across the pipeline/scan schedulers; this queue ranks by
+        // arrival and does not read it. For tasks without a query counter (e.g.
+        // RevokableTask) the charge is a no-op.
         task->add_query_runtime_ns(charged_ns);
     }
     if (_mode != Mode::FULL) {
@@ -402,7 +402,7 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             _handle_message(msg, syncs);
         }
         if (!closing) {
-            // Every pass: compact tombstones, re-sort by attained service, dispatch.
+            // Every pass: compact tombstones, allocate in arrival order, dispatch.
             // Destroy is only attempted after compact has cleared in_sched.
             _rebalance_and_dispatch();
             _try_teardown();
@@ -564,12 +564,11 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
-        return a->attained_ns.load(std::memory_order_relaxed) <
-               b->attained_ns.load(std::memory_order_relaxed);
-    });
+    // Priority is first-come-first-served: `_queries` is append-only in NEW_QUERY
+    // order and the compact above preserves relative order, so it already is the
+    // priority order and needs no sort.
 
-    // Phase 1: desired grants per query - greedy least-attained-first. Each query
+    // Phase 1: desired grants per query - greedy in arrival order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
     // session variable when set, otherwise the BE config, both re-read every pass so a
     // runtime change lands within one tick) before the next is considered. Demand is
@@ -618,7 +617,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
 
     // Phase 3: hand leftover grants to movable workers. `_granted_queries` is already
-    // in attained-service order, so the least-attained query is served first. A worker
+    // in arrival order, so the oldest query is served first. A worker
     // is movable when its last slot write was acked (never two outstanding writes per
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.
