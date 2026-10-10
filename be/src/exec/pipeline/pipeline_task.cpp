@@ -107,6 +107,10 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
     }
 }
 
+int64_t PipelineTask::query_mem_bytes() const {
+    return _query_mem_tracker != nullptr ? _query_mem_tracker->consumption() : 0;
+}
+
 PipelineTask::~PipelineTask() {
     // Safety net for a task destroyed while still counted, which happens when it never
     // reaches a terminal state: finalize() bails out early once the fragment context is

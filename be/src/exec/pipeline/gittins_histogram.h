@@ -21,11 +21,40 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include <vector>
 
 namespace doris {
 #include "common/compile_check_begin.h"
+
+// Memory pressure term of the Gittins holding cost:
+//     (max(0, u - t) / (1 - t))^2
+// where `usage_ratio` (u) is system memory use over capacity and `threshold` (t) is
+// the fraction of capacity below which memory is free. Zero up to the threshold,
+// exactly 1 at full capacity, and continuous in between, so the policy shifts
+// gradually rather than at a cliff. Past capacity it keeps growing.
+inline double gittins_memory_pressure(double usage_ratio, double threshold) {
+    if (!(usage_ratio > 0.0)) {
+        return 0.0;
+    }
+    const double t = std::clamp(std::isfinite(threshold) ? threshold : 0.0, 0.0, 0.999);
+    const double normalized = std::max(0.0, usage_ratio - t) / (1.0 - t);
+    return normalized * normalized;
+}
+
+// Holding cost of a query in the generalized Gittins index:
+//     1 + round(mem_gb) * pressure
+// A query's index is this cost times its plain Gittins index, so under pressure
+// memory-heavy queries are pushed toward completion (and toward releasing memory).
+inline double gittins_holding_cost(int64_t mem_bytes, double pressure) {
+    if (!(pressure > 0.0) || mem_bytes <= 0) {
+        return 1.0;
+    }
+    constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+    const auto mem_gb = std::llround(static_cast<double>(mem_bytes) / kBytesPerGb);
+    return 1.0 + static_cast<double>(mem_gb) * pressure;
+}
 
 // Immutable per-slot Gittins index table, built from a GittinsHistogram snapshot.
 // Safe to read from any thread once published.

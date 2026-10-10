@@ -158,6 +158,10 @@ public:
     // mirror it into the scheduler's per-query state (the scheduler thread must never
     // dereference a QueryContext).
     MOCK_FUNCTION int query_worker_cap() const { return _query_worker_cap; }
+    // Current memory consumption of the owning query, in bytes, from its query mem
+    // tracker; 0 when there is none (e.g. RevokableTask). Mirrored into the pipeline
+    // scheduler's per-query state for the Gittins memory holding cost.
+    MOCK_FUNCTION int64_t query_mem_bytes() const;
 
     // Opaque key identifying the owning query, used by the query-granular task queue
     // to bucket this task. The query context outlives its tasks; the pointer is only
