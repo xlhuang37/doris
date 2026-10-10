@@ -32,8 +32,8 @@ namespace doris {
 
 // Tests for the push-based, query-granular pipeline task queue. Ranking is
 // first-come-first-served: the order in which each query's first task reached the
-// queue, regardless of attained service. Registry keys are TUniqueId values from query_id(); tests
-// encode a fake QueryContext* into that id and never dereference it.
+// queue, regardless of attained service. Registry keys are TUniqueId values from
+// query_id(); tests encode a fake QueryContext* into that id and never dereference it.
 //
 // The central scheduler runs on its own thread; tests use
 // wait_scheduler_settled_for_test() to make its assignment decisions deterministic:
@@ -606,7 +606,7 @@ TEST(PushBasedTaskQueueTest, InelasticFirstBeatsBacklog) {
 
     ASSERT_TRUE(q.push_back(make_inelastic_task(qb, 5 * kSecondNs)).ok());
 
-    // The inelastic task jumps ahead of A's backlog and of attained-service ranking.
+    // The inelastic task jumps ahead of A's backlog and of arrival-order ranking.
     auto t1 = q.take(0);
     ASSERT_NE(t1, nullptr);
     EXPECT_EQ(t1->query_ctx_raw(), qb);
