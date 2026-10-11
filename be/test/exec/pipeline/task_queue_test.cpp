@@ -123,12 +123,18 @@ class PushBasedTaskQueueTest : public testing::Test {
 protected:
     void SetUp() override {
         _old_enable_gittins = config::enable_pipeline_gittins_scheduling;
+        _old_fcfs_threads = config::pipeline_fcfs_thread_num;
         config::enable_pipeline_gittins_scheduling = false;
+        config::pipeline_fcfs_thread_num = 0;
     }
-    void TearDown() override { config::enable_pipeline_gittins_scheduling = _old_enable_gittins; }
+    void TearDown() override {
+        config::enable_pipeline_gittins_scheduling = _old_enable_gittins;
+        config::pipeline_fcfs_thread_num = _old_fcfs_threads;
+    }
 
 private:
     bool _old_enable_gittins = true;
+    int32_t _old_fcfs_threads = 0;
 };
 
 // A lower-attained query is staffed before a higher-attained query, regardless of
@@ -941,6 +947,107 @@ TEST(GittinsTaskQueueTest, TerminationDoesNotChangeRanking) {
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
 
     q.close();
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid FCFS / Gittins worker groups
+// ---------------------------------------------------------------------------
+
+class HybridTaskQueueTest : public testing::Test {
+protected:
+    void SetUp() override {
+        _old_enable_gittins = config::enable_pipeline_gittins_scheduling;
+        _old_fcfs_threads = config::pipeline_fcfs_thread_num;
+        _old_cap = config::pipeline_query_worker_cap;
+        config::enable_pipeline_gittins_scheduling = true;
+    }
+    void TearDown() override {
+        config::enable_pipeline_gittins_scheduling = _old_enable_gittins;
+        config::pipeline_fcfs_thread_num = _old_fcfs_threads;
+        config::pipeline_query_worker_cap = _old_cap;
+    }
+
+private:
+    bool _old_enable_gittins = true;
+    int32_t _old_fcfs_threads = 0;
+    int32_t _old_cap = 8;
+};
+
+// Workers [0, 2) rank by arrival and workers [2, 4) by Gittins index. The FCFS group
+// staffs the oldest query A; the Gittins group staffs C (1.5s attained, higher index
+// than a fresh query) over the older B. Pure FCFS would have picked A and B, pure
+// Gittins C and A.
+TEST_F(HybridTaskQueueTest, GroupsRankByTheirOwnPolicy) {
+    config::pipeline_fcfs_thread_num = 2;
+    TestTaskQueue q(4);
+    const uint64_t c_attained = kSecondNs + kSecondNs / 2;
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xA), 0, /*active=*/2)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xB), 0, /*active=*/2)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xC), c_attained, /*active=*/2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA), 0, 2), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC), 2, 4), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    q.close();
+}
+
+// The worker cap bounds a query's workers summed over both groups. A (oldest, and
+// also top of the Gittins order) reaches its cap of 3 in the FCFS group, so the
+// Gittins group gives it nothing and tops B up from 1 to 3 instead; the two Gittins
+// workers left over stay unassigned.
+TEST_F(HybridTaskQueueTest, WorkerCapIsSharedAcrossGroups) {
+    config::pipeline_fcfs_thread_num = 4;
+    config::pipeline_query_worker_cap = 3;
+    TestTaskQueue q(8);
+    const uint64_t a_attained = kSecondNs + kSecondNs / 2;
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xA), a_attained, /*active=*/10)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xB), 0, /*active=*/10)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA), 0, 4), 3);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA), 4, 8), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB), 0, 4), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB), 4, 8), 2);
+
+    q.close();
+}
+
+// Demand is shared the same way: a query fully staffed by the FCFS group is not
+// staffed again by the Gittins group.
+TEST_F(HybridTaskQueueTest, DemandIsSharedAcrossGroups) {
+    config::pipeline_fcfs_thread_num = 2;
+    TestTaskQueue q(4);
+
+    ASSERT_TRUE(q.push_back(make_task_with_active(qkey(0xA), 0, /*active=*/2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA), 0, 2), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA), 2, 4), 0);
+
+    q.close();
+}
+
+// pipeline_fcfs_thread_num is clamped to [0, pipeline threads]: above the thread count
+// every worker is FCFS (the older fresh query A wins), below 0 every worker is Gittins
+// (B at 1.5s attained wins).
+TEST_F(HybridTaskQueueTest, FcfsThreadNumIsClamped) {
+    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
+    for (int32_t fcfs_threads : {100, -5}) {
+        config::pipeline_fcfs_thread_num = fcfs_threads;
+        TestTaskQueue q(1);
+        ASSERT_TRUE(q.push_back(make_task(qkey(0xA), 0)).ok());
+        ASSERT_TRUE(q.push_back(make_task(qkey(0xB), b_attained)).ok());
+        q.wait_scheduler_settled_for_test();
+
+        const bool all_fcfs = fcfs_threads > 0;
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), all_fcfs ? 1 : 0) << fcfs_threads;
+        EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), all_fcfs ? 0 : 1) << fcfs_threads;
+        q.close();
+    }
 }
 
 } // namespace doris
