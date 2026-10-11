@@ -34,7 +34,11 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
-        : _core_size(core_size), _mode(mode) {
+        : _core_size(core_size),
+          _mode(mode),
+          _gittins_table(mode == Mode::FULL ? build_preset_gittins_table(
+                                                      config::pipeline_gittins_histogram_slots)
+                                            : nullptr) {
     if (_mode == Mode::FULL) {
         auto worker_count = static_cast<size_t>(std::max(core_size, 1));
         _worker_slots = std::vector<WorkerSlot>(worker_count);
@@ -223,7 +227,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             _check_assignment(worker_id);
         }
         // "Inelastic first": single-task pipelines outrank everything, including the
-        // worker's own assignment and arrival-order ranking. Accounting is the
+        // worker's own assignment and priority ranking. Accounting is the
         // same as the tokenless fallback below (the task was never in a per-query
         // sub-queue).
         if (_inelastic_queue.try_dequeue(task)) {
@@ -304,14 +308,6 @@ void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTas
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
     auto charged_ns = static_cast<uint64_t>(std::max<int64_t>(time_spent, 0));
-    if (charge) {
-        // Charge the executed CPU time to the owning query's global counter. This
-        // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers; this queue ranks by
-        // arrival and does not read it. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op.
-        task->add_query_runtime_ns(charged_ns);
-    }
     if (_mode != Mode::FULL) {
         return;
     }
@@ -327,6 +323,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     _refresh_query_mirror(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
+        // Attained service is not charged here: execute() already added this run's
+        // thread CPU time to the query's CPUContext (as do scanners, spill and async
+        // writers), so the snapshot just picks up the current value. Tasks without a
+        // query CPUContext (e.g. RevokableTask) stay at attained 0.
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
@@ -402,7 +402,7 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             _handle_message(msg, syncs);
         }
         if (!closing) {
-            // Every pass: compact tombstones, allocate in arrival order, dispatch.
+            // Every pass: compact tombstones, re-sort by priority, dispatch.
             // Destroy is only attempted after compact has cleared in_sched.
             _rebalance_and_dispatch();
             _try_teardown();
@@ -564,11 +564,22 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    // Priority is first-come-first-served: `_queries` is append-only in NEW_QUERY
-    // order and the compact above preserves relative order, so it already is the
-    // priority order and needs no sort.
+    // Priority: highest Gittins index first, then least attained service, then arrival
+    // order. With the policy off every index is 0, which reduces to plain
+    // least-attained-service.
+    const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+    for (QueryState* qs : _queries) {
+        qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
+        qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
+    }
+    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
+        if (a->rr_index != b->rr_index) {
+            return a->rr_index > b->rr_index;
+        }
+        return a->rr_attained < b->rr_attained;
+    });
 
-    // Phase 1: desired grants per query - greedy in arrival order. Each query
+    // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
     // session variable when set, otherwise the BE config, both re-read every pass so a
     // runtime change lands within one tick) before the next is considered. Demand is
@@ -617,7 +628,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
 
     // Phase 3: hand leftover grants to movable workers. `_granted_queries` is already
-    // in arrival order, so the oldest query is served first. A worker
+    // in priority order, so the highest-priority query is served first. A worker
     // is movable when its last slot write was acked (never two outstanding writes per
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.

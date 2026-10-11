@@ -60,7 +60,8 @@ public:
 
     // Attained service of the query on this BE, in ns. It is the same thread CPU time
     // counter as cpu_cost_ms() (charged by pipeline tasks, spill, scanners and async
-    // writers), so attained_service_ms always equals cpu_ms.
+    // writers), which the pipeline scheduler ranks queries by. Reported as
+    // attained_service_ms.
     int64_t attained_service_ns() const { return cpu_cost_ms(); }
 
     // Bind current thread to cgroup, only some load thread should do this.

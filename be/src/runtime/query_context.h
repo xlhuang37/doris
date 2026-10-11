@@ -102,11 +102,13 @@ public:
 
     ExecEnv* exec_env() const { return _exec_env; }
 
-    // Query-global CPU/exec runtime counter shared by every PipelineFragmentContext
-    // of this query. It is the attained-service key for the pipeline task scheduler
-    // (and is still charged by the scan time-sharing scheduler), so all fragments of
-    // a small query share one low "attained service" value and win priority together.
-    std::atomic<uint64_t>* query_runtime_counter() { return &_query_runtime_ns; }
+    // Attained service of this query on this BE, in ns: the thread CPU time charged to
+    // CPUContext by pipeline tasks, spill, scanners and async writers. It is the same
+    // counter this BE reports as the audit log's CpuTimeMS (and AttainedServiceMS), and
+    // the key the pipeline task scheduler ranks queries by.
+    uint64_t attained_service_ns() const {
+        return static_cast<uint64_t>(_resource_ctx->cpu_context()->attained_service_ns());
+    }
 
     // Tasks of this query that currently want a core, across all fragments and
     // instances: submitted and not yet finished, minus those parked on a dependency.
@@ -217,13 +219,6 @@ public:
         return _query_options.__isset.expected_service_ms ? _query_options.expected_service_ms
                                                           : -1;
     }
-
-    // Service this query has attained so far on this BE, in ns: its CPUContext CPU time,
-    // reported as both cpu_ms and attained_service_ms; see CPUContext::attained_service_ns().
-    int64_t attained_service_ns() const {
-        return _resource_ctx->cpu_context()->attained_service_ns();
-    }
-
     const TQueryOptions& query_options() const { return _query_options; }
     bool should_be_shuffled_agg(int node_id) const {
         return _query_options.__isset.shuffled_agg_ids &&
@@ -359,8 +354,6 @@ private:
     ExecEnv* _exec_env = nullptr;
     MonotonicStopWatch _query_watcher;
 
-    // Query-global runtime counter; see query_runtime_counter().
-    std::atomic<uint64_t> _query_runtime_ns {0};
     // Query-global runnable task count; see active_task_counter().
     std::atomic<int> _active_task_num {0};
     bool _is_nereids = false;
