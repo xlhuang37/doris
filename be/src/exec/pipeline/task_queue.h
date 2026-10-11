@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -51,26 +52,36 @@ namespace doris {
 //     once, through its owning query's token (enqueue serialized by a per-query mutex,
 //     since explicit producers are single-producer). Sub-queues are drained lock-free
 //     via try_dequeue_from_producer.
-//   - A central scheduler thread ranks live queries by their Gittins index and
-//     push-assigns workers by writing per-worker, cache-aligned assignment slots.
-//     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
-//     a single append-only vector, re-sorted on every rebalance. The index is looked
-//     up, keyed by each query's attained service (the query's CPUContext CPU time,
-//     the same counter reported as audit CpuTimeMS, mirrored onto each
-//     QueryState), in a table built once at construction from a pre-installed
+//   - A central scheduler thread push-assigns workers by writing per-worker,
+//     cache-aligned assignment slots. Only the scheduler writes a slot; only the
+//     owning worker reads it.
+//   - Hybrid ranking: the workers are split into two groups, each with its own
+//     priority order over the same live queries. Workers [0, F) form the FCFS group
+//     and rank queries first-come-first-served (by the order their first task reached
+//     this queue); workers [F, N) form the Gittins group and rank queries by Gittins
+//     index. F is `pipeline_fcfs_thread_num` clamped to [0, N], re-read on every
+//     rebalance. The ranking vector is append-only and always in arrival order (a
+//     query torn down after termination and later resurrected re-enters at the back),
+//     which is directly the FCFS order; the Gittins group sorts a copy of it. The
+//     index is looked up, keyed by each query's attained service (the query's
+//     CPUContext CPU time, the same counter reported as audit CpuTimeMS, mirrored onto
+//     each QueryState), in a table built once at construction from a pre-installed
 //     final-CPU-time distribution (see gittins_preset_distribution.h); higher index
 //     first. Equal indexes fall back to least attained service, then arrival order
-//     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the ranking is
-//     plain least-attained-service.
-//   - Core allocation is greedy first-come-first-served in that order: each query
-//     takes as many of the pool's workers as it can use (capped by its own
+//     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the Gittins
+//     group ranks by plain least-attained-service.
+//   - Core allocation is greedy within each group, in that group's order: each query
+//     takes as many of the group's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
 //     name when the query does not override it) before the next is considered. Both
 //     are read fresh on every rebalance, so either can be retuned at runtime. A query's
 //     demand is its active task count (tasks created and not yet finalized, so
 //     blocked tasks count too), which is what lets a query that is momentarily
-//     empty but about to unblock keep its cores. Queries reached after the workers
-//     run out hold no assigned worker and are served only by the fallback.
+//     empty but about to unblock keep its cores. The FCFS group allocates first; the
+//     Gittins group then sees only what each query still wants (demand and cap are
+//     shared across groups), so a query is never staffed twice for the same task.
+//     Queries reached after a group's workers run out hold no worker of that group;
+//     a query with no worker in either group is served only by the fallback.
 //   - Workers obey their slot: dequeue from the assigned query's sub-queue. When the
 //     sub-queue is empty they fall back to a tokenless try_dequeue on the shared queue
 //     (work-conserving, priority-blind relief valve), re-checking the slot after every
@@ -80,7 +91,7 @@ namespace doris {
 //     critical path. Such tasks keep full per-query bookkeeping (pending/in-flight
 //     counters, idle detection, teardown) but bypass the per-query sub-queue and go
 //     into a dedicated shared queue that every worker drains before anything else,
-//     ahead of its assignment and of priority ranking entirely.
+//     ahead of its assignment and of both rankings entirely.
 //   - Workers notify the scheduler through a mutex-guarded inbox (attach/detach acks,
 //     new queries, query termination); the scheduler sleeps on a condition variable
 //     with a timer tick and rebalances every pass so accumulated CPU is visible
@@ -153,12 +164,20 @@ public:
     // Test hook: how many worker slots currently point at `query_id`, i.e. how many
     // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
     int assigned_workers_for_test(const TUniqueId& query_id) const;
+    // Test hook: as above, restricted to workers [begin_worker, end_worker).
+    int assigned_workers_for_test(const TUniqueId& query_id, int begin_worker,
+                                  int end_worker) const;
+
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
     // becomes available within `timeout_ms` (or the queue is closed).
     PipelineTaskSPtr _take(int worker_id, uint32_t timeout_ms);
 
 private:
+    // Worker groups of the hybrid ranking (see class comment); also indexes the
+    // per-group rebalance scratch.
+    enum WorkerGroup : int { FCFS_GROUP = 0, GITTINS_GROUP = 1, NUM_WORKER_GROUPS = 2 };
+
     // ------------------------------------------------------------------
     // Per-query state (full mode only). Created lazily by the enqueue path; destroyed
     // exclusively by the scheduler thread, under the exclusive registry lock, once the
@@ -192,9 +211,12 @@ private:
         bool terminated = false;
         // Membership flag for _destroy_candidates (dedup).
         bool in_destroy_candidates = false;
-        // Rebalance scratch (valid only within one rebalance pass).
-        int rr_grant = 0;
+        // Rebalance scratch (valid only within one rebalance pass). `rr_grant` is per
+        // worker group; `rr_want` is what the query can still use after the groups
+        // allocated so far (demand bounded by the worker cap).
+        std::array<int, NUM_WORKER_GROUPS> rr_grant {};
         int rr_demand = 0;
+        int rr_want = 0;
         // Sort keys, snapshotted once per pass: `attained_ns` keeps moving under the
         // workers, and the comparator must see one consistent value.
         uint64_t rr_attained = 0;
@@ -205,8 +227,8 @@ private:
         // statistic; ranking uses the query's CPUContext time, see attained_ns).
         alignas(64) std::atomic<uint64_t> cpu_time_ns {0};
         // Snapshot of query-global attained service, refreshed whenever a task is
-        // in hand (enqueue / charge). The scheduler derives each query's Gittins
-        // index from this and uses it as the tie-break.
+        // in hand (enqueue / charge). The Gittins group derives each query's Gittins
+        // index from this and uses it as the tie-break; the FCFS group ignores it.
         std::atomic<uint64_t> attained_ns {0};
         // Tasks of this query currently between dequeue and release in this pool.
         // Ordering contract with `pending_approx` (both seq_cst): a dequeuing worker
@@ -353,15 +375,21 @@ private:
     std::vector<WorkerLocal> _worker_local;
     std::vector<WorkerSched> _worker_sched; // scheduler-thread-only
 
-    // Schedulable queries (scheduler-thread-only). Appended on NEW_QUERY; terminated
-    // entries stay as live tombstones until the next rebalance compact. While a
-    // pointer is here (`in_sched`), `_registry.erase` is forbidden.
+    // Schedulable queries (scheduler-thread-only), in arrival order, which is the FCFS
+    // group's priority order. Appended on NEW_QUERY; terminated entries stay as live
+    // tombstones until the next rebalance compact, which must preserve relative order.
+    // Never sorted in place. While a pointer is here (`in_sched`), `_registry.erase` is
+    // forbidden.
     std::vector<QueryState*> _queries;
+    // Copy of `_queries` re-sorted into the Gittins group's priority order on every
+    // pass that has Gittins workers (scheduler-thread-only).
+    std::vector<QueryState*> _gittins_order;
     // Queries pending destroy after QUERY_TERMINATED (scheduler-thread-only).
     std::vector<QueryState*> _destroy_candidates;
-    // Queries that received a grant in the current rebalance pass, in priority order.
-    // Reused across passes to avoid reallocating (scheduler-thread-only).
-    std::vector<QueryState*> _granted_queries;
+    // Per worker group: queries that received a grant from that group in the current
+    // rebalance pass, in the group's priority order. Reused across passes to avoid
+    // reallocating (scheduler-thread-only).
+    std::array<std::vector<QueryState*>, NUM_WORKER_GROUPS> _granted_queries;
     // Gittins index table (full mode), built once at construction from the
     // pre-installed distribution and immutable afterwards, so the scheduler reads it
     // without synchronization. Null in degenerate mode.

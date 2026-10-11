@@ -376,6 +376,9 @@ DECLARE_mInt32(pipeline_query_worker_cap);
 DECLARE_mBool(enable_pipeline_gittins_scheduling);
 // Number of 1-second slots in the Gittins index table
 DECLARE_Int32(pipeline_gittins_histogram_slots);
+// Pipeline workers per scheduler that allocate first-come-first-served; the rest
+// allocate by Gittins index. Clamped to [0, pipeline thread count].
+DECLARE_mInt32(pipeline_fcfs_thread_num);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
