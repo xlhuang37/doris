@@ -34,7 +34,11 @@ namespace doris {
 #include "common/compile_check_begin.h"
 
 MultiCoreTaskQueue::MultiCoreTaskQueue(int core_size, Mode mode)
-        : _core_size(core_size), _mode(mode) {
+        : _core_size(core_size),
+          _mode(mode),
+          _gittins_table(mode == Mode::FULL ? build_preset_gittins_table(
+                                                      config::pipeline_gittins_histogram_slots)
+                                            : nullptr) {
     if (_mode == Mode::FULL) {
         auto worker_count = static_cast<size_t>(std::max(core_size, 1));
         _worker_slots = std::vector<WorkerSlot>(worker_count);
@@ -223,7 +227,7 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             _check_assignment(worker_id);
         }
         // "Inelastic first": single-task pipelines outrank everything, including the
-        // worker's own assignment and arrival-order ranking. Accounting is the
+        // worker's own assignment and priority ranking. Accounting is the
         // same as the tokenless fallback below (the task was never in a per-query
         // sub-queue).
         if (_inelastic_queue.try_dequeue(task)) {
@@ -304,14 +308,6 @@ void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTas
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
     auto charged_ns = static_cast<uint64_t>(std::max<int64_t>(time_spent, 0));
-    if (charge) {
-        // Charge the executed CPU time to the owning query's global counter. This
-        // counter is shared by all of the query's tasks (across fragments, instances
-        // and cores) and across the pipeline/scan schedulers; this queue ranks by
-        // arrival and does not read it. For tasks without a query counter (e.g.
-        // RevokableTask) the charge is a no-op.
-        task->add_query_runtime_ns(charged_ns);
-    }
     if (_mode != Mode::FULL) {
         return;
     }
@@ -327,6 +323,10 @@ void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int
     _refresh_query_mirror(qs, task);
     if (charge) {
         qs->cpu_time_ns.fetch_add(charged_ns, std::memory_order_relaxed);
+        // Attained service is not charged here: execute() already added this run's
+        // thread CPU time to the query's CPUContext (as do scanners, spill and async
+        // writers), so the snapshot just picks up the current value. Tasks without a
+        // query CPUContext (e.g. RevokableTask) stay at attained 0.
         qs->attained_ns.store(task->query_runtime_ns(), std::memory_order_relaxed);
     }
     int remaining = qs->in_flight.fetch_sub(1) - 1;
@@ -402,7 +402,8 @@ void MultiCoreTaskQueue::_scheduler_loop() {
             _handle_message(msg, syncs);
         }
         if (!closing) {
-            // Every pass: compact tombstones, allocate in arrival order, dispatch.
+            // Every pass: compact tombstones, allocate each worker group in its own
+            // priority order, dispatch.
             // Destroy is only attempted after compact has cleared in_sched.
             _rebalance_and_dispatch();
             _try_teardown();
@@ -470,7 +471,7 @@ void MultiCoreTaskQueue::_handle_message(SchedulerMessage& msg,
             break;
         }
         qs->terminated = true;
-        qs->rr_grant = 0;
+        qs->rr_grant.fill(0);
         // Stay in `_queries` as a live tombstone until the next compact. Do not erase.
         if (!qs->in_destroy_candidates) {
             qs->in_destroy_candidates = true;
@@ -557,34 +558,39 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     for (QueryState* qs : _queries) {
         if (qs->terminated) {
             qs->in_sched = false;
-            qs->rr_grant = 0;
+            qs->rr_grant.fill(0);
             continue;
         }
         _queries[live++] = qs;
     }
     _queries.resize(live);
 
-    // Priority is first-come-first-served: `_queries` is append-only in NEW_QUERY
-    // order and the compact above preserves relative order, so it already is the
-    // priority order and needs no sort.
+    // Worker groups: [0, fcfs_workers) is the FCFS group, [fcfs_workers, total) the
+    // Gittins group. Re-read every pass, so a runtime change lands within one tick: a
+    // worker that changes group is simply kept or moved by its new group below.
+    const int total_workers = static_cast<int>(_worker_sched.size());
+    const int fcfs_workers = std::clamp(config::pipeline_fcfs_thread_num, 0, total_workers);
+    const int gittins_workers = total_workers - fcfs_workers;
+    auto group_of = [fcfs_workers](int worker_id) {
+        return worker_id < fcfs_workers ? FCFS_GROUP : GITTINS_GROUP;
+    };
 
-    // Phase 1: desired grants per query - greedy in arrival order. Each query
-    // takes as many workers as it can use (capped by its own worker cap: the per-query
-    // session variable when set, otherwise the BE config, both re-read every pass so a
-    // runtime change lands within one tick) before the next is considered. Demand is
-    // the query's runnable task count, which counts its tasks wherever they sit while
-    // excluding those parked on a dependency, so a query cannot hold cores for work it
-    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
-    // (whose tasks have no QueryContext, so no active count) schedulable, and they
-    // cover the window where a task has already blocked but its worker has yet to
-    // release it.
+    // Phase 1: desired grants per query and group - greedy in each group's priority
+    // order. Each query takes as many of the group's workers as it can use (capped by
+    // its own worker cap: the per-query session variable when set, otherwise the BE
+    // config, both re-read every pass so a runtime change lands within one tick) before
+    // the next is considered. Demand is the query's runnable task count, which counts
+    // its tasks wherever they sit while excluding those parked on a dependency, so a
+    // query cannot hold cores for work it cannot perform. The sub-queue terms are a
+    // floor: they keep the sentinel bucket (whose tasks have no QueryContext, so no
+    // active count) schedulable, and they cover the window where a task has already
+    // blocked but its worker has yet to release it. Demand and cap bound the query's
+    // grants summed over both groups.
     // Every scheduled query gets its scratch reset, not just the granted ones,
     // because phase 2 reads the grant of whatever query a worker currently sits on.
-    int remaining = static_cast<int>(_worker_slots.size());
     const int default_cap = config::pipeline_query_worker_cap;
-    _granted_queries.clear();
     for (QueryState* qs : _queries) {
-        qs->rr_grant = 0;
+        qs->rr_grant.fill(0);
         qs->rr_demand = std::max(qs->active_tasks.load(),
                                  qs->pending_approx.load() + qs->in_flight.load());
         int want = qs->rr_demand;
@@ -597,57 +603,100 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         if (cap > 0) {
             want = std::min(want, cap);
         }
-        if (remaining > 0 && want > 0) {
-            qs->rr_grant = std::min(remaining, want);
-            remaining -= qs->rr_grant;
-            _granted_queries.push_back(qs);
-        }
+        qs->rr_want = want;
     }
+    auto allocate = [this](WorkerGroup group, const std::vector<QueryState*>& order,
+                           int remaining) {
+        auto& granted = _granted_queries[group];
+        granted.clear();
+        for (QueryState* qs : order) {
+            if (remaining == 0) {
+                break;
+            }
+            if (qs->rr_want > 0) {
+                int grant = std::min(remaining, qs->rr_want);
+                qs->rr_grant[group] = grant;
+                qs->rr_want -= grant;
+                remaining -= grant;
+                granted.push_back(qs);
+            }
+        }
+    };
+
+    // FCFS group first: `_queries` is append-only in NEW_QUERY order and the compact
+    // above preserves relative order, so it already is the FCFS priority order.
+    allocate(FCFS_GROUP, _queries, fcfs_workers);
+
+    // Gittins group, over what each query still wants: highest Gittins index first,
+    // then least attained service, then arrival order. With the policy off every index
+    // is 0, which reduces to plain least-attained-service.
+    _gittins_order.clear();
+    if (gittins_workers > 0) {
+        const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+        _gittins_order.assign(_queries.begin(), _queries.end());
+        for (QueryState* qs : _gittins_order) {
+            qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
+            qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
+        }
+        std::stable_sort(_gittins_order.begin(), _gittins_order.end(),
+                         [](const QueryState* a, const QueryState* b) {
+                             if (a->rr_index != b->rr_index) {
+                                 return a->rr_index > b->rr_index;
+                             }
+                             return a->rr_attained < b->rr_attained;
+                         });
+    }
+    allocate(GITTINS_GROUP, _gittins_order, gittins_workers);
 
     // Phase 2: keep stable workers in place. A worker already attached (acked, not
-    // self-detached) to a query with a grant consumes one grant with no slot write,
-    // so a steady state generates no control traffic at all.
-    for (auto& ws : _worker_sched) {
+    // self-detached) to a query with a grant from the worker's own group consumes one
+    // such grant with no slot write, so a steady state generates no control traffic.
+    for (int i = 0; i < total_workers; ++i) {
+        WorkerSched& ws = _worker_sched[i];
         ws.rr_kept = false;
+        const WorkerGroup group = group_of(i);
         if (ws.acked && !ws.self_detached && ws.target != nullptr && !ws.target->terminated &&
-            ws.target->rr_grant > 0) {
-            ws.target->rr_grant--;
+            ws.target->rr_grant[group] > 0) {
+            ws.target->rr_grant[group]--;
             ws.rr_kept = true;
         }
     }
 
-    // Phase 3: hand leftover grants to movable workers. `_granted_queries` is already
-    // in arrival order, so the oldest query is served first. A worker
-    // is movable when its last slot write was acked (never two outstanding writes per
-    // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
-    // attached to a query that no longer wants it.
+    // Phase 3: per group, hand leftover grants to the group's movable workers. Each
+    // group's granted list is already in that group's priority order, so its
+    // highest-priority query is served first. A worker is movable when its last slot
+    // write was acked (never two outstanding writes per worker) and it was not kept in
+    // phase 2: it is unassigned, self-detached, or attached to a query that no longer
+    // wants it from this group.
     bool wrote = false;
-    size_t scan = 0;
-    for (QueryState* qs : _granted_queries) {
-        while (qs->rr_grant > 0) {
-            int chosen = -1;
-            for (size_t n = 0; n < _worker_sched.size(); ++n, ++scan) {
-                size_t i = scan % _worker_sched.size();
-                WorkerSched& ws = _worker_sched[i];
-                if (ws.acked && !ws.rr_kept) {
-                    chosen = static_cast<int>(i);
-                    ++scan;
-                    break;
+    auto dispatch = [&](WorkerGroup group, int begin_worker, int end_worker) {
+        const int group_size = end_worker - begin_worker;
+        int scan = 0;
+        for (QueryState* qs : _granted_queries[group]) {
+            while (qs->rr_grant[group] > 0) {
+                int chosen = -1;
+                for (int n = 0; n < group_size; ++n, ++scan) {
+                    int i = begin_worker + scan % group_size;
+                    WorkerSched& ws = _worker_sched[i];
+                    if (ws.acked && !ws.rr_kept) {
+                        chosen = i;
+                        ++scan;
+                        break;
+                    }
                 }
-            }
-            if (chosen < 0) {
-                // No movable worker anywhere; the rest of the grants wait for the
-                // pending acks and are recomputed next pass.
-                if (wrote) {
-                    _notify_workers(true);
+                if (chosen < 0) {
+                    // No movable worker left in this group; the rest of its grants
+                    // wait for the pending acks and are recomputed next pass.
+                    return;
                 }
-                return;
+                _write_assignment(chosen, qs);
+                qs->rr_grant[group]--;
+                wrote = true;
             }
-            _write_assignment(chosen, qs);
-            qs->rr_grant--;
-            wrote = true;
         }
-    }
+    };
+    dispatch(FCFS_GROUP, 0, fcfs_workers);
+    dispatch(GITTINS_GROUP, fcfs_workers, total_workers);
     if (wrote) {
         _notify_workers(true);
     }
@@ -692,6 +741,11 @@ size_t MultiCoreTaskQueue::registry_size_for_test() const {
 }
 
 int MultiCoreTaskQueue::assigned_workers_for_test(const TUniqueId& query_id) const {
+    return assigned_workers_for_test(query_id, 0, static_cast<int>(_worker_slots.size()));
+}
+
+int MultiCoreTaskQueue::assigned_workers_for_test(const TUniqueId& query_id, int begin_worker,
+                                                  int end_worker) const {
     // Holding the registry lock keeps the state alive for the pointer comparison; the
     // slots themselves are never dereferenced here.
     std::shared_lock<std::shared_mutex> rlock(_registry_mutex);
@@ -700,9 +754,11 @@ int MultiCoreTaskQueue::assigned_workers_for_test(const TUniqueId& query_id) con
         return 0;
     }
     const QueryState* qs = it->second.get();
+    begin_worker = std::max(begin_worker, 0);
+    end_worker = std::min(end_worker, static_cast<int>(_worker_slots.size()));
     int assigned = 0;
-    for (const auto& slot : _worker_slots) {
-        if (slot.assigned.load(std::memory_order_acquire) == qs) {
+    for (int i = begin_worker; i < end_worker; ++i) {
+        if (_worker_slots[i].assigned.load(std::memory_order_acquire) == qs) {
             assigned++;
         }
     }

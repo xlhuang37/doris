@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include <atomic>
-#include <cstdint>
 #include <memory>
 
 #include "runtime/runtime_state.h"
@@ -26,6 +24,7 @@
 namespace doris {
 
 class RuntimeState;
+class CPUContext;
 
 // Base class for execution contexts (e.g. PipelineFragmentContext).
 //
@@ -36,10 +35,9 @@ public:
     TaskExecutionContext();
     virtual ~TaskExecutionContext();
 
-    // Query-global CPU runtime counter, shared by the pipeline scheduler and the
-    // scan scheduler so both rank a query by one unified attained-service signal.
-    // Non-query contexts return nullptr.
-    virtual std::atomic<uint64_t>* query_runtime_counter() { return nullptr; }
+    // CPU accounting of the owning query, whose cpu_cost_ms() counter is the query's
+    // attained service. Non-query contexts return nullptr.
+    virtual const CPUContext* query_cpu_context() { return nullptr; }
 };
 
 using TaskExecutionContextSPtr = std::shared_ptr<TaskExecutionContext>;

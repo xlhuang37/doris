@@ -315,6 +315,22 @@ DEFINE_mInt32(pipeline_task_exec_time_slice, "100");
 // on every rebalance pass, so either can be retuned without a restart.
 DEFINE_mInt32(pipeline_query_worker_cap, "8");
 
+// Rank queries in the pipeline scheduler by Gittins index (derived from the
+// pre-installed final query CPU time distribution) instead of plain least attained
+// service.
+DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
+// Number of 1-second slots in the Gittins index table; final CPU times past the last
+// slot are clamped into it. Read when a pipeline scheduler is created. The default
+// covers the longest pre-installed sample (~411s).
+DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
+// Hybrid pipeline scheduling: the first pipeline_fcfs_thread_num workers of each
+// pipeline scheduler allocate queries first-come-first-served; the remaining
+// (pipeline threads - pipeline_fcfs_thread_num) workers allocate by Gittins index.
+// Values below 0 are treated as 0 (all Gittins) and values above the scheduler's
+// pipeline thread count as that count (all FCFS). Read on every rebalance pass, so
+// it can be retuned without a restart.
+DEFINE_mInt32(pipeline_fcfs_thread_num, "0");
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task
@@ -1656,6 +1672,8 @@ DEFINE_mInt32(snappy_compression_block_size, "262144");
 DEFINE_mInt32(lz4_compression_block_size, "262144");
 
 DEFINE_mBool(enable_pipeline_task_leakage_detect, "false");
+
+DEFINE_mBool(enable_pipeline_worker_timeline_log, "true");
 
 DEFINE_mInt32(check_score_rounds_num, "1000");
 

@@ -372,6 +372,13 @@ DECLARE_mInt32(pipeline_task_exec_time_slice);
 // Default soft per-query worker cap for attained-service pipeline scheduling
 // (0 = unbounded); overridden per query by the session variable of the same name
 DECLARE_mInt32(pipeline_query_worker_cap);
+// Rank pipeline queries by Gittins index instead of least attained service
+DECLARE_mBool(enable_pipeline_gittins_scheduling);
+// Number of 1-second slots in the Gittins index table
+DECLARE_Int32(pipeline_gittins_histogram_slots);
+// Pipeline workers per scheduler that allocate first-come-first-served; the rest
+// allocate by Gittins index. Clamped to [0, pipeline thread count].
+DECLARE_mInt32(pipeline_fcfs_thread_num);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);
@@ -1716,6 +1723,11 @@ DECLARE_mInt32(snappy_compression_block_size);
 DECLARE_mInt32(lz4_compression_block_size);
 
 DECLARE_mBool(enable_pipeline_task_leakage_detect);
+
+// Write a per pipeline worker timeline (START/END of every pipeline task a worker runs, with
+// UNIX timestamp, query id and the query's global runtime counter) to
+// ${LOG_DIR}/worker_timeline/<BE startup time>/.
+DECLARE_mBool(enable_pipeline_worker_timeline_log);
 
 DECLARE_mInt32(check_score_rounds_num);
 

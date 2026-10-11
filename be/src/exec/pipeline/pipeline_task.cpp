@@ -90,7 +90,7 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
     _query_mem_tracker = fragment_context->get_query_ctx()->query_mem_tracker();
 #endif
     if (fragment_context) {
-        _query_runtime_ptr = fragment_context->query_runtime_counter();
+        _query_cpu_ctx = fragment_context->query_cpu_context();
         _query_ctx_raw = fragment_context->get_query_ctx();
         _active_tasks_ptr = _query_ctx_raw->active_task_counter();
         _query_worker_cap = _query_ctx_raw->pipeline_query_worker_cap();
