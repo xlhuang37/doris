@@ -916,7 +916,7 @@ TEST(SrptTaskQueueTest, RanksByExpectedRemainingService) {
     q.close();
 }
 
-// Queries with a supplied expected service are prioritized ahead of unknown-size
+// Queries still inside their expected service are prioritized ahead of unknown-size
 // queries. Unknown queries still use least-attained-service among themselves.
 TEST(SrptTaskQueueTest, KnownServiceOutranksUnknownService) {
     TestTaskQueue q(1);
@@ -936,6 +936,55 @@ TEST(SrptTaskQueueTest, KnownServiceOutranksUnknownService) {
     q.notify_query_terminated(qid(0xA));
     q.wait_scheduler_settled_for_test();
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    q.close();
+}
+
+// An estimate stops counting once the query has outrun it, so the overrunning query
+// no longer looks almost done: the query still inside its estimate is staffed first
+// even though far more service is expected of it. Pushed in the other order so that
+// arrival order is not what decides this.
+TEST(SrptTaskQueueTest, OverrunServiceRanksAfterLiveEstimate) {
+    TestTaskQueue q(1);
+    auto* overrun = qkey(0xA); // expected 2s, attained 5s -> estimate exhausted
+    auto* live = qkey(0xB);    // expected 20s, attained 0 -> 20s remaining
+
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(overrun, 5 * kSecondNs, 2'000)).ok());
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(live, 0, 20'000)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.notify_query_terminated(qid(0xB));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+
+    q.close();
+}
+
+// An overrunning query is demoted into the unknown-size group rather than pinned to
+// the very bottom: there it competes by least attained service, losing to an unknown
+// query that has burned less CPU and beating one that has burned more.
+TEST(SrptTaskQueueTest, OverrunServiceCompetesAsUnknownSize) {
+    TestTaskQueue q(1);
+    auto* overrun = qkey(0xA);        // expected 1s, attained 5s
+    auto* unknown_higher = qkey(0xB); // attained 9s
+    auto* unknown_lower = qkey(0xC);  // attained 1s
+
+    ASSERT_TRUE(q.push_back(make_task_with_expected_service(overrun, 5 * kSecondNs, 1'000)).ok());
+    ASSERT_TRUE(q.push_back(make_task(unknown_higher, 9 * kSecondNs)).ok());
+    ASSERT_TRUE(q.push_back(make_task(unknown_lower, kSecondNs)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+
+    q.notify_query_terminated(qid(0xC));
+    q.wait_scheduler_settled_for_test();
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
 
     q.close();

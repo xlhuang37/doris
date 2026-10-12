@@ -565,28 +565,32 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
 
     // SRPT priority: least expected remaining service first. Expected service is
     // supplied by the client in milliseconds; attained service is query CPU time.
-    // Unknown-size queries rank after known-size queries and retain the old
-    // least-attained-service behavior among themselves.
+    // An estimate only carries information while the query is still inside it: once
+    // attained service reaches it, the query is treated as unknown-size, because
+    // nothing is known about how much work it has left. Unknown-size queries rank
+    // after queries with a live estimate and use least attained service among
+    // themselves, so an overrunning query sinks as it keeps burning CPU.
     constexpr uint64_t kNanosecondsPerMillisecond = 1'000'000ULL;
+    constexpr uint64_t kMaxRemaining = std::numeric_limits<uint64_t>::max();
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
         const int64_t expected_ms = qs->expected_service_ms.load(std::memory_order_relaxed);
-        qs->rr_expected_known = expected_ms >= 0;
-        if (!qs->rr_expected_known) {
-            qs->rr_remaining = std::numeric_limits<uint64_t>::max();
-            continue;
+        uint64_t remaining = 0;
+        if (expected_ms >= 0) {
+            const uint64_t expected_ms_unsigned = static_cast<uint64_t>(expected_ms);
+            const uint64_t expected_ns =
+                    expected_ms_unsigned > kMaxRemaining / kNanosecondsPerMillisecond
+                            ? kMaxRemaining
+                            : expected_ms_unsigned * kNanosecondsPerMillisecond;
+            remaining = expected_ns > qs->rr_attained ? expected_ns - qs->rr_attained : 0;
         }
-        const uint64_t expected_ms_unsigned = static_cast<uint64_t>(expected_ms);
-        const uint64_t expected_ns = expected_ms_unsigned > std::numeric_limits<uint64_t>::max() /
-                                                                    kNanosecondsPerMillisecond
-                                             ? std::numeric_limits<uint64_t>::max()
-                                             : expected_ms_unsigned * kNanosecondsPerMillisecond;
-        qs->rr_remaining = expected_ns > qs->rr_attained ? expected_ns - qs->rr_attained : 0;
+        qs->rr_has_remaining = remaining > 0;
+        qs->rr_remaining = qs->rr_has_remaining ? remaining : kMaxRemaining;
     }
     std::stable_sort(_queries.begin(), _queries.end(),
                      [](const QueryState* a, const QueryState* b) {
-                         if (a->rr_expected_known != b->rr_expected_known) {
-                             return a->rr_expected_known;
+                         if (a->rr_has_remaining != b->rr_has_remaining) {
+                             return a->rr_has_remaining;
                          }
                          if (a->rr_remaining != b->rr_remaining) {
                              return a->rr_remaining < b->rr_remaining;

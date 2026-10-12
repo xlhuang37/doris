@@ -55,9 +55,11 @@ namespace doris {
 //     Only the scheduler writes a slot; only the owning worker reads it. Ranking is
 //     a single append-only vector, re-sorted on every rebalance. Remaining service is
 //     the client-supplied `expected_service` minus attained service (the query's
-//     CPUContext CPU time, mirrored onto each QueryState), floored at zero. Queries
-//     without an expected service rank after known queries and use least attained
-//     service among themselves.
+//     CPUContext CPU time, mirrored onto each QueryState). A query whose attained
+//     service has reached its estimate counts as unknown-size, as does one that never
+//     supplied an estimate: both rank after every query with a live estimate and use
+//     least attained service among themselves, so an overrunning query loses priority
+//     rather than appearing to be almost done.
 //   - Core allocation is greedy first-come-first-served in that order: each query
 //     takes as many of the pool's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
@@ -196,7 +198,10 @@ private:
         // the workers, and the comparator must see one consistent value.
         uint64_t rr_attained = 0;
         uint64_t rr_remaining = 0;
-        bool rr_expected_known = false;
+        // Whether `rr_remaining` is a real remaining-service estimate. False both for a
+        // query that never supplied one and for one that has outrun the estimate it did
+        // supply; see the ranking pass in _rebalance_and_dispatch().
+        bool rr_has_remaining = false;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // Wall-clock time this query's tasks ran on this pool's workers (per-pool
