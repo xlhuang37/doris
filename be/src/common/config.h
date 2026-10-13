@@ -376,6 +376,17 @@ DECLARE_mInt32(pipeline_query_worker_cap);
 DECLARE_mBool(enable_pipeline_gittins_scheduling);
 // Number of 1-second slots in the Gittins index table
 DECLARE_Int32(pipeline_gittins_histogram_slots);
+// Peak query memory (bytes) at which a query is demoted from the top level to level 1
+DECLARE_mInt64(pipeline_mem_demotion_l1_bytes);
+// Peak query memory (bytes) at which a query is demoted to the bottom level
+DECLARE_mInt64(pipeline_mem_demotion_l2_bytes);
+// Total query memory (bytes) of a pool above which the scheduler stops exploring and
+// runs only the earliest-arrived queries (<= 0 disables the fallback)
+DECLARE_mInt64(pipeline_exploration_mem_budget_bytes);
+// Number of earliest-arrived queries that run while the exploration budget is exceeded
+DECLARE_mInt32(pipeline_fcfs_fallback_query_count);
+// Upper bound on a single query's memory limit in bytes (<= 0 means no extra bound)
+DECLARE_mInt64(pipeline_query_max_mem_bytes);
 
 // task executor min concurrency per task
 DECLARE_mInt32(task_executor_min_concurrency_per_task);

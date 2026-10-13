@@ -324,6 +324,20 @@ DEFINE_mBool(enable_pipeline_gittins_scheduling, "true");
 // covers the longest pre-installed sample (~411s).
 DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
 
+// Memory levels of the pipeline scheduler. Every query starts in the top level and is
+// demoted, never promoted, as its peak memory crosses these thresholds. A higher level
+// has absolute priority over a lower one; Gittins order applies inside a level.
+DEFINE_mInt64(pipeline_mem_demotion_l1_bytes, "2147483648"); // 2GB
+DEFINE_mInt64(pipeline_mem_demotion_l2_bytes, "5368709120"); // 5GB
+// While the summed memory of a pool's live queries exceeds this budget, the scheduler
+// grants workers only to the `pipeline_fcfs_fallback_query_count` earliest-arrived
+// queries until memory falls back under the budget. <= 0 disables the fallback.
+DEFINE_mInt64(pipeline_exploration_mem_budget_bytes, "128849018880"); // 120GB
+DEFINE_mInt32(pipeline_fcfs_fallback_query_count, "2");
+// Caps every query's memory limit so the fallback queries fit next to the exploration
+// budget. Read when a query is created; <= 0 leaves the limit unchanged.
+DEFINE_mInt64(pipeline_query_max_mem_bytes, "42949672960"); // 40GB
+
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
 // task executor max concurrency per task
