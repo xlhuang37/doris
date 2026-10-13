@@ -62,6 +62,19 @@ namespace doris {
 //     first. Equal indexes fall back to least attained service, then arrival order
 //     (stable_sort), so with `enable_pipeline_gittins_scheduling` off the ranking is
 //     plain least-attained-service.
+//   - Memory levels sit above the Gittins order: every query starts in level 0 and is
+//     demoted to level 1 and then level 2 as its peak memory crosses
+//     `pipeline_mem_demotion_l1_bytes` / `pipeline_mem_demotion_l2_bytes`. Peak memory
+//     never shrinks, so demotion is permanent. A lower level number has absolute
+//     priority; the Gittins order only breaks ties inside a level.
+//   - Exploration budget: levels 0 and 1 explore cheaply only while the summed current
+//     memory of the pool's live queries stays within
+//     `pipeline_exploration_mem_budget_bytes`. Above it the pool switches to FCFS-N:
+//     only the `pipeline_fcfs_fallback_query_count` earliest-arrived queries (any
+//     level) receive workers, workers sitting on any other query are unassigned, and
+//     the priority-blind fallback dequeue is suspended so the other queries stop
+//     allocating. The first pass back within budget resumes level/Gittins order. The
+//     sentinel bucket is exempt, and inelastic tasks keep their dedicated queue.
 //   - Core allocation is greedy first-come-first-served in that order: each query
 //     takes as many of the pool's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
@@ -153,6 +166,10 @@ public:
     // Test hook: how many worker slots currently point at `query_id`, i.e. how many
     // cores the last rebalance gave it. Call after wait_scheduler_settled_for_test().
     int assigned_workers_for_test(const TUniqueId& query_id) const;
+
+    // Test hook: whether the last rebalance found the pool over its exploration budget.
+    bool fcfs_mode_for_test() const { return _fcfs_mode.load(); }
+
 protected:
     // Single-attempt take with an explicit wait timeout. Returns nullptr if no task
     // becomes available within `timeout_ms` (or the queue is closed).
@@ -199,6 +216,10 @@ private:
         // workers, and the comparator must see one consistent value.
         uint64_t rr_attained = 0;
         double rr_index = 0.0;
+        int rr_level = 0;
+        uint64_t rr_arrival = 0;
+        // Over budget and not among the FCFS-N earliest arrivals: gets no workers.
+        bool rr_held = false;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // Wall-clock time this query's tasks ran on this pool's workers (per-pool
@@ -232,6 +253,11 @@ private:
         // alongside `active_tasks` for the same reason (only producers and workers may
         // touch a QueryContext). Constant for the life of a query in practice.
         std::atomic<int> worker_cap {-1};
+        // Mirrors of the owning query's memory tracker (current and peak bytes) and
+        // arrival time, refreshed alongside `active_tasks` for the same reason.
+        std::atomic<int64_t> mem_bytes {0};
+        std::atomic<int64_t> peak_mem_bytes {0};
+        std::atomic<uint64_t> arrival_ns {0};
     };
 
     // ------------------------------------------------------------------
@@ -303,7 +329,7 @@ private:
     PipelineTaskSPtr _try_take_once(int worker_id);
     void _check_assignment(int worker_id);
     void _release_in_flight(PipelineTask* task, bool charge, int64_t time_spent);
-    // Republishes the query's active task count and worker cap into `qs`. Called by
+    // Republishes the query's active task count, worker cap, memory and arrival into `qs`. Called by
     // producers and workers, which are the only threads allowed to read them off a
     // task (they resolve through the QueryContext, which the scheduler must not touch).
     void _refresh_query_mirror(QueryState* qs, const PipelineTask* task);
@@ -366,6 +392,9 @@ private:
     // pre-installed distribution and immutable afterwards, so the scheduler reads it
     // without synchronization. Null in degenerate mode.
     const std::shared_ptr<const GittinsIndexTable> _gittins_table;
+    // Written by the scheduler each pass, read by workers: the pool is over its
+    // exploration budget, so the priority-blind fallback dequeue is suspended.
+    std::atomic<bool> _fcfs_mode {false};
 
     // Inbox.
     std::mutex _inbox_mutex;

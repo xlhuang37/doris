@@ -272,8 +272,9 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             }
         }
     }
-    // Fallback: work-conserving, priority-blind dequeue across all sub-queues.
-    if (!_queue.try_dequeue(task)) {
+    // Fallback: work-conserving, priority-blind dequeue across all sub-queues. Over the
+    // exploration budget it would let held queries keep allocating, so it is skipped.
+    if (_fcfs_mode.load(std::memory_order_relaxed) || !_queue.try_dequeue(task)) {
         return nullptr;
     }
     if (_mode == Mode::FULL) {
@@ -304,6 +305,9 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
 void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTask* task) {
     qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
     qs->worker_cap.store(task->query_worker_cap(), std::memory_order_relaxed);
+    qs->mem_bytes.store(task->query_mem_consumption(), std::memory_order_relaxed);
+    qs->peak_mem_bytes.store(task->query_peak_mem_consumption(), std::memory_order_relaxed);
+    qs->arrival_ns.store(task->query_arrival_ns(), std::memory_order_relaxed);
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -564,20 +568,54 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    // Priority: highest Gittins index first, then least attained service, then arrival
-    // order. With the policy off every index is 0, which reduces to plain
-    // least-attained-service.
+    // Priority within budget: lowest memory level first, then highest Gittins index,
+    // then least attained service, then arrival order. With the Gittins policy off
+    // every index is 0, which reduces each level to plain least-attained-service.
     const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+    const int64_t l1_bytes = config::pipeline_mem_demotion_l1_bytes;
+    const int64_t l2_bytes = config::pipeline_mem_demotion_l2_bytes;
+    int64_t total_mem = 0;
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
         qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
+        const int64_t peak = qs->peak_mem_bytes.load(std::memory_order_relaxed);
+        qs->rr_level = peak >= l2_bytes ? 2 : (peak >= l1_bytes ? 1 : 0);
+        qs->rr_arrival = qs->arrival_ns.load(std::memory_order_relaxed);
+        qs->rr_held = false;
+        total_mem += std::max<int64_t>(qs->mem_bytes.load(std::memory_order_relaxed), 0);
     }
-    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
-        if (a->rr_index != b->rr_index) {
-            return a->rr_index > b->rr_index;
+    const int64_t budget = config::pipeline_exploration_mem_budget_bytes;
+    const bool fcfs = budget > 0 && total_mem > budget;
+    _fcfs_mode.store(fcfs, std::memory_order_relaxed);
+    if (!fcfs) {
+        std::stable_sort(_queries.begin(), _queries.end(),
+                         [](const QueryState* a, const QueryState* b) {
+                             if (a->rr_level != b->rr_level) {
+                                 return a->rr_level < b->rr_level;
+                             }
+                             if (a->rr_index != b->rr_index) {
+                                 return a->rr_index > b->rr_index;
+                             }
+                             return a->rr_attained < b->rr_attained;
+                         });
+    } else {
+        // Over budget: only the earliest-arrived queries run, to completion, until
+        // memory falls back under the budget. The sentinel bucket holds no query
+        // memory and is never held.
+        std::stable_sort(_queries.begin(), _queries.end(),
+                         [](const QueryState* a, const QueryState* b) {
+                             return a->rr_arrival < b->rr_arrival;
+                         });
+        int admitted = 0;
+        const int fcfs_count = config::pipeline_fcfs_fallback_query_count;
+        for (QueryState* qs : _queries) {
+            if (_is_sentinel(qs->query_id)) {
+                continue;
+            }
+            qs->rr_held = admitted >= fcfs_count;
+            admitted++;
         }
-        return a->rr_attained < b->rr_attained;
-    });
+    }
 
     // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
@@ -608,6 +646,9 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         if (cap > 0) {
             want = std::min(want, cap);
         }
+        if (qs->rr_held) {
+            want = 0;
+        }
         if (remaining > 0 && want > 0) {
             qs->rr_grant = std::min(remaining, want);
             remaining -= qs->rr_grant;
@@ -633,6 +674,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.
     bool wrote = false;
+    bool out_of_workers = false;
     size_t scan = 0;
     for (QueryState* qs : _granted_queries) {
         while (qs->rr_grant > 0) {
@@ -649,14 +691,28 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
             if (chosen < 0) {
                 // No movable worker anywhere; the rest of the grants wait for the
                 // pending acks and are recomputed next pass.
-                if (wrote) {
-                    _notify_workers(true);
-                }
-                return;
+                out_of_workers = true;
+                break;
             }
             _write_assignment(chosen, qs);
             qs->rr_grant--;
             wrote = true;
+        }
+        if (out_of_workers) {
+            break;
+        }
+    }
+
+    // Phase 4 (over budget only): a worker left on a held query would keep running it,
+    // so unassign it. Within budget such workers keep serving until they are needed.
+    if (fcfs) {
+        for (size_t i = 0; i < _worker_sched.size(); ++i) {
+            WorkerSched& ws = _worker_sched[i];
+            if (ws.acked && !ws.rr_kept && !ws.self_detached && ws.target != nullptr &&
+                !ws.target->terminated && ws.target->rr_held) {
+                _write_assignment(static_cast<int>(i), nullptr);
+                wrote = true;
+            }
         }
     }
     if (wrote) {
