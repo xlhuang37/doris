@@ -69,12 +69,14 @@ namespace doris {
 //     priority; the Gittins order only breaks ties inside a level.
 //   - Exploration budget: levels 0 and 1 explore cheaply only while the summed current
 //     memory of the pool's live queries stays within
-//     `pipeline_exploration_mem_budget_bytes`. Above it the pool switches to FCFS-N:
-//     only the `pipeline_fcfs_fallback_query_count` earliest-arrived queries (any
-//     level) receive workers, workers sitting on any other query are unassigned, and
-//     the priority-blind fallback dequeue is suspended so the other queries stop
-//     allocating. The first pass back within budget resumes level/Gittins order. The
-//     sentinel bucket is exempt, and inelastic tasks keep their dedicated queue.
+//     `pipeline_exploration_mem_budget_bytes`. Above it the pool switches to FCFS:
+//     queries (any level) are ranked by arrival alone and each is capped by
+//     `pipeline_fcfs_query_worker_cap` instead of its usual worker cap, so the earliest
+//     arrivals take the workers and that cap, together with the pool size, decides how
+//     many queries run. Workers they cannot use serve the other queries through the
+//     priority-blind fallback dequeue, which stays on so the pool remains
+//     work-conserving. The first pass back within budget resumes level/Gittins order.
+//     Inelastic tasks keep their dedicated queue.
 //   - Core allocation is greedy first-come-first-served in that order: each query
 //     takes as many of the pool's workers as it can use (capped by its own
 //     `pipeline_query_worker_cap` session variable, or by the BE config of the same
@@ -218,8 +220,6 @@ private:
         double rr_index = 0.0;
         int rr_level = 0;
         uint64_t rr_arrival = 0;
-        // Over budget and not among the FCFS-N earliest arrivals: gets no workers.
-        bool rr_held = false;
 
         // ---- Hot part: separate cacheline, touched by workers ----
         // Wall-clock time this query's tasks ran on this pool's workers (per-pool
@@ -392,8 +392,7 @@ private:
     // pre-installed distribution and immutable afterwards, so the scheduler reads it
     // without synchronization. Null in degenerate mode.
     const std::shared_ptr<const GittinsIndexTable> _gittins_table;
-    // Written by the scheduler each pass, read by workers: the pool is over its
-    // exploration budget, so the priority-blind fallback dequeue is suspended.
+    // Written by the scheduler each pass: the pool is over its exploration budget.
     std::atomic<bool> _fcfs_mode {false};
 
     // Inbox.

@@ -272,9 +272,8 @@ PipelineTaskSPtr MultiCoreTaskQueue::_try_take_once(int worker_id) {
             }
         }
     }
-    // Fallback: work-conserving, priority-blind dequeue across all sub-queues. Over the
-    // exploration budget it would let held queries keep allocating, so it is skipped.
-    if (_fcfs_mode.load(std::memory_order_relaxed) || !_queue.try_dequeue(task)) {
+    // Fallback: work-conserving, priority-blind dequeue across all sub-queues.
+    if (!_queue.try_dequeue(task)) {
         return nullptr;
     }
     if (_mode == Mode::FULL) {
@@ -581,7 +580,6 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         const int64_t peak = qs->peak_mem_bytes.load(std::memory_order_relaxed);
         qs->rr_level = peak >= l2_bytes ? 2 : (peak >= l1_bytes ? 1 : 0);
         qs->rr_arrival = qs->arrival_ns.load(std::memory_order_relaxed);
-        qs->rr_held = false;
         total_mem += std::max<int64_t>(qs->mem_bytes.load(std::memory_order_relaxed), 0);
     }
     const int64_t budget = config::pipeline_exploration_mem_budget_bytes;
@@ -599,31 +597,23 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
                              return a->rr_attained < b->rr_attained;
                          });
     } else {
-        // Over budget: only the earliest-arrived queries run, to completion, until
-        // memory falls back under the budget. The sentinel bucket holds no query
-        // memory and is never held.
+        // Over budget: the earliest arrivals are staffed first, each up to the FCFS
+        // worker cap, so they run to completion while memory is over the budget. How
+        // many queries get workers follows from that cap and the pool size.
         std::stable_sort(_queries.begin(), _queries.end(),
                          [](const QueryState* a, const QueryState* b) {
                              return a->rr_arrival < b->rr_arrival;
                          });
-        int admitted = 0;
-        const int fcfs_count = config::pipeline_fcfs_fallback_query_count;
-        for (QueryState* qs : _queries) {
-            if (_is_sentinel(qs->query_id)) {
-                continue;
-            }
-            qs->rr_held = admitted >= fcfs_count;
-            admitted++;
-        }
     }
 
     // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
-    // session variable when set, otherwise the BE config, both re-read every pass so a
-    // runtime change lands within one tick) before the next is considered. Demand is
-    // the query's runnable task count, which counts its tasks wherever they sit while
-    // excluding those parked on a dependency, so a query cannot hold cores for work it
-    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
+    // session variable when set, otherwise the BE config; over budget, the FCFS cap for
+    // every query instead; all re-read every pass so a runtime change lands within one
+    // tick) before the next is considered. Demand is the query's runnable task count,
+    // which counts its tasks wherever they sit while excluding those parked on a
+    // dependency, so a query cannot hold cores for work it cannot perform. The
+    // sub-queue terms are a floor: they keep the sentinel bucket
     // (whose tasks have no QueryContext, so no active count) schedulable, and they
     // cover the window where a task has already blocked but its worker has yet to
     // release it.
@@ -631,6 +621,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // because phase 2 reads the grant of whatever query a worker currently sits on.
     int remaining = static_cast<int>(_worker_slots.size());
     const int default_cap = config::pipeline_query_worker_cap;
+    const int fcfs_cap = config::pipeline_fcfs_query_worker_cap;
     _granted_queries.clear();
     for (QueryState* qs : _queries) {
         qs->rr_grant = 0;
@@ -639,15 +630,12 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         int want = qs->rr_demand;
         // A negative mirror means the query set no session-level override (and is
         // also what the sentinel bucket reports), so fall back to the BE config.
-        int cap = qs->worker_cap.load(std::memory_order_relaxed);
+        int cap = fcfs ? fcfs_cap : qs->worker_cap.load(std::memory_order_relaxed);
         if (cap < 0) {
             cap = default_cap;
         }
         if (cap > 0) {
             want = std::min(want, cap);
-        }
-        if (qs->rr_held) {
-            want = 0;
         }
         if (remaining > 0 && want > 0) {
             qs->rr_grant = std::min(remaining, want);
@@ -703,18 +691,6 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         }
     }
 
-    // Phase 4 (over budget only): a worker left on a held query would keep running it,
-    // so unassign it. Within budget such workers keep serving until they are needed.
-    if (fcfs) {
-        for (size_t i = 0; i < _worker_sched.size(); ++i) {
-            WorkerSched& ws = _worker_sched[i];
-            if (ws.acked && !ws.rr_kept && !ws.self_detached && ws.target != nullptr &&
-                !ws.target->terminated && ws.target->rr_held) {
-                _write_assignment(static_cast<int>(i), nullptr);
-                wrote = true;
-            }
-        }
-    }
     if (wrote) {
         _notify_workers(true);
     }

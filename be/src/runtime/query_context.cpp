@@ -153,10 +153,6 @@ void QueryContext::_init_query_mem_tracker() {
                     << " OR is -1. Using process memory limit instead.";
         bytes_limit = MemInfo::mem_limit();
     }
-    if (const int64_t max_query_mem = config::pipeline_query_max_mem_bytes;
-        max_query_mem > 0 && bytes_limit > max_query_mem) {
-        bytes_limit = max_query_mem;
-    }
     // If the query is a pure load task(streamload, routine load, group commit), then it should not use
     // memlimit per query to limit their memory usage.
     if (is_pure_load_task()) {

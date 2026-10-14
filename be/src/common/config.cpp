@@ -330,13 +330,14 @@ DEFINE_Int32(pipeline_gittins_histogram_slots, "512");
 DEFINE_mInt64(pipeline_mem_demotion_l1_bytes, "2147483648"); // 2GB
 DEFINE_mInt64(pipeline_mem_demotion_l2_bytes, "5368709120"); // 5GB
 // While the summed memory of a pool's live queries exceeds this budget, the scheduler
-// grants workers only to the `pipeline_fcfs_fallback_query_count` earliest-arrived
-// queries until memory falls back under the budget. <= 0 disables the fallback.
+// grants workers first-come-first-served, earliest arrival first, until memory falls
+// back under the budget. <= 0 disables the fallback.
 DEFINE_mInt64(pipeline_exploration_mem_budget_bytes, "128849018880"); // 120GB
-DEFINE_mInt32(pipeline_fcfs_fallback_query_count, "2");
-// Caps every query's memory limit so the fallback queries fit next to the exploration
-// budget. Read when a query is created; <= 0 leaves the limit unchanged.
-DEFINE_mInt64(pipeline_query_max_mem_bytes, "42949672960"); // 40GB
+// Per-query worker cap while the exploration budget is exceeded, in place of
+// `pipeline_query_worker_cap` and the session variable of the same name. Together with
+// the pool size it bounds how many queries run at once. 0 means unbounded; < 0 defers
+// to `pipeline_query_worker_cap`.
+DEFINE_mInt32(pipeline_fcfs_query_worker_cap, "32");
 
 // task executor min concurrency per task
 DEFINE_Int32(task_executor_min_concurrency_per_task, "1");
