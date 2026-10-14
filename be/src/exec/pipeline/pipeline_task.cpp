@@ -94,6 +94,9 @@ PipelineTask::PipelineTask(PipelinePtr& pipeline, uint32_t task_id, RuntimeState
         _query_ctx_raw = fragment_context->get_query_ctx();
         _active_tasks_ptr = _query_ctx_raw->active_task_counter();
         _query_worker_cap = _query_ctx_raw->pipeline_query_worker_cap();
+        const timespec arrival = _query_ctx_raw->get_query_arrival_timestamp();
+        _query_arrival_ns = static_cast<uint64_t>(arrival.tv_sec) * 1'000'000'000ULL +
+                            static_cast<uint64_t>(arrival.tv_nsec);
         // The task starts out in INITED, which counts as active; _state_transition()
         // takes over the bookkeeping from here.
         _active_tasks_ptr->fetch_add(1, std::memory_order_relaxed);
@@ -136,6 +139,14 @@ PipelineTask::~PipelineTask() {
     }
 #endif
     reset_member();
+}
+
+int64_t PipelineTask::query_mem_consumption() const {
+    return _query_mem_tracker != nullptr ? _query_mem_tracker->consumption() : 0;
+}
+
+int64_t PipelineTask::query_peak_mem_consumption() const {
+    return _query_mem_tracker != nullptr ? _query_mem_tracker->peak_consumption() : 0;
 }
 
 Status PipelineTask::prepare(const std::vector<TScanRangeParams>& scan_range, const int sender_id,

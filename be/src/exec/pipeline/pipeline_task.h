@@ -159,6 +159,17 @@ public:
     // dereference a QueryContext).
     MOCK_FUNCTION int query_worker_cap() const { return _query_worker_cap; }
 
+    // Current and peak bytes held by the owning query's memory tracker, mirrored into
+    // the pipeline scheduler's per-query state alongside the worker cap. Zero for tasks
+    // with no query memory tracker.
+    MOCK_FUNCTION int64_t query_mem_consumption() const;
+    MOCK_FUNCTION int64_t query_peak_mem_consumption() const;
+
+    // Monotonic arrival time of the owning query in nanoseconds; orders queries
+    // first-come-first-served when the scheduler exceeds its memory budget. Zero for
+    // tasks with no QueryContext.
+    MOCK_FUNCTION uint64_t query_arrival_ns() const { return _query_arrival_ns; }
+
     // Opaque key identifying the owning query, used by the query-granular task queue
     // to bucket this task. The query context outlives its tasks; the pointer is only
     // ever compared/used as a map key, never dereferenced by the queue.
@@ -268,6 +279,7 @@ private:
     // construction because query options are immutable for the life of a query.
     // Caching it keeps the scheduler's mirror refresh off the QueryContext cacheline.
     int _query_worker_cap = -1;
+    uint64_t _query_arrival_ns = 0;
 
     RuntimeProfile* _parent_profile = nullptr;
     std::unique_ptr<RuntimeProfile> _task_profile;

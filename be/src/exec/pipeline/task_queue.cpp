@@ -304,6 +304,9 @@ void MultiCoreTaskQueue::release_task(PipelineTask* task) {
 void MultiCoreTaskQueue::_refresh_query_mirror(QueryState* qs, const PipelineTask* task) {
     qs->active_tasks.store(task->active_task_num(), std::memory_order_relaxed);
     qs->worker_cap.store(task->query_worker_cap(), std::memory_order_relaxed);
+    qs->mem_bytes.store(task->query_mem_consumption(), std::memory_order_relaxed);
+    qs->peak_mem_bytes.store(task->query_peak_mem_consumption(), std::memory_order_relaxed);
+    qs->arrival_ns.store(task->query_arrival_ns(), std::memory_order_relaxed);
 }
 
 void MultiCoreTaskQueue::_release_in_flight(PipelineTask* task, bool charge, int64_t time_spent) {
@@ -564,28 +567,53 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     }
     _queries.resize(live);
 
-    // Priority: highest Gittins index first, then least attained service, then arrival
-    // order. With the policy off every index is 0, which reduces to plain
-    // least-attained-service.
+    // Priority within budget: lowest memory level first, then highest Gittins index,
+    // then least attained service, then arrival order. With the Gittins policy off
+    // every index is 0, which reduces each level to plain least-attained-service.
     const bool use_gittins = config::enable_pipeline_gittins_scheduling;
+    const int64_t l1_bytes = config::pipeline_mem_demotion_l1_bytes;
+    const int64_t l2_bytes = config::pipeline_mem_demotion_l2_bytes;
+    int64_t total_mem = 0;
     for (QueryState* qs : _queries) {
         qs->rr_attained = qs->attained_ns.load(std::memory_order_relaxed);
         qs->rr_index = use_gittins ? _gittins_table->index(qs->rr_attained) : 0.0;
+        const int64_t peak = qs->peak_mem_bytes.load(std::memory_order_relaxed);
+        qs->rr_level = peak >= l2_bytes ? 2 : (peak >= l1_bytes ? 1 : 0);
+        qs->rr_arrival = qs->arrival_ns.load(std::memory_order_relaxed);
+        total_mem += std::max<int64_t>(qs->mem_bytes.load(std::memory_order_relaxed), 0);
     }
-    std::stable_sort(_queries.begin(), _queries.end(), [](const QueryState* a, const QueryState* b) {
-        if (a->rr_index != b->rr_index) {
-            return a->rr_index > b->rr_index;
-        }
-        return a->rr_attained < b->rr_attained;
-    });
+    const int64_t budget = config::pipeline_exploration_mem_budget_bytes;
+    const bool fcfs = budget > 0 && total_mem > budget;
+    _fcfs_mode.store(fcfs, std::memory_order_relaxed);
+    if (!fcfs) {
+        std::stable_sort(_queries.begin(), _queries.end(),
+                         [](const QueryState* a, const QueryState* b) {
+                             if (a->rr_level != b->rr_level) {
+                                 return a->rr_level < b->rr_level;
+                             }
+                             if (a->rr_index != b->rr_index) {
+                                 return a->rr_index > b->rr_index;
+                             }
+                             return a->rr_attained < b->rr_attained;
+                         });
+    } else {
+        // Over budget: the earliest arrivals are staffed first, each up to the FCFS
+        // worker cap, so they run to completion while memory is over the budget. How
+        // many queries get workers follows from that cap and the pool size.
+        std::stable_sort(_queries.begin(), _queries.end(),
+                         [](const QueryState* a, const QueryState* b) {
+                             return a->rr_arrival < b->rr_arrival;
+                         });
+    }
 
     // Phase 1: desired grants per query - greedy in priority order. Each query
     // takes as many workers as it can use (capped by its own worker cap: the per-query
-    // session variable when set, otherwise the BE config, both re-read every pass so a
-    // runtime change lands within one tick) before the next is considered. Demand is
-    // the query's runnable task count, which counts its tasks wherever they sit while
-    // excluding those parked on a dependency, so a query cannot hold cores for work it
-    // cannot perform. The sub-queue terms are a floor: they keep the sentinel bucket
+    // session variable when set, otherwise the BE config; over budget, the FCFS cap for
+    // every query instead; all re-read every pass so a runtime change lands within one
+    // tick) before the next is considered. Demand is the query's runnable task count,
+    // which counts its tasks wherever they sit while excluding those parked on a
+    // dependency, so a query cannot hold cores for work it cannot perform. The
+    // sub-queue terms are a floor: they keep the sentinel bucket
     // (whose tasks have no QueryContext, so no active count) schedulable, and they
     // cover the window where a task has already blocked but its worker has yet to
     // release it.
@@ -593,6 +621,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // because phase 2 reads the grant of whatever query a worker currently sits on.
     int remaining = static_cast<int>(_worker_slots.size());
     const int default_cap = config::pipeline_query_worker_cap;
+    const int fcfs_cap = config::pipeline_fcfs_query_worker_cap;
     _granted_queries.clear();
     for (QueryState* qs : _queries) {
         qs->rr_grant = 0;
@@ -601,7 +630,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
         int want = qs->rr_demand;
         // A negative mirror means the query set no session-level override (and is
         // also what the sentinel bucket reports), so fall back to the BE config.
-        int cap = qs->worker_cap.load(std::memory_order_relaxed);
+        int cap = fcfs ? fcfs_cap : qs->worker_cap.load(std::memory_order_relaxed);
         if (cap < 0) {
             cap = default_cap;
         }
@@ -633,6 +662,7 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
     // worker) and it was not kept in phase 2: it is unassigned, self-detached, or
     // attached to a query that no longer wants it.
     bool wrote = false;
+    bool out_of_workers = false;
     size_t scan = 0;
     for (QueryState* qs : _granted_queries) {
         while (qs->rr_grant > 0) {
@@ -649,16 +679,18 @@ void MultiCoreTaskQueue::_rebalance_and_dispatch() {
             if (chosen < 0) {
                 // No movable worker anywhere; the rest of the grants wait for the
                 // pending acks and are recomputed next pass.
-                if (wrote) {
-                    _notify_workers(true);
-                }
-                return;
+                out_of_workers = true;
+                break;
             }
             _write_assignment(chosen, qs);
             qs->rr_grant--;
             wrote = true;
         }
+        if (out_of_workers) {
+            break;
+        }
     }
+
     if (wrote) {
         _notify_workers(true);
     }

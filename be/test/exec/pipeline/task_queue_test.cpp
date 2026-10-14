@@ -20,9 +20,11 @@
 #include <gen_cpp/Types_types.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "common/config.h"
 #include "exec/pipeline/gittins_histogram.h"
@@ -64,10 +66,18 @@ public:
     // base implementation would go through the QueryContext, which is a fake pointer
     // here and must never be dereferenced.
     int query_worker_cap() const override { return _worker_cap; }
+    int64_t query_mem_consumption() const override { return _mem_bytes; }
+    int64_t query_peak_mem_consumption() const override { return _peak_mem_bytes; }
+    uint64_t query_arrival_ns() const override { return _arrival_ns; }
 
     void set_runtime_ns(uint64_t runtime_ns) { _runtime_ns = runtime_ns; }
     void set_active_task_num(int num) { _active_task_num = num; }
     void set_worker_cap(int cap) { _worker_cap = cap; }
+    void set_mem(int64_t current, int64_t peak) {
+        _mem_bytes = current;
+        _peak_mem_bytes = peak;
+    }
+    void set_arrival_ns(uint64_t arrival_ns) { _arrival_ns = arrival_ns; }
 
 private:
     QueryContext* _key;
@@ -75,6 +85,9 @@ private:
     bool _inelastic;
     int _active_task_num = 0;
     int _worker_cap = -1;
+    int64_t _mem_bytes = 0;
+    int64_t _peak_mem_bytes = 0;
+    uint64_t _arrival_ns = 0;
 };
 
 // Use a short empty-queue wait so tests don't block for the production 100ms.
@@ -113,6 +126,16 @@ PipelineTaskSPtr make_task_with_active_and_cap(QueryContext* key, uint64_t runti
     auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
     task->set_active_task_num(active);
     task->set_worker_cap(cap);
+    return task;
+}
+// A task whose query holds `mem` bytes now, peaked at `peak` bytes, arrived at
+// `arrival_ns`, and reports `active` live tasks.
+PipelineTaskSPtr make_mem_task(QueryContext* key, uint64_t runtime_ns, int64_t mem, int64_t peak,
+                               uint64_t arrival_ns, int active = 0) {
+    auto task = std::make_shared<MockPipelineTask>(key, runtime_ns);
+    task->set_mem(mem, peak);
+    task->set_arrival_ns(arrival_ns);
+    task->set_active_task_num(active);
     return task;
 }
 } // namespace
@@ -940,6 +963,261 @@ TEST(GittinsTaskQueueTest, TerminationDoesNotChangeRanking) {
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
     EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
 
+    q.close();
+}
+
+// ---------------------------------------------------------------------------
+// Memory levels and the exploration budget
+// ---------------------------------------------------------------------------
+
+// Byte-sized thresholds: level 1 from 100, level 2 from 500, FCFS above 1000 total with
+// 2 workers per query. Gittins is off unless a test turns it on, so in-level order is
+// least attained.
+class MemoryLevelTaskQueueTest : public testing::Test {
+protected:
+    void SetUp() override {
+        _old_gittins = config::enable_pipeline_gittins_scheduling;
+        _old_l1 = config::pipeline_mem_demotion_l1_bytes;
+        _old_l2 = config::pipeline_mem_demotion_l2_bytes;
+        _old_budget = config::pipeline_exploration_mem_budget_bytes;
+        _old_fcfs_cap = config::pipeline_fcfs_query_worker_cap;
+        config::enable_pipeline_gittins_scheduling = false;
+        config::pipeline_mem_demotion_l1_bytes = 100;
+        config::pipeline_mem_demotion_l2_bytes = 500;
+        config::pipeline_exploration_mem_budget_bytes = 1000;
+        config::pipeline_fcfs_query_worker_cap = 2;
+    }
+    void TearDown() override {
+        config::enable_pipeline_gittins_scheduling = _old_gittins;
+        config::pipeline_mem_demotion_l1_bytes = _old_l1;
+        config::pipeline_mem_demotion_l2_bytes = _old_l2;
+        config::pipeline_exploration_mem_budget_bytes = _old_budget;
+        config::pipeline_fcfs_query_worker_cap = _old_fcfs_cap;
+    }
+
+private:
+    bool _old_gittins = true;
+    int64_t _old_l1 = 0;
+    int64_t _old_l2 = 0;
+    int64_t _old_budget = 0;
+    int32_t _old_fcfs_cap = 0;
+};
+
+// A lower level outranks a higher one regardless of attained service: the level-0
+// query has burned the most CPU yet is staffed first, and the level-2 query, which
+// least-attained-service alone would pick, gets nothing.
+TEST_F(MemoryLevelTaskQueueTest, LowerLevelHasAbsolutePriority) {
+    TestTaskQueue q(2);
+    auto* l2 = qkey(0xA);
+    auto* l1 = qkey(0xB);
+    auto* l0 = qkey(0xC);
+
+    ASSERT_TRUE(q.push_back(make_mem_task(l2, 0, 0, 600, 1)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(l1, kSecondNs, 0, 200, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(l0, 5 * kSecondNs, 0, 0, 3)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_FALSE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+// The level follows peak memory, not current memory: a query that has released
+// almost everything it once held stays demoted.
+TEST_F(MemoryLevelTaskQueueTest, LevelFollowsPeakMemory) {
+    TestTaskQueue q(1);
+    auto* demoted = qkey(0xA);
+    auto* fresh = qkey(0xB);
+
+    ASSERT_TRUE(q.push_back(make_mem_task(demoted, 0, 10, 200, 1)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(fresh, 5 * kSecondNs, 50, 50, 2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+// Inside a level, the Gittins index decides, exactly as without memory levels.
+TEST_F(MemoryLevelTaskQueueTest, GittinsOrdersWithinLevel) {
+    config::enable_pipeline_gittins_scheduling = true;
+    TestTaskQueue q(1);
+    auto* qa = qkey(0xA); // fresh
+    auto* qb = qkey(0xB); // 1.5s attained, higher index under the preset
+    const uint64_t b_attained = kSecondNs + kSecondNs / 2;
+
+    ASSERT_TRUE(q.push_back(make_mem_task(qa, 0, 0, 200, 1)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(qb, b_attained, 0, 200, 2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 0);
+
+    q.close();
+}
+
+// Over budget, the earliest arrivals take the workers, whatever their level and push
+// order: at 2 workers per query, the two oldest fill the pool. Idle workers still fall
+// back to the other queries' tasks. Back within budget, level order resumes.
+TEST_F(MemoryLevelTaskQueueTest, OverBudgetRunsEarliestArrivals) {
+    TestTaskQueue q(4);
+    auto* first = qkey(0xA);  // arrival 1, level 2
+    auto* second = qkey(0xB); // arrival 2, level 2
+    auto* third = qkey(0xC);  // arrival 3, level 0
+    auto* fourth = qkey(0xD); // arrival 4, level 0
+
+    // 500 * 2 + 50 * 2 = 1100 > 1000. Pushed latest arrival first; every query could
+    // use 2 workers.
+    ASSERT_TRUE(q.push_back(make_mem_task(fourth, 0, 50, 50, 4, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(third, 0, 50, 50, 3, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(second, 0, 500, 600, 2, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(first, 0, 500, 600, 1, 2)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_TRUE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xD)), 0);
+
+    // Every worker tries twice: once its query has nothing queued, a worker drains
+    // the later queries' tasks through the fallback, so all four come out.
+    std::vector<QueryContext*> taken;
+    for (int round = 0; round < 2; ++round) {
+        for (int w = 0; w < 4; ++w) {
+            if (auto task = q.take(w)) {
+                taken.push_back(task->query_ctx_raw());
+                q.update_statistics(task.get(), 0);
+            }
+        }
+    }
+    ASSERT_EQ(taken.size(), 4U);
+    for (auto* key : {first, second, third, fourth}) {
+        EXPECT_NE(std::find(taken.begin(), taken.end(), key), taken.end());
+    }
+
+    // The two oldest release their memory (peaks stay) and every query has a task
+    // queued again: 100 total.
+    ASSERT_TRUE(q.push_back(make_mem_task(first, 0, 0, 600, 1)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(second, 0, 0, 600, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(third, 0, 50, 50, 3)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(fourth, 0, 50, 50, 4)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_FALSE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xD)), 1);
+
+    q.close();
+}
+
+// Crossing the budget moves workers off later queries that are still running: the
+// oldest query can use the whole pool at the FCFS cap, so it takes over both busy
+// workers as well as the idle one.
+TEST_F(MemoryLevelTaskQueueTest, CrossingBudgetMovesWorkersToEarliestArrival) {
+    config::pipeline_fcfs_query_worker_cap = 3;
+    TestTaskQueue q(3);
+    auto* oldest = qkey(0xA);
+    auto* middle = qkey(0xB);
+    auto* newest = qkey(0xC);
+
+    ASSERT_TRUE(q.push_back(make_mem_task(middle, 0, 100, 100, 2)).ok());
+    ASSERT_TRUE(q.push_back(make_mem_task(newest, 0, 100, 100, 3)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_FALSE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 1);
+
+    // The workers ack their assignments and keep the tasks in flight, so both queries
+    // still want a core and only the budget can take it away.
+    std::vector<PipelineTaskSPtr> running;
+    for (int w = 0; w < 3; ++w) {
+        if (auto task = q.take(w)) {
+            running.push_back(std::move(task));
+        }
+    }
+    ASSERT_EQ(running.size(), 2U);
+
+    ASSERT_TRUE(q.push_back(make_mem_task(oldest, 0, 900, 900, 1, 3)).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_TRUE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 3);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 0);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 0);
+
+    q.close();
+}
+
+// Over budget every query is bounded by the FCFS worker cap, which replaces both the
+// BE worker cap and a query's session-level cap, and the cap alone decides how many
+// queries share the pool: 12 workers at 5 per query staff two queries fully and a
+// third with what is left.
+TEST_F(MemoryLevelTaskQueueTest, OverBudgetUsesFcfsWorkerCap) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 2;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    config::pipeline_fcfs_query_worker_cap = 5;
+    TestTaskQueue q(12);
+
+    // 3 * 600 = 1800 > 1000. Every query could use 8 cores; the first also sets a
+    // session cap of 1.
+    for (uintptr_t i = 0; i < 3; ++i) {
+        auto task = std::make_shared<MockPipelineTask>(qkey(0xA + i), 0);
+        task->set_mem(600, 600);
+        task->set_arrival_ns(i + 1);
+        task->set_active_task_num(8);
+        if (i == 0) {
+            task->set_worker_cap(1);
+        }
+        ASSERT_TRUE(q.push_back(task).ok());
+    }
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_TRUE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 5);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 5);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xC)), 2);
+
+    q.close();
+}
+
+// Within budget the FCFS worker cap plays no part: the session cap and the BE cap apply.
+TEST_F(MemoryLevelTaskQueueTest, WithinBudgetIgnoresFcfsWorkerCap) {
+    const int32_t old_cap = config::pipeline_query_worker_cap;
+    config::pipeline_query_worker_cap = 2;
+    Defer restore_cap {[&]() { config::pipeline_query_worker_cap = old_cap; }};
+    config::pipeline_fcfs_query_worker_cap = 5;
+    TestTaskQueue q(16);
+
+    auto qa = std::make_shared<MockPipelineTask>(qkey(0xA), 0);
+    qa->set_active_task_num(8);
+    qa->set_worker_cap(1);
+    auto qb = std::make_shared<MockPipelineTask>(qkey(0xB), 0);
+    qb->set_active_task_num(8);
+    ASSERT_TRUE(q.push_back(qa).ok());
+    ASSERT_TRUE(q.push_back(qb).ok());
+    q.wait_scheduler_settled_for_test();
+
+    EXPECT_FALSE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xB)), 2);
+
+    q.close();
+}
+
+// A non-positive budget turns the fallback off entirely.
+TEST_F(MemoryLevelTaskQueueTest, NonPositiveBudgetDisablesFcfs) {
+    config::pipeline_exploration_mem_budget_bytes = 0;
+    TestTaskQueue q(1);
+    ASSERT_TRUE(q.push_back(make_mem_task(qkey(0xA), 0, 1'000'000, 1'000'000, 1)).ok());
+    q.wait_scheduler_settled_for_test();
+    EXPECT_FALSE(q.fcfs_mode_for_test());
+    EXPECT_EQ(q.assigned_workers_for_test(qid(0xA)), 1);
     q.close();
 }
 
